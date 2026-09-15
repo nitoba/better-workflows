@@ -3,6 +3,7 @@ import { Cause, Effect, Exit, Result, Schema, Semaphore, Tracer } from 'effect'
 import { DurableDeferred } from 'effect/unstable/workflow'
 import { PersistedQueue } from 'effect/unstable/persistence'
 import { ActivityError, WorkflowError, toFailure } from '../errors'
+import { SqlError } from 'effect/unstable/sql/SqlError'
 import type { Failure } from '../errors'
 import type { WorkflowsOptions } from '../types'
 import { decode, encode, milliseconds, validate } from './values'
@@ -75,7 +76,12 @@ export function activityWorker(
             if (signal.aborted)
               throw new WorkflowError('LEASE_LOST', 'This invocation has been aborted')
             const exit = await Effect.runPromiseExit(journal.heartbeat(claim, details))
-            if (Exit.isFailure(exit)) throw new ActivityError(toFailure(Cause.squash(exit.cause)))
+            if (Exit.isFailure(exit)) {
+              const error = Cause.squash(exit.cause)
+              // Preserve infrastructure identity: the worker must NACK this delivery.
+              if (error instanceof SqlError) throw error
+              throw new ActivityError(toFailure(error))
+            }
           }
         })
         if (signal.aborted)

@@ -15,5 +15,10 @@ export function durable<A, R>(
 export function promised<A>(
   operation: (signal: AbortSignal) => Promise<A>
 ): Effect.Effect<A, Failure> {
-  return Effect.tryPromise({ try: operation, catch: toFailure })
+  return durable(
+    Effect.tryPromise({
+      try: operation,
+      catch: (error) => (error instanceof SqlError ? error : toFailure(error))
+    })
+  )
 }
