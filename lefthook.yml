@@ -2,13 +2,13 @@ pre-commit:
   parallel: true
   commands:
     lint:
-      glob: "{src,tests,scripts}/**/*.ts"
+      glob: '{src,tests,scripts}/**/*.ts'
       run: bunx oxlint --type-aware {staged_files}
       stage_fixed: true
     format:
-      glob: "*.{ts,tsx,json,jsonc,md,yml,yaml,toml}"
+      glob: '*.{ts,tsx,json,jsonc,md,yml,yaml,toml}'
       run: bunx oxfmt --write {staged_files} '!tools/oxlint/**'
       stage_fixed: true
     typecheck:
-      glob: "{src,tests,scripts}/**/*.{ts,tsx,json}"
+      glob: '{src,tests,scripts}/**/*.{ts,tsx,json}'
       run: bun run typecheck

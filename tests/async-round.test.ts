@@ -3,7 +3,7 @@ import { runAsyncRound } from '../src/internal/async-round'
 
 test('suspension does not enter user catch or finally blocks', async () => {
   const events: string[] = []
-  const result = await runAsyncRound(async control => {
+  const result = await runAsyncRound(async (control) => {
     try {
       await control.park()
       events.push('continued')
@@ -20,23 +20,29 @@ test('suspension does not enter user catch or finally blocks', async () => {
 
 test('ordinary business exceptions can still be caught', async () => {
   const result = await runAsyncRound(async () => {
-    try { throw new Error('business error') }
-    catch { return 'recovered' }
+    try {
+      throw new Error('business error')
+    } catch {
+      return 'recovered'
+    }
   }, new AbortController().signal)
   expect(result).toEqual({ status: 'success', value: 'recovered' })
 })
 
 test('uncaught errors become a failure outcome', async () => {
   const error = new Error('failed')
-  expect(await runAsyncRound(async () => { throw error }, new AbortController().signal))
-    .toEqual({ status: 'failure', error })
+  expect(
+    await runAsyncRound(async () => {
+      throw error
+    }, new AbortController().signal)
+  ).toEqual({ status: 'failure', error })
 })
 
 test('closing a round invalidates late continuations without throwing into them', async () => {
   const abort = new AbortController()
   const barrier = Promise.withResolvers<void>()
   const events: string[] = []
-  const result = runAsyncRound(async control => {
+  const result = runAsyncRound(async (control) => {
     await barrier.promise
     if (!control.active) return control.park()
     events.push('late commit')
@@ -52,7 +58,9 @@ test('closing a round invalidates late continuations without throwing into them'
 
 test('an already closed round never invokes the application', async () => {
   let invoked = false
-  const result = await runAsyncRound(async () => { invoked = true }, AbortSignal.abort())
+  const result = await runAsyncRound(async () => {
+    invoked = true
+  }, AbortSignal.abort())
   expect(result).toEqual({ status: 'closed' })
   expect(invoked).toBe(false)
 })

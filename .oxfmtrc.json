@@ -12,6 +12,7 @@
     "**/dist/**",
     "**/coverage/**",
     "**/.turbo/**",
-    "**/.angular/**"
+    "**/.angular/**",
+    "**/.agents/**"
   ]
 }
