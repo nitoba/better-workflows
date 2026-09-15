@@ -1,0 +1,21 @@
+name: Tracked source archive
+on:
+  push:
+    paths: ['.github/workflows/development-snapshot.yml']
+permissions:
+  contents: read
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Archive only tracked public repository files
+        run: git archive --format=tar.gz --output=source.tar.gz HEAD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tracked-source
+          path: source.tar.gz
+          retention-days: 1
