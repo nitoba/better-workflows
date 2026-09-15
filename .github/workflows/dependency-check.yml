@@ -1,0 +1,35 @@
+name: Standalone GitHub dependency and Mailpit verification
+on: [push, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.2'
+      - run: bun install
+      - run: bun node_modules/typescript/bin/tsc --noEmit --skipLibCheck --moduleResolution bundler --module esnext --target es2023 --types node,bun scripts/dependency-check.ts
+      - run: bun scripts/dependency-check.ts | tee dependency-validation.txt
+      - name: Fetch checksum-verified Mailpit for local integration validation
+        run: |
+          curl --fail -L https://github.com/axllent/mailpit/releases/download/v1.31.1/mailpit-linux-amd64.tar.gz -o mailpit.tar.gz
+          echo '87d2652abd7c17dc99029147ff62ac671afdf7fd76630f7faf5b14125211c709  mailpit.tar.gz' | sha256sum --check
+          tar -xzf mailpit.tar.gz mailpit
+          ./mailpit --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dependency-validation-and-mailpit
+          path: |
+            mailpit.tar.gz
+            bun.lock
+            dependency-validation.txt
+          retention-days: 1
