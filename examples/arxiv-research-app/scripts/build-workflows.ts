@@ -1,0 +1,10 @@
+import { createRequire } from 'node:module';
+import { dirname, resolve } from 'node:path';
+import { existsSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+const require = createRequire(import.meta.url);
+const location = dirname(require.resolve('better-workflows/package.json'));
+if (!existsSync(resolve(location, 'src/index.ts'))) throw new Error('GitHub dependency source is missing');
+const bin = resolve(import.meta.dir, '../node_modules/.bin/tsdown');
+const result = spawnSync(bin, ['--config', resolve(location, 'tsdown.config.ts')], { cwd: location, stdio: 'inherit' });
+if (result.status !== 0) process.exit(result.status ?? 1);

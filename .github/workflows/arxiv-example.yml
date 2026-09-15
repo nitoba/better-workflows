@@ -1,0 +1,37 @@
+name: arXiv application
+on:
+  push:
+    branches: ['example/arxiv-research-app']
+permissions:
+  contents: read
+jobs:
+  install:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.2'
+      - name: Install independent GitHub consumer
+        working-directory: examples/arxiv-research-app
+        run: bun install
+      - name: Export public dependencies for offline validation
+        if: always()
+        working-directory: examples/arxiv-research-app
+        run: |
+          mkdir -p .dev-tools
+          cp "$(command -v bun)" .dev-tools/bun
+          cp "$(command -v node)" .dev-tools/node
+          tar --exclude='.git' --exclude='.env' --exclude='.npmrc' -czf /tmp/arxiv-dependencies.tar.gz node_modules bun.lock .dev-tools
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: arxiv-dependencies
+          path: /tmp/arxiv-dependencies.tar.gz
+          retention-days: 1

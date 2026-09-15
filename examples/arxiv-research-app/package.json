@@ -1,0 +1,37 @@
+{
+  "name": "arxiv-research-app",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.4.2",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "postinstall": "bun scripts/build-workflows.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "start": "node --env-file=.env dist/main.js",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "better-workflows": "github:nitoba/better-workflows#f08d38d31c276c2f5474125b6b36fa37eac79fb8",
+    "@nestjs/common": "12.0.3",
+    "@nestjs/core": "12.0.3",
+    "@nestjs/platform-express": "12.0.3",
+    "@ai-sdk/google": "latest",
+    "ai": "latest",
+    "@llamaindex/liteparse": "latest",
+    "fast-xml-parser": "latest",
+    "nodemailer": "latest",
+    "reflect-metadata": "0.2.2",
+    "rxjs": "7.8.2",
+    "zod": "latest"
+  },
+  "devDependencies": {
+    "@nestjs/testing": "12.0.3",
+    "@types/bun": "1.4.1",
+    "@types/node": "^24",
+    "@types/nodemailer": "latest",
+    "typescript": "7.0.2",
+    "tsdown": "0.22.14"
+  }
+}
