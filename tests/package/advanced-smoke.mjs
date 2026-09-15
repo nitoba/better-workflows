@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { fork } from 'node:child_process'
 import { once } from 'node:events'
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, rm, readFile, readdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createServer } from 'node:net'
@@ -13,6 +13,17 @@ import { createWorkflowsAdmin } from 'better-workflows/admin'
 import { sqlite } from 'better-workflows/sqlite'
 import { postgres } from 'better-workflows/postgres'
 import { Batch, Child, Even, Odd, queues, setAudit } from './advanced-contracts.mjs'
+
+const distribution = new URL('../../dist/', import.meta.url)
+const declarations = (await readdir(distribution)).filter((name) => name.endsWith('.d.mts'))
+assert.ok(declarations.length > 0)
+for (const name of declarations) {
+  assert.doesNotMatch(
+    await readFile(new URL(name, distribution), 'utf8'),
+    /from\s+['"](?:effect|@effect\/)/u,
+    `${name} must not expose private engine types`
+  )
+}
 
 const url = process.env.WORKFLOWS_TEST_POSTGRES_URL
 const dir = await mkdtemp(join(tmpdir(), 'bw-advanced-'))

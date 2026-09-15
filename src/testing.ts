@@ -25,7 +25,7 @@ interface TestingBackend {
 }
 
 /** Test-only business time. SQL leases, cluster polling and Date.now are never monkey-patched. */
-export class WorkflowsTestClock implements BusinessClock {
+export class WorkflowsTestClock {
   private time: number
   private sequence = 0
   private readonly sleepers = new Map<number, { at: number; resume: () => void }>()
@@ -146,7 +146,7 @@ export class WorkflowsTestingModule {
     if (options.clock !== undefined && options.clock !== 'manual')
       throw new WorkflowError('INVALID_CLOCK', 'Only manual business time is supported')
     const { clock: _clock, initialTime, ...root } = options
-    const clock = new WorkflowsTestClock(initialTime)
+    const clock = new WorkflowsTestClock(initialTime) satisfies BusinessClock
     const settings: WorkflowsOptions = {
       ...root,
       namespace: root.namespace ?? `test-${randomUUID()}`,

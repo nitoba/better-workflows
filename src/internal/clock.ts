@@ -1,4 +1,5 @@
-import { Clock, Duration, Effect } from 'effect'
+import { Duration, Effect } from 'effect'
+import type { Clock } from 'effect'
 
 export const WORKFLOWS_TEST_CLOCK = Symbol.for('better-workflows/testing/clock')
 
