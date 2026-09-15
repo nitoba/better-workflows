@@ -11,7 +11,7 @@ if (!existsSync(resolve(dependency, 'src/index.ts'))) {
 }
 const manifest = JSON.parse(readFileSync(resolve(dependency, 'package.json'), 'utf8'));
 if (manifest.name !== 'better-workflows') throw new Error('Unexpected dependency package');
-const result = spawnSync(process.execPath, ['run', '--cwd', dependency, 'build'], {
+const result = spawnSync(process.execPath, ['run', '--bun', '--cwd', dependency, 'build'], {
   cwd: root,
   env: { ...process.env, PATH: `${root}/node_modules/.bin:${process.env.PATH ?? ''}` },
   stdio: 'inherit',
