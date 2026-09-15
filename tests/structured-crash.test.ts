@@ -4,6 +4,7 @@ import { once } from 'node:events'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { readDeadlines, expireDeadlines } from './deadline-snapshot'
 
 interface Message {
   type: string
@@ -69,8 +70,13 @@ for (const scenario of ['map', 'child', 'saga']) {
       const exited = once(first.child, 'exit')
       first.child.kill('SIGKILL')
       expect((await exited)[1]).toBe('SIGKILL')
-      if (scenario === 'saga') await new Promise((resolve) => setTimeout(resolve, 2100))
-      const restart = Date.now()
+      const deadlines = readDeadlines(join(dir, 'db.sqlite'), checkpoint.executionId)
+      if (scenario === 'saga') {
+        expect(deadlines).toHaveLength(1)
+        expect(deadlines[0]).toMatchObject({ kind: 'retry', attempt: 1 })
+        await expireDeadlines(deadlines)
+        expect(deadlines[0]!.deadline).toBeLessThanOrEqual(Date.now())
+      }
       second = worker(dir, scenario, 'recover')
       const complete = await second.message
       expect(complete.type).toBe('complete')
@@ -84,7 +90,10 @@ for (const scenario of ['map', 'child', 'saga']) {
         .split('\n')
         .map((line) => JSON.parse(line))
       if (scenario === 'saga') {
-        expect(Date.now() - restart).toBeLessThan(1800)
+        // Recovery must reuse the original due instant, regardless of process startup speed.
+        expect(readDeadlines(join(dir, 'db.sqlite'), checkpoint.executionId)).toEqual(
+          deadlines.map((deadline) => ({ ...deadline, delivered: 1 }))
+        )
         expect(calls.map((call) => call.id)).toEqual([
           'forward-a',
           'forward-b',

@@ -4,6 +4,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { once } from 'node:events'
+import { readDeadlines, expireDeadlines } from './deadline-snapshot'
 
 function worker(directory: string, scenario: string, mode: string) {
   const child = spawn(process.execPath, ['tests/fixtures/crash-worker.ts'], {
@@ -61,16 +62,24 @@ for (const scenario of ['signal', 'timer', 'retry']) {
       const firstExit = once(first.child, 'exit')
       first.child.kill('SIGKILL')
       expect((await firstExit)[1]).toBe('SIGKILL')
-      // Let the original persisted deadline expire while no process exists.
-      if (scenario !== 'signal') await new Promise((resolve) => setTimeout(resolve, 2100))
-      const start = Date.now()
+      const deadlines = readDeadlines(join(directory, 'db.sqlite'), checkpoint.executionId)
+      if (scenario !== 'signal') {
+        expect(deadlines).toHaveLength(1)
+        expect(deadlines[0]!.kind).toBe(scenario)
+        // Expire the actual persisted deadline while no process exists.
+        await expireDeadlines(deadlines)
+        expect(deadlines[0]!.deadline).toBeLessThanOrEqual(Date.now())
+      }
       second = worker(directory, scenario, 'recover')
       const done = await second.message
       expect(done.type).toBe('complete')
       expect(done.executionId).toBe(checkpoint.executionId)
       expect(done.created).toBe(false)
       expect(done.result).toBe('crash-id')
-      if (scenario !== 'signal') expect(Date.now() - start).toBeLessThan(1800)
+      if (scenario !== 'signal')
+        expect(readDeadlines(join(directory, 'db.sqlite'), checkpoint.executionId)).toEqual(
+          deadlines.map((deadline) => ({ ...deadline, delivered: 1 }))
+        )
       const calls = (await readFile(join(directory, 'calls.jsonl'), 'utf8'))
         .trim()
         .split('\n')
