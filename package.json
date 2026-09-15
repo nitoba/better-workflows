@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "description": "NestJS-native contracts and private queue engine integration with optional durable storage.",
   "keywords": [
-    "better-effect-mq",
+    "better-workflows",
     "nestjs",
     "queue",
     "typescript"
