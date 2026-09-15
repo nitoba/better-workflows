@@ -1,0 +1,102 @@
+{
+  "name": "better-workflows",
+  "version": "0.0.0",
+  "description": "NestJS-native contracts and private queue engine integration with optional durable storage.",
+  "keywords": [
+    "better-effect-mq",
+    "nestjs",
+    "queue",
+    "typescript"
+  ],
+  "homepage": "https://github.com/nitoba/better-workflows#readme",
+  "bugs": {
+    "url": "https://github.com/nitoba/better-workflows/issues"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nitoba/better-workflows.git"
+  },
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md",
+    "CHANGELOG.md"
+  ],
+  "type": "module",
+  "sideEffects": [
+    "./dist/index.mjs"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "import": "./dist/index.mjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "tsdown",
+    "dev": "tsdown --watch",
+    "typecheck": "node node_modules/typescript/bin/tsc --noEmit",
+    "test": "bun test",
+    "test:coverage": "bun test --coverage",
+    "lint": "oxlint --type-aware src tests scripts tsdown.config.ts",
+    "lint:fix": "oxlint --type-aware --fix src tests scripts tsdown.config.ts",
+    "format": "oxfmt --write . '!tools/oxlint/**'",
+    "format:check": "oxfmt --check . '!tools/oxlint/**'",
+    "publint": "publint",
+    "check": "bun run check:tooling && bun run typecheck && bun run test && bun run format:check && bun run build && bun run lint && bun run publint",
+    "hooks:install": "lefthook install",
+    "prepublishOnly": "bun run check"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@nestjs/common": "^12.0.0",
+    "@nestjs/core": "^12.0.0",
+    "@nestjs/testing": "^12.0.0",
+    "@oxlint/plugins": "1.78.0",
+    "@types/bun": "1.4.1",
+    "@types/node": "^22.0.0",
+    "lefthook": "^2.1.10",
+    "oxfmt": "^0.63.0",
+    "oxlint": "^1.78.0",
+    "oxlint-tsgolint": "^7.0.2001",
+    "publint": "^0.3.23",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2",
+    "tsdown": "^0.22.14",
+    "typescript": "^7.0.2",
+    "zod": "^4.0.0"
+  },
+  "peerDependencies": {
+    "@nestjs/common": ">=12.0.0 <13.0.0",
+    "@nestjs/core": ">=12.0.0 <13.0.0",
+    "pg": ">=8.11.0 <9.0.0",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2",
+    "typescript": ">=6.0.0",
+    "zod": ">=4.1.0 <5.0.0"
+  },
+  "peerDependenciesMeta": {
+    "typescript": {
+      "optional": true
+    },
+    "zod": {
+      "optional": true
+    }
+  },
+  "devEngines": {
+    "packageManager": {
+      "name": "bun",
+      "version": "1.4.2",
+      "onFail": "error"
+    }
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "packageManager": "bun@1.4.2",
+  "trustedDependencies": [
+    "lefthook"
+  ]
+}
