@@ -6,6 +6,7 @@ import { Injectable, Inject } from '@nestjs/common'
 import { Test } from '@nestjs/testing'
 import { z } from 'zod'
 import {
+  defineQueue,
   Activities,
   Activity,
   Workflow,
@@ -34,7 +35,13 @@ class Calculator {
 class Maths {
   constructor(@Inject(Calculator) private readonly calculator: Calculator) {}
 
-  @Activity({ name: 'double', version: 1, queue: 'maths', input: z.number(), output: z.number() })
+  @Activity({
+    name: 'double',
+    version: 1,
+    queue: defineQueue('maths'),
+    input: z.number(),
+    output: z.number()
+  })
   async double(value: number, context: ActivityContext): Promise<number> {
     await context.heartbeat({ value })
     return this.calculator.double(value)
@@ -70,13 +77,18 @@ test('Nest DI + SQLite + queued activity + durable timer + early signal complete
       WorkflowsModule.forRoot({
         namespace: 'test',
         storage: sqlite({ filename: join(directory, 'workflows.sqlite') }),
-        queues: { maths: { concurrency: 2 } },
+        queues: [{ queue: defineQueue('maths'), concurrency: 2 }],
         pollInterval: '20ms',
         lease: { duration: '2s', refreshInterval: '500ms' }
       }),
-      WorkflowsModule.forFeature([Calculation])
+      WorkflowsModule.forFeature({
+        name: 'calculation',
+        workflows: [Calculation],
+        activities: [Maths],
+        providers: [Calculator]
+      })
     ],
-    providers: [Calculation, Maths, Calculator, Submitter]
+    providers: [Submitter]
   }).compile()
   try {
     await app.init()

@@ -1,3 +1,5 @@
+export { defineQueue } from './queues'
+export type { QueueReference } from './queues'
 export {
   Activities,
   Activity,
@@ -36,6 +38,17 @@ export type {
   ParallelTasks,
   ParallelResults,
   QueueOptions,
+  QueueRegistration,
+  QueueSettings,
+  ActivityDefaults,
+  WorkflowDefaults,
+  ExecutionOptions,
+  HandlerRegistration,
+  FeatureConfiguration,
+  FeatureStructure,
+  FeatureExports,
+  WorkflowsFeatureOptions,
+  WorkflowsFeatureAsyncOptions,
   WorkflowClass,
   WorkflowContext,
   WorkflowHandler,

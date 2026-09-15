@@ -81,7 +81,6 @@ try {
   const options = {
     namespace,
     storage,
-    queues,
     migrations: 'validate',
     pollInterval: '20ms',
     lease: { duration: '3s', refreshInterval: '800ms' }
@@ -93,8 +92,16 @@ try {
   }
   class App {}
   Module({
-    imports: [WorkflowsModule.forRoot(options), WorkflowsModule.forFeature([Batch, Child])],
-    providers: url ? [Batch, Child] : [Batch, Child, Even, Odd]
+    imports: [
+      WorkflowsModule.forRoot(options),
+      WorkflowsModule.forFeature({
+        name: 'advanced',
+        queues,
+        workflows: [Batch, Child],
+        activities: url ? [] : [Even, Odd],
+        activityContracts: url ? [Even, Odd] : []
+      })
+    ]
   })(App)
   app = await NestFactory.createApplicationContext(App, { logger: false, abortOnError: false })
   const client = app.get(getWorkflowToken(Batch))

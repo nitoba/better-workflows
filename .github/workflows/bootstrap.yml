@@ -30,7 +30,12 @@ jobs:
         run: bun run example ci-report --approve
         env:
           WORKFLOWS_DEMO_DIR: ${{ runner.temp }}/better-workflows-example
+      - name: Run modular example
+        run: bun run example:modular
+        env:
+          WORKFLOWS_MODULAR_DIR: ${{ runner.temp }}/better-workflows-modular
       - name: Lint
+        shell: bash
         run: bun run lint 2>&1 | tee lint.log
       - name: Diagnostics
         if: always()

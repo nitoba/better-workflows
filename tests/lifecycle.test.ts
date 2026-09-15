@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test'
 import { z } from 'zod'
-import { Activity, Activities, ActivityError, Workflow, defineSignal } from '../src'
+import { defineQueue, Activity, Activities, ActivityError, Workflow, defineSignal } from '../src'
 import type { ActivityContext, WorkflowContext } from '../src'
 import { testApp, eventually } from './helpers'
 
@@ -15,7 +15,7 @@ class RetryActivities {
   @Activity({
     name: 'retry',
     version: 1,
-    queue: 'work',
+    queue: defineQueue('work'),
     input: z.string(),
     output: z.number(),
     retry: { maxAttempts: 3, initialDelay: '30ms', maxDelay: '60ms' }
@@ -64,7 +64,7 @@ class BusinessActivities {
   @Activity({
     name: 'business-error',
     version: 1,
-    queue: 'work',
+    queue: defineQueue('work'),
     input: z.string(),
     output: z.number(),
     retry: { maxAttempts: 5 }

@@ -40,3 +40,5 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 *.sqlite-wal
 lint.log
 manifest.txt
+
+.demo-modular/

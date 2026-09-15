@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test'
 import { z } from 'zod'
-import { Activities, Activity, Workflow, defineSignal } from '../src'
+import { defineQueue, Activities, Activity, Workflow, defineSignal } from '../src'
 import type { ActivityContext, WorkflowContext } from '../src'
 import { Journal } from '../src/internal/journal'
 import { WorkflowsRuntime } from '../src/internal/runtime'
@@ -72,7 +72,7 @@ class Timed {
   @Activity({
     name: 'timed',
     version: 1,
-    queue: 'work',
+    queue: defineQueue('work'),
     input: z.string(),
     output: z.string(),
     timeout: '50ms',
@@ -149,11 +149,23 @@ class Limited {
       this.active--
     }
   }
-  @Activity({ name: 'limit-one', version: 1, queue: 'work', input: z.string(), output: z.string() })
+  @Activity({
+    name: 'limit-one',
+    version: 1,
+    queue: defineQueue('work'),
+    input: z.string(),
+    output: z.string()
+  })
   one(_input: string) {
     return this.work()
   }
-  @Activity({ name: 'limit-two', version: 1, queue: 'work', input: z.string(), output: z.string() })
+  @Activity({
+    name: 'limit-two',
+    version: 1,
+    queue: defineQueue('work'),
+    input: z.string(),
+    output: z.string()
+  })
   two(_input: string) {
     return this.work()
   }

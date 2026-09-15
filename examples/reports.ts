@@ -5,6 +5,7 @@ import { Inject, Injectable, Module } from '@nestjs/common'
 import { NestFactory } from '@nestjs/core'
 import { z } from 'zod'
 import {
+  defineQueue,
   Activities,
   Activity,
   Workflow,
@@ -50,7 +51,7 @@ class ReportActivities {
   @Activity({
     name: 'reports.generate',
     version: 1,
-    queue: 'reports',
+    queue: defineQueue('reports'),
     input: Input,
     output: Output,
     timeout: '30s'
@@ -91,12 +92,17 @@ class ReportsDemo {
   imports: [
     WorkflowsModule.forRoot({
       namespace: 'reports-demo',
-      storage: sqlite({ filename: join(directory, 'workflows.sqlite') }),
-      queues: { reports: { concurrency: 2 } }
+      storage: sqlite({ filename: join(directory, 'workflows.sqlite') })
     }),
-    WorkflowsModule.forFeature([GenerateReport])
+    WorkflowsModule.forFeature({
+      name: 'reports',
+      workflows: [GenerateReport],
+      activities: [ReportActivities],
+      providers: [ReportsService],
+      queues: [{ queue: defineQueue('reports'), concurrency: 2 }]
+    })
   ],
-  providers: [GenerateReport, ReportActivities, ReportsService, ReportsDemo]
+  providers: [ReportsDemo]
 })
 class AppModule {}
 

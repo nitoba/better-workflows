@@ -1,4 +1,6 @@
 import { Inject, Injectable } from '@nestjs/common'
+import { queueName } from './queues'
+import type { QueueReference } from './queues'
 import { Cause, Effect, Exit, Layer, ManagedRuntime, Crypto } from 'effect'
 import * as NodeCrypto from '@effect/platform-node/NodeCrypto'
 import { SqlClient } from 'effect/unstable/sql'
@@ -26,8 +28,8 @@ export class WorkflowsAdmin {
       this.backend.pruneRetention(plan, options?.confirm === true)
   }
   readonly queues = {
-    setLimits: (queue: string, options: Parameters<AdminBackend['setQueueLimits']>[1]) =>
-      this.backend.setQueueLimits(queue, options)
+    setLimits: (queue: QueueReference, options: Parameters<AdminBackend['setQueueLimits']>[1]) =>
+      this.backend.setQueueLimits(queueName(queue), options)
   }
 }
 export class StandaloneWorkflowsAdmin extends WorkflowsAdmin {

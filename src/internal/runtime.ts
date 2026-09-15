@@ -66,7 +66,7 @@ export class WorkflowsRuntime
     @Optional() @Inject(WORKFLOWS_TEST_CLOCK) private readonly clock?: BusinessClock
   ) {
     validateOptions(options)
-    this.registry = new Registry(options.namespace)
+    this.registry = new Registry(options)
   }
 
   registerContract(workflow: WorkflowClass): void {
@@ -92,19 +92,27 @@ export class WorkflowsRuntime
     try {
       const sql = await infrastructure.runPromise(SqlClient.SqlClient)
       this.journal = new Journal(sql, this.options.namespace, this.clock)
-      for (const [name, options] of Object.entries(this.options.queues))
+      for (const [name, options] of this.registry.queues.entries())
         await this.run(new Permits(this.journal).register(name, options))
       const workflowSlots = Semaphore.makeUnsafe(
         this.options.execution?.workflows?.concurrency ?? 20
       )
+      const featureSlots = new Map<symbol, Semaphore.Semaphore>()
       if (this.options.execution?.workflows?.enabled !== false) {
         for (const workflow of this.registry.workflows.values()) {
-          if (!workflow.handler) continue
+          if (!workflow.handler || !workflow.enabled) continue
+          const feature = workflow.owner!.registration.id
+          if (workflow.concurrency !== undefined && !featureSlots.has(feature))
+            featureSlots.set(feature, Semaphore.makeUnsafe(workflow.concurrency))
+          const featureLimit = featureSlots.get(feature)
           const engine = await infrastructure.runPromise(WorkflowEngine.WorkflowEngine)
           await infrastructure.runPromise(
             Scope.provide(
               engine.register(workflow.definition, (payload, id) =>
-                this.execute(workflow, payload.input, id).pipe(workflowSlots.withPermits(1))
+                this.execute(workflow, payload.input, id).pipe(
+                  workflowSlots.withPermits(1),
+                  (effect) => (featureLimit ? featureLimit.withPermits(1)(effect) : effect)
+                )
               ),
               infrastructure.scope
             )
@@ -113,21 +121,21 @@ export class WorkflowsRuntime
       }
       if (this.options.execution?.activities?.enabled !== false) {
         const slots = new Map(
-          Object.entries(this.options.queues).map(([name, queue]) => [
+          [...this.registry.queues].map(([name, queue]) => [
             name,
             Semaphore.makeUnsafe(queue.concurrency)
           ])
         )
-        const allowed = this.options.execution?.activities?.queues
         for (const activity of this.registry.activities.values()) {
-          if (allowed && !allowed.includes(activity.options.queue)) continue
+          if (!activity.enabled) continue
           infrastructure.runFork(
             activityWorker(
               this.queue(activity),
               activity,
               this.journal,
               slots.get(activity.options.queue)!,
-              this.options
+              this.options,
+              this.registry.queues.get(activity.options.queue)!.concurrency
             )
           )
         }
@@ -295,9 +303,9 @@ export class WorkflowsRuntime
 
   private queue(activity: ActivityContract): EngineQueue {
     const { name, version, queue } = activity.options
-    if (!this.options.queues[queue])
+    if (!this.registry.queues.get(queue))
       throw new WorkflowError('UNKNOWN_QUEUE', `Configure queue ${queue} used by ${name}`)
-    if (this.options.queues[queue]?.perKeyConcurrency !== undefined && !activity.options.key)
+    if (this.registry.queues.get(queue)?.perKeyConcurrency !== undefined && !activity.options.key)
       throw new WorkflowError(
         'ACTIVITY_KEY_REQUIRED',
         `${name} must declare key for queue ${queue}`

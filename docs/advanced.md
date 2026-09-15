@@ -1,6 +1,6 @@
 # Advanced workflows and operations
 
-Examples use the real alpha.2 API. Workflows and activities are normal Nest providers. Keep I/O in activities and retain old handler versions while executions need replay. All persisted results and branch values must be plain JSON (or a root void result).
+Examples use the real alpha.3 API. Workflows and activities are normal Nest providers. Keep I/O in activities and retain old handler versions while executions need replay. All persisted results and branch values must be plain JSON (or a root void result).
 
 ## Durable map and parallel branches
 
@@ -62,7 +62,7 @@ const background = await ctx.startChild(
 
 The default parent-close policy is **request-cancel**. It applies on completion, failure or cancellation of the parent. Consequently, use `abandon` for a deliberately independent child that must survive its parent's completion. Cancellation is cooperative, not rollback. The child can fail with a business error that the parent catches; a cancelled child awaiting `child()` produces `CHILD_WORKFLOW_CANCELLED`.
 
-Register child handlers in the orchestrator's Nest providers. Share the same namespace/storage and contract definitions across producers, parents and workers. Parent/child relations are persisted and respected by retention.
+Register child implementations through `forFeature({ workflows: [...] })`. The parent feature declares them or imports their exported clients. Share the same namespace/storage and contract definitions across producers, parents and workers. Parent/child relations are persisted and respected by retention.
 
 ## Sagas and compensations
 
@@ -119,12 +119,15 @@ const module = await Test.createTestingModule({
   imports: [
     WorkflowsTestingModule.forRoot({
       clock: 'manual',
-      initialTime: Date.UTC(2026, 0, 1),
-      queues: { reports: { concurrency: 2 } }
+      initialTime: Date.UTC(2026, 0, 1)
     }),
-    WorkflowsModule.forFeature([ApprovalWorkflow])
-  ],
-  providers: [ApprovalWorkflow, ReportActivities]
+    WorkflowsModule.forFeature({
+      name: 'reports',
+      workflows: [ApprovalWorkflow],
+      activities: [ReportActivities],
+      queues: [{ queue: ReportQueue, concurrency: 2 }]
+    })
+  ]
 }).compile()
 await module.init()
 try {
@@ -144,7 +147,7 @@ try {
 
 The default is isolated real in-memory SQLite plus the real Effect workflow engine, **not mocked workflow results**. `storage` and `namespace` can be supplied for persistence/restart tests. Time is local to that testing module; `Date.now()` and other applications' clocks are untouched.
 
-`advanceTime` visits each pending business deadline chronologically. It controls new durable timers, signal timeouts, persisted retry deadlines and activity timeouts. For example, a one-day retry followed by a two-day retry fires at day 1 and day 3, not both at the final target date. Existing pre-alpha.2 native timers retain their original engine protocol and are not retroactively virtualized.
+`advanceTime` visits each pending business deadline chronologically. It controls new durable timers, signal timeouts, persisted retry deadlines and activity timeouts. For example, a one-day retry followed by a two-day retry fires at day 1 and day 3, not both at the final target date.
 
 Transport/cluster polling and ownership leases use real time. Arbitrary user `setTimeout`, network calls and provider-side clocks are not virtualized. `runUntilIdle` waits for observable state to settle with a bounded real-time safety timeout; use `waitFor` when a specific asynchronous milestone matters. Pending signal waits do not prevent idleness. A continuously progressing workflow can produce `TEST_NOT_IDLE` instead of silently returning.
 
@@ -167,7 +170,7 @@ try {
 }
 ```
 
-No workflow runner or activity worker starts through this connection. Back up the database and stop workers for an alpha.1-to-alpha.2 upgrade. Migration v2 preserves existing commands and their timer protocol. Migrations serialize using a PostgreSQL transaction advisory lock or SQLite's writer lock. Newer/gapped ledgers and missing already-applied journal structures are rejected, not treated as an empty database. There is no automatic downgrade or rollback migration.
+No workflow runner or activity worker starts through this connection. Run schema changes before starting application workers. Migrations serialize using a PostgreSQL transaction advisory lock or SQLite's writer lock. Newer/gapped ledgers and missing already-applied journal structures are rejected, not treated as an empty database. There is no automatic downgrade or rollback migration.
 
 After applying migrations:
 
@@ -220,22 +223,25 @@ Successful pruning removes the execution's journal details, queue records and na
 
 ## Shared queue limits
 
+Use `DocumentsQueue = defineQueue('documents')`. See [module configuration](modules.md) for ownership, visibility and explicit deployment overrides.
+
 ```ts
 @Activity({
-  name: 'documents.extract', version: 1, queue: 'documents',
+  name: 'documents.extract', version: 1, queue: DocumentsQueue,
   input: ExtractInput, output: ExtractOutput,
   key: (input) => input.tenantId
 })
 ```
 
 ```ts
-queues: {
-  documents: {
-    concurrency: 8,        // local worker slots in each process
+queues: [
+  {
+    queue: DocumentsQueue, // defineQueue('documents'), registered in the owning feature or root
+    concurrency: 8, // local worker slots in each process
     globalConcurrency: 4, // total live permits across all processes
-    perKeyConcurrency: 1  // live permits for each tenant in the same queue
+    perKeyConcurrency: 1 // live permits for each tenant in this queue
   }
-}
+]
 ```
 
 Limits share the `(namespace, queue)` boundary across activity types. `perKeyConcurrency` requires a nonempty stable `Activity.key`; the key is derived from validated input and checked as part of replay. Without a global limit, per-key limiting still applies. Without either shared limit, local queue slots continue to apply.
@@ -245,7 +251,7 @@ Admission, claim ownership and permit creation are atomic SQL operations. Heartb
 Processes must agree on the shared limits. A different deployment configuration fails with `QUEUE_LIMIT_CONFLICT` instead of silently weakening enforcement. Drain active workflows, stop producers/workers, then update persisted policy and deploy matching options:
 
 ```ts
-await admin.queues.setLimits('documents', {
+await admin.queues.setLimits(DocumentsQueue, {
   globalConcurrency: 6,
   perKeyConcurrency: 2
 })

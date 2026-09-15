@@ -1,4 +1,5 @@
-import type { Type, ModuleMetadata } from '@nestjs/common'
+import type { Type, ModuleMetadata, InjectionToken } from '@nestjs/common'
+import type { QueueReference } from './queues'
 import type { StandardSchemaV1 } from '@standard-schema/spec'
 import type { Failure } from './errors'
 
@@ -30,7 +31,7 @@ export interface WorkflowOptions<I = unknown, O = unknown> {
 export interface ActivityOptions<I = unknown, O = unknown> {
   readonly name: string
   readonly version: number
-  readonly queue: string
+  readonly queue?: QueueReference
   readonly input: StandardSchemaV1<I, I>
   readonly output: StandardSchemaV1<O, O>
   readonly retry?: RetryOptions
@@ -126,6 +127,73 @@ export interface QueueOptions {
   readonly perKeyConcurrency?: number
 }
 
+/** Defaults describe activity behavior, never create queues or handlers. */
+export interface ActivityDefaults {
+  readonly queue?: QueueReference
+  readonly retry?: RetryOptions
+  readonly timeout?: Duration
+}
+
+export interface QueueSettings {
+  readonly concurrency?: number
+  /** null explicitly removes an inherited shared limit. */
+  readonly globalConcurrency?: number | null
+  readonly perKeyConcurrency?: number | null
+}
+
+export interface QueueRegistration extends QueueSettings {
+  readonly queue: QueueReference
+}
+
+export interface WorkflowDefaults {
+  readonly queues?: QueueSettings
+  readonly activities?: ActivityDefaults
+}
+
+export interface ExecutionOptions {
+  readonly workflows?: { readonly enabled?: boolean; readonly concurrency?: number }
+  readonly activities?: { readonly enabled?: boolean; readonly queues?: readonly QueueReference[] }
+}
+
+/** Reuse an existing exported Nest provider without creating a second instance. */
+export type HandlerRegistration<T extends Type = Type> =
+  | T
+  | { readonly provide: T; readonly useExisting: InjectionToken<InstanceType<T>> }
+
+export interface FeatureConfiguration {
+  readonly queues?: readonly QueueRegistration[]
+  readonly defaults?: WorkflowDefaults
+  /** A feature can restrict execution, never re-enable a role disabled at the root. */
+  readonly execution?: ExecutionOptions
+}
+
+export interface FeatureExports {
+  readonly queues?: readonly QueueReference[]
+  readonly activities?: readonly Type[]
+}
+
+export interface FeatureStructure extends Pick<ModuleMetadata, 'imports' | 'providers'> {
+  /** Required when the feature owns implementations, activity contracts or configuration. */
+  readonly name?: string
+  readonly workflows?: readonly HandlerRegistration<WorkflowClass>[]
+  readonly activities?: readonly HandlerRegistration[]
+  /** Contract ownership/defaults without instantiating activity services (orchestrator processes). */
+  readonly activityContracts?: readonly Type[]
+  /** Typed workflow clients only; no workflow service is instantiated. */
+  readonly clients?: readonly WorkflowClass[]
+  readonly exports?: FeatureExports
+}
+
+export interface WorkflowsFeatureOptions extends FeatureStructure, FeatureConfiguration {}
+
+export interface WorkflowsFeatureAsyncOptions extends FeatureStructure {
+  readonly inject?: readonly InjectionToken[]
+  // Only values are asynchronous: Nest's provider graph is declared statically above.
+  readonly useFactory: (
+    ...dependencies: any[]
+  ) => FeatureConfiguration | Promise<FeatureConfiguration>
+}
+
 export interface WorkflowContext {
   readonly executionId: string
   activities<T>(provider: Type<T>): ActivityClient<T>
@@ -184,27 +252,31 @@ export interface PostgresStorage {
 export interface WorkflowsOptions {
   readonly namespace: string
   readonly storage: SqliteStorage | PostgresStorage
-  /** One root runtime per Nest application. Infrastructure providers are global. */
-  readonly isGlobal?: true
+  /** Infrastructure is global by default; feature handlers never are. */
+  readonly isGlobal?: boolean
   readonly topology?: 'single-node' | 'distributed'
   readonly cluster?: {
     readonly address: { readonly host: string; readonly port: number }
     readonly listenAddress?: { readonly host: string; readonly port: number }
   }
-  readonly execution?: {
-    readonly workflows?: { readonly enabled?: boolean; readonly concurrency?: number }
-    readonly activities?: { readonly enabled?: boolean; readonly queues?: readonly string[] }
-  }
-  readonly queues: Readonly<Record<string, QueueOptions>>
+  readonly execution?: ExecutionOptions
+  /** Optional application-owned queues, visible to every feature. */
+  readonly queues?: readonly QueueRegistration[]
+  readonly defaults?: WorkflowDefaults
+  /** Explicit final deployment overrides; must refer to registered queues. */
+  readonly queueOverrides?: readonly QueueRegistration[]
   readonly migrations?: 'run' | 'validate'
   readonly pollInterval?: Duration
   readonly lease?: { readonly duration: Duration; readonly refreshInterval: Duration }
 }
 
 export interface WorkflowsAsyncOptions extends Pick<ModuleMetadata, 'imports'> {
+  readonly isGlobal?: boolean
   readonly inject?: readonly (string | symbol | Type)[]
   // Nest's factory dependency tuple is heterogeneous; consumers retain their own argument types.
-  readonly useFactory: (...dependencies: any[]) => WorkflowsOptions | Promise<WorkflowsOptions>
+  readonly useFactory: (
+    ...dependencies: any[]
+  ) => Omit<WorkflowsOptions, 'isGlobal'> | Promise<Omit<WorkflowsOptions, 'isGlobal'>>
 }
 
 export type ExecutionStatus =

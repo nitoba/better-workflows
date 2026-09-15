@@ -30,17 +30,6 @@ export function validateOptions(options: WorkflowsOptions): void {
       'Lease duration must be at least three times its positive refresh interval'
     )
   }
-  for (const [name, queue] of Object.entries(options.queues)) {
-    identifier(name, 'Queue name')
-    positiveInteger(queue.concurrency, `Queue ${name} concurrency`)
-    if (queue.globalConcurrency !== undefined)
-      positiveInteger(queue.globalConcurrency, `Queue ${name} global concurrency`)
-    if (queue.perKeyConcurrency !== undefined)
-      positiveInteger(queue.perKeyConcurrency, `Queue ${name} per-key concurrency`)
-  }
-  for (const queue of options.execution?.activities?.queues ?? []) {
-    if (!options.queues[queue]) throw new WorkflowError('UNKNOWN_QUEUE', queue)
-  }
   if (options.topology === 'distributed') {
     if (options.storage.driver !== 'postgres')
       throw new WorkflowError('INVALID_TOPOLOGY', 'Distributed execution requires PostgreSQL')

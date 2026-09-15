@@ -2,7 +2,7 @@
 
 Durable workflows for **NestJS 12**, using decorators, modules, dependency injection and `async/await`. Effect's workflow/cluster engine is private infrastructure; application code does not import Effect.
 
-**Status: `0.1.0-alpha.2`.** This repository contains an executable implementation, not just API declarations. It is an initial release candidate for application-level evaluation, not a claim that every proposed feature or failure mode is covered. No npm publication is required to run the repository.
+**Status: `0.1.0-alpha.3`.** This repository contains an executable implementation, not just API declarations. It is an initial release candidate for application-level evaluation, not a claim that every proposed feature or failure mode is covered. No npm publication is required to run the repository.
 
 ## Run the example
 
@@ -36,19 +36,20 @@ import {
   Activity,
   Workflow,
   defineSignal,
+  defineQueue,
   type ActivityContext,
   type WorkflowContext
 } from 'better-workflows'
 
+const ReportQueue = defineQueue('reports')
 const Approval = defineSignal('report.approval', z.boolean())
 const Input = z.object({ reportId: z.string(), values: z.array(z.number()).min(1) })
 
-@Activities()
+@Activities({ queue: ReportQueue })
 export class ReportActivities {
   @Activity({
     name: 'reports.sum',
     version: 1,
-    queue: 'reports',
     input: z.array(z.number()),
     output: z.number(),
     timeout: '30s'
@@ -88,8 +89,14 @@ import { WorkflowsModule } from 'better-workflows'
 import { sqlite } from 'better-workflows/sqlite'
 
 @Module({
-  imports: [WorkflowsModule.forFeature([GenerateReport])],
-  providers: [GenerateReport, ReportActivities],
+  imports: [
+    WorkflowsModule.forFeature({
+      name: 'reports',
+      workflows: [GenerateReport],
+      activities: [ReportActivities],
+      queues: [{ queue: ReportQueue, concurrency: 2 }]
+    })
+  ],
   exports: [WorkflowsModule]
 })
 export class ReportsModule {}
@@ -98,8 +105,7 @@ export class ReportsModule {}
   imports: [
     WorkflowsModule.forRoot({
       namespace: 'reports-app',
-      storage: sqlite({ filename: './data/workflows.sqlite' }),
-      queues: { reports: { concurrency: 2 } }
+      storage: sqlite({ filename: './data/workflows.sqlite' })
     }),
     ReportsModule
   ]
@@ -107,7 +113,11 @@ export class ReportsModule {}
 export class AppModule {}
 ```
 
-Register **one root** per Nest application. Its infrastructure is global. `forFeature()` creates typed clients only: handlers still belong in the providers of their owning module. Import/export that module rather than registering duplicate handler instances. `forRootAsync({ imports, inject, useFactory })` supports configuration providers.
+Register **one root** per Nest application. It configures infrastructure and optional application defaults/queue overrides; it does not need to know domain queues. `forFeature()` owns implementations, their typed clients and local configuration. Do not also register those handlers in the outer module's `providers`. Use feature `imports`/`providers` for dependencies or `{ provide, useExisting }` to reuse an exported instance.
+
+`forFeature({ clients: [GenerateReport] })` registers clients only, without constructing workflow services. `activityContracts` provides remote activity metadata without constructing workers. Private feature queues/activities are shared through explicit exports and actual Nest imports. `forRootAsync()` and `forFeatureAsync()` support configuration providers. Infrastructure is global by default; `isGlobal: false` requires explicit infrastructure imports.
+
+See [modules and configuration](docs/modules.md) for precedence, queue ownership, cross-domain calls, asynchronous factories and separated worker processes. Run `bun run example:modular` for a multi-domain application with **no root queue catalog**.
 
 Handlers must be singleton providers with a static dependency tree. Request-scoped dependencies and non-singleton handlers are rejected. Background execution does not retain an HTTP request. HTTP pipes, guards and interceptors are not silently applied to activities. Apply authorization in the application's controllers/services before accepting, inspecting, signalling or cancelling executions.
 
@@ -145,7 +155,7 @@ Retrieve a handle later with `client.getHandle(executionId)`. `result({ timeout,
 
 ```ts
 @Activity({
-  name: 'reports.deliver', version: 1, queue: 'delivery',
+  name: 'reports.deliver', version: 1, queue: DeliveryQueue,
   input: DeliveryInput, output: DeliveryReceipt,
   retry: { maxAttempts: 3, backoff: 'exponential', initialDelay: '1s', maxDelay: '30s' },
   timeout: '1m'
@@ -184,15 +194,15 @@ WorkflowsModule.forRoot({
   cluster: { address: { host: 'worker-1.internal', port: 34431 } },
   execution: {
     workflows: { enabled: true, concurrency: 20 },
-    activities: { enabled: true, queues: ['reports'] }
+    activities: { enabled: true, queues: [ReportQueue] }
   },
-  queues: { reports: { concurrency: 2 } }
+  queues: [{ queue: ReportQueue, concurrency: 2 }]
 })
 ```
 
 The address must be reachable by other runners. Optional `cluster.listenAddress` can differ from the advertised address. Keep runner sockets on a trusted private network; the library does not configure a public authenticated gateway.
 
-For API-only or activity-only processes, set `execution.workflows.enabled: false`; no runner address is required. API-only processes also set `execution.activities.enabled: false`. Orchestrators need workflow handlers; activity workers need activity handlers. Contract classes still need to be shared and imported by producers/orchestrators. Use the same namespace and database across roles. A logical queue's `concurrency` is **per process**, shared by its activity handlers. `globalConcurrency` and `perKeyConcurrency` add SQL-backed limits shared across processes in the same namespace and queue.
+For API-only or activity-only processes, set `execution.workflows.enabled: false`; no runner address is required. API-only processes also set `execution.activities.enabled: false`. Orchestrators register workflow handlers and activityContracts with their owning feature configuration; activity workers register activity implementations. API producers can register clients only. Share contract classes and domain configuration across roles. Use the same namespace and database across roles. A logical queue's `concurrency` is **per process**, shared by its activity handlers. `globalConcurrency` and `perKeyConcurrency` add SQL-backed limits shared across processes in the same namespace and queue.
 
 ## Structured workflows and operations
 
@@ -210,9 +220,7 @@ const results = await ctx.map(
 Each branch has its own stable command path and durable admission state. A branch waiting on a signal still counts against this map's limit. Results retain input order. Use `ctx.parallel` for a typed object of named branches. Plain `Promise.all` is not the supported durable parallel primitive.
 
 ```ts
-queues: {
-  documents: { concurrency: 8, globalConcurrency: 4, perKeyConcurrency: 1 }
-}
+queues: [{ queue: DocumentsQueue, concurrency: 8, globalConcurrency: 4, perKeyConcurrency: 1 }]
 ```
 
 Keyed activities declare `key: (input) => input.tenantId` in `@Activity()`. Limits cover all handlers in that queue, not just one activity. All processes must agree on shared limits; configuration drift fails at bootstrap.
@@ -225,4 +233,4 @@ This remains an alpha. External effects are at least once and must be idempotent
 
 Schema migrations can run automatically at bootstrap (`migrations: 'run'`, the default), or be applied separately before starting the application with `migrations: 'validate'`. Retention requires an explicit preview and confirmation, preserves active dependencies and keeps compact idempotency tombstones. There is no background deletion policy by default.
 
-Scheduling decorators, a visual dashboard and publication automation are outside this release. The library has no integration or dependency on an external queue library. No npm publication is performed by the development scripts.
+Scheduling decorators, a visual dashboard and publication automation are outside this release. No npm publication is performed by the development scripts.

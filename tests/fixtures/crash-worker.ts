@@ -4,6 +4,7 @@ import { Module } from '@nestjs/common'
 import { NestFactory } from '@nestjs/core'
 import { z } from 'zod'
 import {
+  defineQueue,
   Activity,
   Activities,
   ActivityError,
@@ -26,7 +27,7 @@ class Files {
   @Activity({
     name: 'write-marker',
     version: 1,
-    queue: 'work',
+    queue: defineQueue('work'),
     input: z.string(),
     output: z.string(),
     retry: { maxAttempts: 3, initialDelay: '2s', maxDelay: '2s' }
@@ -65,13 +66,12 @@ class CrashWorkflow {
     WorkflowsModule.forRoot({
       namespace: 'crash-tests',
       storage: sqlite({ filename }),
-      queues: { work: { concurrency: 1 } },
+      queues: [{ queue: defineQueue('work'), concurrency: 1 }],
       pollInterval: '20ms',
       lease: { duration: '600ms', refreshInterval: '150ms' }
     }),
-    WorkflowsModule.forFeature([CrashWorkflow])
-  ],
-  providers: [CrashWorkflow, Files]
+    WorkflowsModule.forFeature({ name: 'crash', workflows: [CrashWorkflow], activities: [Files] })
+  ]
 })
 class AppModule {}
 

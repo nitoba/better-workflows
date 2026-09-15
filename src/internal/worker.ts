@@ -37,12 +37,12 @@ export function activityWorker(
   activity: RegisteredActivity,
   journal: Journal,
   semaphore: Semaphore.Semaphore,
-  options: WorkflowsOptions
+  options: WorkflowsOptions,
+  concurrency: number
 ) {
   const lease = milliseconds(options.lease?.duration ?? '30s')
   const refresh = milliseconds(options.lease?.refreshInterval ?? '10s')
   const poll = Math.min(milliseconds(options.pollInterval ?? '100ms'), refresh)
-  const concurrency = options.queues[activity.options.queue]!.concurrency
   const permits = new Permits(journal)
 
   const execute = (payload: ActivityEnvelope, delivery: number) =>

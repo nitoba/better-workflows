@@ -12,13 +12,19 @@ Module({
       storage: postgres({ connectionString: process.env.WORKFLOWS_TEST_POSTGRES_URL }),
       topology: 'distributed',
       migrations: 'validate',
-      queues,
       pollInterval: '20ms',
       lease: { duration: '3s', refreshInterval: '800ms' },
       execution: { workflows: { enabled: false } }
+    }),
+    WorkflowsModule.forFeature({
+      name: 'advanced',
+      queues: queues.map((policy) => ({
+        ...policy,
+        concurrency: process.env.WORKFLOW_WORKER === 'even' ? 1 : 4
+      })),
+      activities: [process.env.WORKFLOW_WORKER === 'even' ? Even : Odd]
     })
-  ],
-  providers: [process.env.WORKFLOW_WORKER === 'even' ? Even : Odd]
+  ]
 })(App)
 let app
 try {

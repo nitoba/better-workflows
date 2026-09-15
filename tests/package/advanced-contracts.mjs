@@ -1,4 +1,4 @@
-import { Activities, Activity, Workflow } from 'better-workflows'
+import { defineQueue, Activities, Activity, Workflow } from 'better-workflows'
 import { z } from 'zod'
 
 const input = z.object({ index: z.number().int(), tenant: z.string() })
@@ -33,7 +33,7 @@ for (const [provider, name] of [
   Activity({
     name: `shared-${name}`,
     version: 1,
-    queue: 'shared',
+    queue: defineQueue('shared'),
     input,
     output: z.number(),
     key: (value) => value.tenant
@@ -62,4 +62,6 @@ Workflow({
   output: z.array(z.number()),
   idempotencyKey: (id) => id
 })(Batch)
-export const queues = { shared: { concurrency: 4, globalConcurrency: 2, perKeyConcurrency: 1 } }
+export const queues = [
+  { queue: defineQueue('shared'), concurrency: 4, globalConcurrency: 2, perKeyConcurrency: 1 }
+]

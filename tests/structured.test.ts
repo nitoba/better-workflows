@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test'
 import { z } from 'zod'
-import { Activities, Activity, ActivityError, Workflow, defineSignal } from '../src'
+import { defineQueue, Activities, Activity, ActivityError, Workflow, defineSignal } from '../src'
 import type { WorkflowContext } from '../src'
 import { WorkflowsRuntime } from '../src/internal/runtime'
 import { WorkflowClient } from '../src/client'
@@ -15,7 +15,7 @@ class Work {
   @Activity({
     name: 'structured.work',
     version: 1,
-    queue: 'work',
+    queue: defineQueue('work'),
     input: z.string(),
     output: z.string()
   })
@@ -54,7 +54,10 @@ class Batch {
 }
 
 test('durable map keeps two waiting branches admitted, settles in input order and never repeats completed work', async () => {
-  const app = await testApp(Batch, { providers: [Work], queues: { work: { concurrency: 8 } } })
+  const app = await testApp(Batch, {
+    providers: [Work],
+    queues: [{ queue: defineQueue('work'), concurrency: 8 }]
+  })
   try {
     const handle = await app.client.start('batch')
     await eventually(
@@ -292,7 +295,7 @@ test('saga-scoped activities work outside compensated steps; captured outer cont
     @Activity({
       name: 'saga-echo',
       version: 1,
-      queue: 'work',
+      queue: defineQueue('work'),
       input: z.string(),
       output: z.string()
     })

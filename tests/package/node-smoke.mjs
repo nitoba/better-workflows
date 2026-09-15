@@ -8,6 +8,7 @@ import { Module } from '@nestjs/common'
 import { NestFactory } from '@nestjs/core'
 import { z } from 'zod'
 import {
+  defineQueue,
   Activities,
   Activity,
   ActivityError,
@@ -36,7 +37,7 @@ Activities()(Maths)
 Activity({
   name: 'double',
   version: 1,
-  queue: 'maths',
+  queue: defineQueue('maths'),
   input: z.number(),
   output: z.number(),
   retry: { maxAttempts: 2, initialDelay: '20ms' }
@@ -65,15 +66,24 @@ const storage = url
 const base = {
   namespace,
   storage,
-  queues: { maths: { concurrency: 2 } },
+  queues: [{ queue: defineQueue('maths'), concurrency: 2 }],
   pollInterval: '50ms',
   lease: { duration: '3s', refreshInterval: '800ms' }
 }
 async function app(options, providers) {
   class App {}
   Module({
-    imports: [WorkflowsModule.forRoot(options), WorkflowsModule.forFeature([Calculation])],
-    providers
+    imports: [
+      WorkflowsModule.forRoot(options),
+      WorkflowsModule.forFeature({
+        name: 'calculation',
+        clients: [Calculation],
+        workflows: providers.includes(Calculation) ? [Calculation] : [],
+        activities: providers.includes(Maths) ? [Maths] : [],
+        activityContracts:
+          providers.includes(Calculation) && !providers.includes(Maths) ? [Maths] : []
+      })
+    ]
   })(App)
   return NestFactory.createApplicationContext(App, { logger: false, abortOnError: false })
 }

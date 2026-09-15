@@ -5,6 +5,7 @@ import { Module } from '@nestjs/common'
 import { NestFactory } from '@nestjs/core'
 import { z } from 'zod'
 import {
+  defineQueue,
   Activities,
   Activity,
   ActivityError,
@@ -28,7 +29,7 @@ class Markers {
   @Activity({
     name: 'structured-marker',
     version: 1,
-    queue: 'work',
+    queue: defineQueue('work'),
     input: z.string(),
     output: z.string(),
     retry: { maxAttempts: 2, initialDelay: '2s', maxDelay: '2s' }
@@ -107,13 +108,16 @@ class Parent {
     WorkflowsModule.forRoot({
       namespace: 'structured-crash-tests',
       storage: sqlite({ filename }),
-      queues: { work: { concurrency: 4, globalConcurrency: 2 } },
+      queues: [{ queue: defineQueue('work'), concurrency: 4, globalConcurrency: 2 }],
       pollInterval: '20ms',
       lease: { duration: '600ms', refreshInterval: '150ms' }
     }),
-    WorkflowsModule.forFeature([Parent, Child])
-  ],
-  providers: [Parent, Child, Markers]
+    WorkflowsModule.forFeature({
+      name: 'structured',
+      workflows: [Parent, Child],
+      activities: [Markers]
+    })
+  ]
 })
 class App {}
 

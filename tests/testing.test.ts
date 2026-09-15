@@ -2,6 +2,7 @@ import { test, expect } from 'bun:test'
 import { Test } from '@nestjs/testing'
 import { z } from 'zod'
 import {
+  defineQueue,
   Activities,
   Activity,
   ActivityError,
@@ -20,7 +21,7 @@ class Retrying {
   @Activity({
     name: 'retry-virtual',
     version: 1,
-    queue: 'work',
+    queue: defineQueue('work'),
     input: z.string(),
     output: z.string(),
     retry: { maxAttempts: 3, initialDelay: '1d', maxDelay: '10d' }
@@ -57,11 +58,10 @@ test('virtual clock visits persisted retries, timers and signal timeouts chronol
     imports: [
       WorkflowsTestingModule.forRoot({
         initialTime: Date.UTC(2026, 0, 1),
-        queues: { work: { concurrency: 2 } }
+        queues: [{ queue: defineQueue('work'), concurrency: 2 }]
       }),
-      WorkflowsModule.forFeature([Travel])
-    ],
-    providers: [Travel, Retrying]
+      WorkflowsModule.forFeature({ name: 'travel', workflows: [Travel], activities: [Retrying] })
+    ]
   }).compile()
   try {
     await app.init()

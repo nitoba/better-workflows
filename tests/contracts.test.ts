@@ -4,7 +4,14 @@ import { Test } from '@nestjs/testing'
 import { Cause, Effect, Exit } from 'effect'
 import { ConnectionError, SqlError } from 'effect/unstable/sql/SqlError'
 import { z } from 'zod'
-import { Activities, Activity, Workflow, WorkflowsModule, getWorkflowToken } from '../src'
+import {
+  defineQueue,
+  Activities,
+  Activity,
+  Workflow,
+  WorkflowsModule,
+  getWorkflowToken
+} from '../src'
 import type { WorkflowClient } from '../src'
 import { sqlite } from '../src/sqlite'
 import { promised } from '../src/internal/effects'
@@ -41,12 +48,11 @@ test('version upgrades preserve deduplication but cannot reinterpret a prior out
       WorkflowsModule.forRoot({
         namespace: 'versions',
         storage: sqlite({ filename: ':memory:' }),
-        queues: {},
+        queues: [],
         pollInterval: '20ms'
       }),
-      WorkflowsModule.forFeature([VersionOne, VersionTwo])
-    ],
-    providers: [VersionOne, VersionTwo]
+      WorkflowsModule.forFeature({ name: 'versions', workflows: [VersionOne, VersionTwo] })
+    ]
   }).compile()
   try {
     await app.init()
@@ -81,12 +87,11 @@ test('forRootAsync resolves dependencies from imported Nest modules', async () =
         useFactory: async (settings: Settings) => ({
           namespace: settings.namespace,
           storage: sqlite({ filename: ':memory:' }),
-          queues: {}
+          queues: []
         })
       }),
-      WorkflowsModule.forFeature([VersionOne])
-    ],
-    providers: [VersionOne]
+      WorkflowsModule.forFeature({ name: 'versions', workflows: [VersionOne] })
+    ]
   }).compile()
   try {
     await app.init()
@@ -105,7 +110,7 @@ class RequestActivity {
   @Activity({
     name: 'request-dependent',
     version: 1,
-    queue: 'work',
+    queue: defineQueue('work'),
     input: z.string(),
     output: z.string()
   })
@@ -119,11 +124,15 @@ test('request-scoped dependency trees fail at bootstrap instead of losing their 
     imports: [
       WorkflowsModule.forRoot({
         namespace: 'scopes',
-        storage: sqlite({ filename: ':memory:' }),
-        queues: { work: { concurrency: 1 } }
+        storage: sqlite({ filename: ':memory:' })
+      }),
+      WorkflowsModule.forFeature({
+        name: 'scoped',
+        activities: [RequestActivity],
+        providers: [RequestState],
+        queues: [{ queue: defineQueue('work'), concurrency: 1 }]
       })
-    ],
-    providers: [RequestActivity, RequestState]
+    ]
   }).compile()
   try {
     await expect(app.init()).rejects.toMatchObject({ code: 'UNSUPPORTED_SCOPE' })

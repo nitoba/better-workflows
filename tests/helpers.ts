@@ -3,9 +3,10 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import type { Type } from '@nestjs/common'
 import { Test } from '@nestjs/testing'
-import { WorkflowsModule, getWorkflowToken } from '../src'
+import { defineQueue, WorkflowsModule, getWorkflowToken } from '../src'
 import type { WorkflowClass, WorkflowsOptions, WorkflowClient } from '../src'
 import { sqlite } from '../src/sqlite'
+import { WORKFLOW_METADATA, ACTIVITIES_METADATA } from '../src/decorators'
 
 export interface TestAppOptions {
   readonly providers?: readonly Type[]
@@ -19,14 +20,34 @@ export async function testApp<W extends WorkflowClass>(workflow: W, options: Tes
   const root: WorkflowsOptions = {
     namespace: 'integration',
     storage: sqlite({ filename: options.filename ?? join(directory, 'workflows.sqlite') }),
-    queues: options.queues ?? { work: { concurrency: 2 } },
     pollInterval: '20ms',
     lease: { duration: '1500ms', refreshInterval: '400ms' }
   }
   const configured = options.execution ? { ...root, execution: options.execution } : root
   const module = await Test.createTestingModule({
-    imports: [WorkflowsModule.forRoot(configured), WorkflowsModule.forFeature([workflow])],
-    providers: [workflow, ...(options.providers ?? [])]
+    imports: [
+      WorkflowsModule.forRoot(configured),
+      WorkflowsModule.forFeature({
+        name: 'integration',
+        workflows: [
+          ...new Set([
+            workflow,
+            ...(options.providers ?? []).filter((provider): provider is WorkflowClass =>
+              Reflect.hasOwnMetadata(WORKFLOW_METADATA, provider)
+            )
+          ])
+        ],
+        activities: (options.providers ?? []).filter((provider) =>
+          Reflect.hasOwnMetadata(ACTIVITIES_METADATA, provider)
+        ),
+        providers: (options.providers ?? []).filter(
+          (provider) =>
+            !Reflect.hasOwnMetadata(WORKFLOW_METADATA, provider) &&
+            !Reflect.hasOwnMetadata(ACTIVITIES_METADATA, provider)
+        ),
+        queues: options.queues ?? [{ queue: defineQueue('work'), concurrency: 2 }]
+      })
+    ]
   }).compile()
   try {
     await module.init()

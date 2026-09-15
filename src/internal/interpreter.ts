@@ -120,7 +120,7 @@ export class WorkflowInterpreter {
           options: ChildOptions | undefined,
           wait: boolean
         ): Promise<any> => {
-          const contract = self.registry.contract(provider)
+          const contract = self.registry.childContract(self.workflow, provider)
           const encoded = encode(input)
           const policy = options?.parentClosePolicy ?? 'request-cancel'
           if (policy !== 'abandon' && policy !== 'request-cancel')
@@ -170,7 +170,7 @@ export class WorkflowInterpreter {
         const context: WorkflowContext = {
           executionId: self.executionId,
           activities<T>(provider: Type<T>): ActivityClient<T> {
-            const entries = self.registry.activityContracts(provider).map((activity) => [
+            const entries = self.registry.activitiesFor(self.workflow, provider).map((activity) => [
               activity.method,
               (input: any, options: StepOptions) => {
                 const encoded = encode(input)

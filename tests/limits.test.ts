@@ -3,7 +3,7 @@ import { z } from 'zod'
 import { ManagedRuntime } from 'effect'
 import * as SqliteClient from '@effect/sql-sqlite-bun/SqliteClient'
 import { SqlClient } from 'effect/unstable/sql'
-import { Activities, Activity, Workflow } from '../src'
+import { defineQueue, Activities, Activity, Workflow } from '../src'
 import type { WorkflowContext, ActivityContext } from '../src'
 import { Journal } from '../src/internal/journal'
 import { Permits } from '../src/internal/permits'
@@ -19,7 +19,7 @@ class Keyed {
   @Activity({
     name: 'limits.keyed',
     version: 1,
-    queue: 'work',
+    queue: defineQueue('work'),
     input: z.object({ key: z.string(), id: z.string() }),
     output: z.string(),
     key: (input) => input.key
@@ -53,7 +53,9 @@ class Batches {
 test('queue global and per-key permits enforce shared limits independently of local and branch slots', async () => {
   const app = await testApp(Batches, {
     providers: [Keyed],
-    queues: { work: { concurrency: 8, globalConcurrency: 2, perKeyConcurrency: 1 } }
+    queues: [
+      { queue: defineQueue('work'), concurrency: 8, globalConcurrency: 2, perKeyConcurrency: 1 }
+    ]
   })
   try {
     const handle = await app.client.start('all')

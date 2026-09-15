@@ -151,7 +151,7 @@ export class WorkflowsTestingModule {
       ...root,
       namespace: root.namespace ?? `test-${randomUUID()}`,
       storage: root.storage ?? { driver: 'sqlite', filename: ':memory:', runtime: 'auto' },
-      queues: root.queues ?? {},
+      queues: root.queues ?? [],
       pollInterval: root.pollInterval ?? '5ms',
       topology: 'single-node'
     }

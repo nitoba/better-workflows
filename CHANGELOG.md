@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.0-alpha.3
+
+Breaking registration refactor: replace array-only `forFeature` and string/dictionary queues with domain-owned object registrations and `defineQueue` references. No compatibility overloads.
+
+- Optional root queue catalog; root/feature defaults and explicit final deployment overrides.
+- `forFeature` / `forFeatureAsync` distinguish implementations, clients and activity contracts without constructing remote worker services.
+- Default routing/retry/timeout on `@Activities`, method overrides and frozen owner-resolved contracts.
+- Actual Nest import/export visibility, private queues, shared activity capabilities and `useExisting` bindings.
+- Single runtime and local semaphore per logical queue; global/per-key policies remain shared across processes.
+- Root/feature execution intersections, per-feature workflow budgets and optional non-global root infrastructure.
+- Public admin/testing APIs use the same queue references and catalog. Existing durability and schema administration remain intact.
+- Updated examples, Node consumers and PostgreSQL two-process tests; new modularity tests and runnable multi-domain example.
+
 ## 0.1.0-alpha.2
 
 - Durable keyed map and named parallel branches, with persisted admission and ordered settle-all results.

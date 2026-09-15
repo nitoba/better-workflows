@@ -1,6 +1,6 @@
 {
   "name": "better-workflows",
-  "version": "0.1.0-alpha.2",
+  "version": "0.1.0-alpha.3",
   "description": "Durable workflows, activities, signals and timers with NestJS-native decorators and dependency injection.",
   "keywords": [
     "better-workflows",
@@ -69,7 +69,8 @@
     "hooks:install": "lefthook install",
     "prepublishOnly": "bun run check",
     "example": "bun examples/reports.ts",
-    "test:node": "node tests/package/node-smoke.mjs && node tests/package/advanced-smoke.mjs"
+    "test:node": "node tests/package/node-smoke.mjs && node tests/package/advanced-smoke.mjs",
+    "example:modular": "bun examples/modular.ts"
   },
   "dependencies": {
     "@effect/platform-node": "4.0.0-rc.115",
