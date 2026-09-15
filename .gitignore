@@ -8,3 +8,4 @@ coverage/
 *.tgz
 *.tar.gz
 *.log
+.workflows-build-*/

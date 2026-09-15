@@ -1,21 +1,36 @@
-import { existsSync, readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { cp, mkdtemp, readFile, rm, symlink } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-// The pinned GitHub source exposes dist/ but has no prepare lifecycle script.
-// Build the installed dependency, not a copied implementation or a workspace link.
+// GitHub installs contain source, but this pinned alpha has no prepare script.
+// tsdown's declaration plugin excludes paths under node_modules. Build the exact
+// installed source in a disposable staging directory and install its dist output.
+// This is NOT a vendored library: package.json + bun.lock resolve the GitHub SHA.
 const root = resolve(import.meta.dir, '..');
-const dependency = resolve(root, 'node_modules/better-workflows');
-if (!existsSync(resolve(dependency, 'src/index.ts'))) {
-  throw new Error('GitHub source missing. Run bun install with development dependencies.');
+const dependency = join(root, 'node_modules/better-workflows');
+const manifest = JSON.parse(await readFile(join(dependency, 'package.json'), 'utf8'));
+if (manifest.name !== 'better-workflows') throw new Error('Unexpected GitHub dependency');
+const staging = await mkdtemp(join(root, '.workflows-build-'));
+try {
+  for (const path of ['src', 'package.json', 'tsconfig.json']) {
+    await cp(join(dependency, path), join(staging, path), { recursive: true });
+  }
+  await symlink(join(root, 'node_modules'), join(staging, 'node_modules'), 'junction');
+  const child = spawnSync(process.env.NODE_BINARY ?? 'node', [
+    join(root, 'node_modules/tsdown/dist/run.mjs'), '--config-loader', 'native',
+    '--config', join(root, 'scripts/workflows-build.config.mjs'),
+  ], {
+    cwd: root, stdio: 'inherit',
+    env: { ...process.env, BW_BUILD_DIR: staging },
+  });
+  if (child.error) throw child.error;
+  if (child.status !== 0) throw new Error(`GitHub dependency build exited with ${child.status}`);
+  for (const name of ['index.mjs', 'index.d.mts', 'sqlite.mjs', 'testing.d.mts']) {
+    if (!existsSync(join(staging, 'dist', name))) throw new Error(`Missing dependency output: ${name}`);
+  }
+  await rm(join(dependency, 'dist'), { recursive: true, force: true });
+  await cp(join(staging, 'dist'), join(dependency, 'dist'), { recursive: true });
+} finally {
+  await rm(staging, { recursive: true, force: true });
 }
-const manifest = JSON.parse(readFileSync(resolve(dependency, 'package.json'), 'utf8'));
-if (manifest.name !== 'better-workflows') throw new Error('Unexpected dependency package');
-const result = spawnSync(process.execPath, ['run', '--bun', '--cwd', dependency, 'build'], {
-  cwd: root,
-  env: { ...process.env, PATH: `${root}/node_modules/.bin:${process.env.PATH ?? ''}` },
-  stdio: 'inherit',
-});
-if (result.error) throw result.error;
-if (result.status !== 0) process.exit(result.status ?? 1);
-if (!existsSync(resolve(dependency, 'dist/index.mjs'))) throw new Error('Dependency build produced no entry point');

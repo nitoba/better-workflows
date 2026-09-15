@@ -1,0 +1,48 @@
+name: Arxiv research application
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  application:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      mailpit:
+        image: axllent/mailpit:v1.31.1
+        ports:
+          - 1025:1025
+          - 8025:8025
+    env:
+      MAILPIT_API_URL: http://127.0.0.1:8025
+      SMTP_PORT: "1025"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.2'
+      - name: Install pinned GitHub dependency
+        run: |
+          if test -f bun.lock; then bun install --frozen-lockfile; else bun install; fi
+      - run: bun run check
+      - name: Verify Mailpit
+        run: curl --fail --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:8025/livez
+      - name: Integration with real Mailpit and native LiteParse
+        run: bun run test:integration
+      - name: Compiled application bootstrap
+        run: |
+          DATA_DIR="${RUNNER_TEMP}/compiled-app" bun -e 'import {createApplication} from "./dist/bootstrap.js"; const app=await createApplication(); await app.init(); const response=await app.inject({method:"GET",url:"/api/health"}); if(response.statusCode!==200) throw new Error(response.body); await app.close();'
+      - name: Export validated public source and lockfile
+        run: |
+          git ls-files -z > "${RUNNER_TEMP}/source-files"
+          if ! git ls-files --error-unmatch bun.lock >/dev/null 2>&1; then printf 'bun.lock\0' >> "${RUNNER_TEMP}/source-files"; fi
+          tar --null -T "${RUNNER_TEMP}/source-files" -czf "${RUNNER_TEMP}/validated-application.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: validated-application
+          path: ${{ runner.temp }}/validated-application.tar.gz
+          retention-days: 1

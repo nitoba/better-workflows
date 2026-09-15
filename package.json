@@ -16,7 +16,8 @@
     "test:integration": "bun test tests/integration --timeout 60000",
     "check": "bun run typecheck && bun run test && bun run build",
     "doctor": "bun run scripts/doctor.ts",
-    "smoke:live": "bun run scripts/live-smoke.ts"
+    "smoke:live": "bun run scripts/live-smoke.ts",
+    "source:check": "bun run scripts/source-smoke.ts"
   },
   "dependencies": {
     "@nestjs/common": "12.0.3",
@@ -26,8 +27,8 @@
     "ai": "7.0.102",
     "@llamaindex/liteparse": "2.14.6",
     "better-workflows": "github:nitoba/better-workflows#f08d38d31c276c2f5474125b6b36fa37eac79fb8",
-    "fast-xml-parser": "latest",
-    "nodemailer": "latest",
+    "fast-xml-parser": "5.11.1",
+    "nodemailer": "10.0.10",
     "reflect-metadata": "0.2.2",
     "rxjs": "7.8.2",
     "zod": "4.6.5"
@@ -36,7 +37,7 @@
     "@nestjs/testing": "12.0.3",
     "@types/bun": "1.4.1",
     "@types/node": "22.20.2",
-    "@types/nodemailer": "latest",
+    "@types/nodemailer": "8.0.2",
     "tsdown": "0.22.14",
     "typescript": "7.0.2"
   }

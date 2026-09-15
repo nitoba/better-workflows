@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "target": "ES2023", "module": "NodeNext", "moduleResolution": "NodeNext",
+    "lib": ["ES2024", "DOM"], "types": ["bun", "node"],
+    "strict": true, "noUncheckedIndexedAccess": true, "noImplicitOverride": true,
+    "experimentalDecorators": true, "emitDecoratorMetadata": true,
+    "esModuleInterop": true, "verbatimModuleSyntax": true,
+    "skipLibCheck": true, "sourceMap": true
+  },
+  "include": ["src/**/*.ts", "tests/**/*.ts", "scripts/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}

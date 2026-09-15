@@ -1,0 +1,36 @@
+name: arxiv-research-workflows
+services:
+  mailpit:
+    image: axllent/mailpit:v1.31.1
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:1025:1025"
+      - "127.0.0.1:8025:8025"
+    environment:
+      MP_DATABASE: /data/mailpit.db
+      MP_MAX_MESSAGES: "1000"
+    volumes:
+      - mailpit-data:/data
+  api:
+    profiles: [app]
+    build: .
+    init: true
+    env_file: .env
+    environment:
+      HOST: 0.0.0.0
+      DATA_DIR: /app/data
+      SMTP_HOST: mailpit
+      SMTP_PORT: "1025"
+      NODE_BINARY: node
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - research-data:/app/data
+    depends_on:
+      - mailpit
+    stop_grace_period: 40s
+    pids_limit: 256
+    mem_limit: 2g
+volumes:
+  mailpit-data:
+  research-data:

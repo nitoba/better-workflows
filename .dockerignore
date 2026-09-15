@@ -1,0 +1,12 @@
+node_modules
+dist
+data
+.env
+.env.*
+.git
+.github
+coverage
+.workflows-build-*
+*.zip
+*.tgz
+*.log
