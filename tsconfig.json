@@ -23,6 +23,6 @@
     "experimentalDecorators": true,
     "emitDecoratorMetadata": true
   },
-  "include": ["src", "tests", "scripts", "tsdown.config.ts"],
+  "include": ["src", "tests", "scripts", "tsdown.config.ts", "examples"],
   "exclude": ["tests/package/consumer", "node_modules", "dist"]
 }

@@ -1,30 +1,94 @@
-name: Bootstrap development environment
+name: CI
 on:
   push:
-    paths:
-      - '.github/workflows/bootstrap.yml'
-      - 'package.json'
+  pull_request:
 permissions:
   contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
-  bootstrap:
+  quality:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: '1.4.2'
       - run: bun install
-      - run: bun run typecheck && bun test && bun run build
-      - name: Export offline development workspace
-        run: |
-          cp "$(command -v bun)" .ci-bun
-          tar --exclude=.git --exclude='*.tar.gz' -czf /tmp/development-workspace.tar.gz .
+      - run: bun run typecheck
+      - run: bun test
+      - run: bun run build && bun run publint
+      - name: Lint
+        run: bun run lint 2>&1 | tee lint.log
+      - name: Diagnostics
+        if: always()
+        run: git ls-files -s > manifest.txt
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: development-workspace
-          path: /tmp/development-workspace.tar.gz
+          name: diagnostics
+          path: |
+            lint.log
+            bun.lock
+            manifest.txt
           retention-days: 1
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        node: ['22.16.0', '24']
+    env:
+      NODE_OPTIONS: --experimental-strip-types
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.2'
+      - run: bun install
+      - run: bun run build
+      - run: bun run test:node
+  postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: workflows
+          POSTGRES_PASSWORD: workflows
+          POSTGRES_DB: workflows
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd 'pg_isready -U workflows'
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      WORKFLOWS_TEST_POSTGRES_URL: postgres://workflows:workflows@127.0.0.1:5432/workflows
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.2'
+      - run: bun install
+      - run: bun run build
+      - run: bun run test:node

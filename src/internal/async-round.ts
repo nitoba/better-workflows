@@ -20,7 +20,7 @@ export function runAsyncRound<A>(
   execute: (control: RoundControl) => Promise<A>,
   signal: AbortSignal
 ): Promise<RoundResult<A>> {
-  return new Promise(resolve => {
+  return new Promise((resolve) => {
     let active = true
     const finish = (result: RoundResult<A>): void => {
       if (!active) return
@@ -30,7 +30,9 @@ export function runAsyncRound<A>(
     }
     const close = (): void => finish({ status: 'closed' })
     const control: RoundControl = {
-      get active() { return active },
+      get active() {
+        return active
+      },
       park<T>(): Promise<T> {
         finish({ status: 'suspended' })
         return new Promise<T>(() => {})
@@ -43,13 +45,14 @@ export function runAsyncRound<A>(
     signal.addEventListener('abort', close, { once: true })
     // A callback can throw before producing a Promise. This handles both paths.
     Promise.resolve()
-      .then(() => active ? execute(control) : control.park<A>())
+      .then(() => (active ? execute(control) : control.park<A>()))
       .then(
-        value => finish({ status: 'success', value }),
-        error => finish({
-          status: 'failure',
-          error: error instanceof Error ? error : new Error(String(error))
-        })
+        (value) => finish({ status: 'success', value }),
+        (error) =>
+          finish({
+            status: 'failure',
+            error: error instanceof Error ? error : new Error(String(error))
+          })
       )
   })
 }
