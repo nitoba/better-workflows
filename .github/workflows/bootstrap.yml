@@ -1,0 +1,29 @@
+name: Bootstrap development environment
+on:
+  push:
+    paths:
+      - '.github/workflows/bootstrap.yml'
+permissions:
+  contents: read
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.2'
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck && bun run build
+      - name: Export offline development workspace
+        run: |
+          cp "$(command -v bun)" .ci-bun
+          tar --exclude=.git --exclude='*.tar.gz' -czf /tmp/development-workspace.tar.gz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: development-workspace
+          path: /tmp/development-workspace.tar.gz
+          retention-days: 1
