@@ -46,7 +46,7 @@ export function Activity<I, O>(options: ActivityOptions<I, O>): MethodDecorator 
   validateActivityDefaults(options)
   positiveInteger(options.version, 'Activity version')
   return (target, property, descriptor) => {
-    // oxlint-disable-next-line anti-slop/no-runtime-typeof -- Legacy decorators must reject static methods and non-method descriptors.
+    // oxlint-disable anti-slop/no-runtime-typeof -- Decorator boundary must reject static methods and non-method descriptors.
     if (
       typeof target === 'function' ||
       typeof descriptor.value !== 'function' ||
@@ -54,6 +54,7 @@ export function Activity<I, O>(options: ActivityOptions<I, O>): MethodDecorator 
     ) {
       throw new WorkflowError('INVALID_ACTIVITY', 'Activities must be named instance methods')
     }
+    // oxlint-enable anti-slop/no-runtime-typeof
     Reflect.defineMetadata(
       ACTIVITY_METADATA,
       Object.freeze({ ...options, ...freezeActivityDefaults(options) }),

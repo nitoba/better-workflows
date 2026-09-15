@@ -70,7 +70,7 @@ test('durable map keeps two waiting branches admitted, settles in input order an
       await handle.signal(Approved, key, { idempotencyKey: key })
     const result = await handle.result({ timeout: '8s' })
     expect(result.map((value) => value.split(':')[0])).toEqual(['a', 'b', 'c', 'd'])
-    expect(result.map((value) => value.split(':')[1]).sort()).toEqual(['1', '2', '3', '4'])
+    expect(result.map((value) => value.split(':')[1]!).sort()).toEqual(['1', '2', '3', '4'])
     expect(app.module.get(Work).seen.sort()).toEqual(['a', 'b', 'c', 'd'])
     expect(app.module.get(Work).max).toBe(2)
   } finally {

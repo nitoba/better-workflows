@@ -86,7 +86,7 @@ export class Registry {
   }
 
   contract(provider: WorkflowClass): RegisteredWorkflow {
-    // Safety: @Workflow validates and owns this metadata.
+    // SAFETY: @Workflow validates and owns this metadata.
     const options = Reflect.getOwnMetadata(WORKFLOW_METADATA, provider) as
       | WorkflowOptions<any, any>
       | undefined
@@ -412,7 +412,7 @@ export class Registry {
   }
 
   private resolveActivities(provider: Type, feature: Feature): ActivityContract[] {
-    // Safety: @Activities writes and validates these defaults; getOwnMetadata avoids implicit class ownership inheritance.
+    // SAFETY: @Activities writes and validates these defaults; getOwnMetadata avoids implicit class ownership inheritance.
     const classDefaults = Reflect.getOwnMetadata(ACTIVITIES_METADATA, provider) as
       | ActivityDefaults
       | undefined
@@ -428,7 +428,7 @@ export class Registry {
       for (const method of Object.getOwnPropertyNames(prototype)) {
         if (methods.has(method)) continue
         methods.add(method)
-        // Safety: @Activity is the only writer of validated method metadata.
+        // SAFETY: @Activity is the only writer of validated method metadata.
         const declared = Reflect.getOwnMetadata(ACTIVITY_METADATA, prototype, method) as
           | ActivityOptions<any, any>
           | undefined
@@ -480,20 +480,15 @@ function selected(queues: readonly QueueReference[] | undefined, name: string): 
 function mergeActivityDefaults(
   ...layers: readonly (ActivityDefaults | undefined)[]
 ): ActivityDefaults {
-  const result: {
-    queue?: QueueReference
-    retry?: ActivityDefaults['retry']
-    timeout?: ActivityDefaults['timeout']
-  } = {}
+  let result: ActivityDefaults = {}
   for (const layer of layers) {
     if (!layer) continue
     validateActivityDefaults(layer)
-    if (layer.queue !== undefined) result.queue = layer.queue
-    if (layer.retry !== undefined) result.retry = Object.freeze({ ...layer.retry })
-    if (layer.timeout !== undefined) result.timeout = layer.timeout
+    if (layer.queue !== undefined) result = { ...result, queue: layer.queue }
+    if (layer.retry !== undefined) result = { ...result, retry: Object.freeze({ ...layer.retry }) }
+    if (layer.timeout !== undefined) result = { ...result, timeout: layer.timeout }
   }
-  // Safety: only present values are assigned above; exact optional property types are preserved.
-  return Object.freeze(result) as ActivityDefaults
+  return Object.freeze(result)
 }
 
 function resolveQueue(...layers: readonly (QueueSettings | undefined)[]): QueueOptions {
@@ -517,10 +512,8 @@ function resolveQueue(...layers: readonly (QueueSettings | undefined)[]): QueueO
       perKeyConcurrency = layer.perKeyConcurrency
     }
   }
-  const result: { concurrency: number; globalConcurrency?: number; perKeyConcurrency?: number } = {
-    concurrency
-  }
-  if (globalConcurrency !== null) result.globalConcurrency = globalConcurrency
-  if (perKeyConcurrency !== null) result.perKeyConcurrency = perKeyConcurrency
+  let result: QueueOptions = { concurrency }
+  if (globalConcurrency !== null) result = { ...result, globalConcurrency }
+  if (perKeyConcurrency !== null) result = { ...result, perKeyConcurrency }
   return Object.freeze(result)
 }

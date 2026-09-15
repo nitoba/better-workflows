@@ -182,7 +182,7 @@ export class WorkflowsRuntime
     return this.stop()
   }
 
-  health(): { readonly ready: boolean; readonly lastDispatchError: string | undefined } {
+  health() {
     return { ready: this.ready && !this.stopping, lastDispatchError: this.lastDispatchError }
   }
 

@@ -7,7 +7,7 @@ import type { MigrationStatus } from '../admin-types'
 import { Journal } from './journal'
 import { ENGINE_VERSION } from './migrations'
 
-const required: Readonly<Record<string, readonly string[]>> = {
+const required = {
   better_workflows_schema: ['version'],
   better_workflows_runs: [
     'execution_id',
@@ -53,7 +53,7 @@ const required: Readonly<Record<string, readonly string[]>> = {
   better_workflows_queue: ['sequence', 'id', 'queue_name', 'element', 'state', 'acquired_by'],
   cluster_migrations: ['migration_id'],
   better_workflows_queue_migrations: ['migration_id']
-}
+} satisfies Readonly<Record<string, readonly string[]>>
 const fail = (code: string, message: string) =>
   Effect.fail<Failure>({ code, message, retryable: false })
 

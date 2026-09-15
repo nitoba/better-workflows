@@ -250,7 +250,7 @@ export class WorkflowInterpreter {
                 )
               }
             ])
-            // Safety: discovered decorators define these methods; inputs and results are schema validated.
+            // SAFETY: discovered decorators define these methods; inputs and results are schema validated.
             return Object.fromEntries(entries) as ActivityClient<T>
           },
           sleep(step, duration) {
@@ -326,7 +326,7 @@ export class WorkflowInterpreter {
                   )
                   .pipe(
                     Effect.map((values) => {
-                      // Safety: keys and results use the same stable ordered branch list.
+                      // SAFETY: keys and results use the same stable ordered branch list.
                       return Object.fromEntries(keys.map((key, i) => [key, values[i]])) as {
                         [K in keyof T]: Awaited<ReturnType<T[K]>>
                       }

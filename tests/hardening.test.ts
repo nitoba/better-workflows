@@ -256,12 +256,16 @@ test('canonical JSON enforces the persistence contract and does not silently dro
     1n,
     new Date(),
     { missing: undefined },
+    // oxlint-disable-next-line eslint/no-sparse-arrays -- Deliberate invalid input to the persistence validator.
     [, 1],
     Symbol('x'),
     () => 1
   ]
   for (const value of invalid) expect(() => encode(value)).toThrow()
-  const cyclic: { self?: object } = {}
+  interface CyclicValue {
+    self?: CyclicValue
+  }
+  const cyclic: CyclicValue = {}
   cyclic.self = cyclic
   expect(() => encode(cyclic)).toThrow()
   const accessor = Object.defineProperty({}, 'value', {

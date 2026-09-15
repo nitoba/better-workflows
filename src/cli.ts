@@ -75,7 +75,7 @@ async function main(): Promise<void> {
       const path = flags.get('--plan')
       if (!path || flags.get('--confirm') !== 'true')
         throw new WorkflowError('CONFIRMATION_REQUIRED', 'Prune requires --plan and --confirm')
-      // Safety: the retention API validates the plan's namespace, integrity, identifiers and live state before any deletion.
+      // SAFETY: the retention API validates the plan's namespace, integrity, identifiers and live state before any deletion.
       const plan = JSON.parse(await readFile(path, 'utf8')) as RetentionPlan
       console.log(JSON.stringify(await admin.retention.prune(plan, { confirm: true }), null, 2))
     } else throw new WorkflowError('INVALID_ARGUMENT', usage)

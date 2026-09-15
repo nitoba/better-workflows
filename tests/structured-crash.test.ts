@@ -44,7 +44,7 @@ function worker(directory: string, scenario: string, mode: string) {
     }, 12000)
     child.once('message', (value) => {
       clearTimeout(timeout)
-      // Safety: both ends of this IPC channel use the fixture's Message protocol.
+      // SAFETY: both ends of this IPC channel use the fixture's Message protocol.
       resolve(value as Message)
     })
     child.once('error', (error) => {

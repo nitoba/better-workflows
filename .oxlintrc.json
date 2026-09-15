@@ -33,5 +33,26 @@
     "**/coverage/**",
     "**/.turbo/**",
     "**/.angular/**"
+  ],
+  "overrides": [
+    {
+      "files": ["src/internal/**/*.ts"],
+      "rules": {
+        // Effect generators cannot be arrow functions; allow only the intentional self capture.
+        "typescript/no-this-alias": [
+          "error",
+          {
+            "allowedNames": ["self"]
+          }
+        ]
+      }
+    },
+    {
+      "files": ["tests/**/*.test.ts"],
+      "rules": {
+        // bun-types 1.4.1 types .rejects matchers as void although the runtime returns a Promise.
+        "typescript/await-thenable": "off"
+      }
+    }
   ]
 }

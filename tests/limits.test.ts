@@ -96,25 +96,24 @@ test('SQL admission is atomic, releases on completion, rejects drift and fences 
     const first = await runtime.runPromise(
       permits.claim('q', envelope('a', 'same'), 1, 'owner-a', 1000)
     )
-    if (typeof first === 'string') throw new Error(first)
+    if (first === 'blocked' || first === 'closed' || first === 'stale') throw new Error(first)
     expect(
       await runtime.runPromise(permits.claim('q', envelope('b', 'same'), 1, 'owner-b', 1000))
     ).toBe('blocked')
     const other = await runtime.runPromise(
       permits.claim('q', envelope('c', 'different'), 1, 'owner-c', 1000)
     )
-    expect(typeof other).toBe('object')
+    expect(other).toMatchObject({ owner_token: 'owner-c' })
     const replacement = await runtime.runPromise(
       permits.claim('q', envelope('a', 'same'), 2, 'replacement', 1000)
     )
-    if (typeof replacement === 'string') throw new Error(replacement)
+    if (replacement === 'blocked' || replacement === 'closed' || replacement === 'stale')
+      throw new Error(replacement)
     expect(await runtime.runPromise(permits.finish(first, '["json",1]', null))).toBe(false)
     expect(await runtime.runPromise(permits.finish(replacement, '["json",1]', null))).toBe(true)
     expect(
-      typeof (await runtime.runPromise(
-        permits.claim('q', envelope('b', 'same'), 1, 'owner-b', 1000)
-      ))
-    ).toBe('object')
+      await runtime.runPromise(permits.claim('q', envelope('b', 'same'), 1, 'owner-b', 1000))
+    ).toMatchObject({ owner_token: 'owner-b' })
     const drift = await runtime.runPromiseExit(
       permits.register('q', { concurrency: 1, globalConcurrency: 3, perKeyConcurrency: 1 })
     )

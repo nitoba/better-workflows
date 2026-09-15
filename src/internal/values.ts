@@ -8,12 +8,12 @@ const MAX_BYTES = 1_048_576
 export function milliseconds(value: Duration): number {
   let duration: number
   if (Number.isFinite(value)) {
-    // Safety: Number.isFinite only accepts primitive finite numbers at runtime.
+    // SAFETY: Number.isFinite only accepts primitive finite numbers at runtime.
     duration = value as number
   } else {
     const match = /^(\d+(?:\.\d+)?)(ms|s|m|h|d)$/.exec(String(value))
     if (!match) throw new WorkflowError('INVALID_DURATION', `Invalid duration: ${value}`)
-    // Safety: the regular expression captures only keys of UNITS.
+    // SAFETY: the regular expression captures only keys of UNITS.
     duration = Number(match[1]) * UNITS[match[2] as keyof typeof UNITS]
   }
   if (!Number.isSafeInteger(duration) || duration < 0) {
@@ -26,7 +26,7 @@ export function milliseconds(value: Duration): number {
 }
 
 export function identifier(value: string, label: string): void {
-  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- Configuration may originate in untyped JavaScript or JSON.
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof, eslint/no-control-regex -- Validate untyped configuration and intentionally reject ASCII control characters.
   if (typeof value !== 'string' || !value || value.length > 256 || /[\u0000-\u001f]/.test(value)) {
     throw new WorkflowError(
       'INVALID_IDENTIFIER',
@@ -140,7 +140,7 @@ export function decode<T>(value: string): T {
     throw new WorkflowError('CORRUPT_STORAGE', 'Invalid transport envelope')
   }
   const [kind, data] = envelope
-  // Safety: values were validated by the registered Standard Schema before encoding and are revalidated at handler boundaries.
+  // SAFETY: values were validated by the registered Standard Schema before encoding and are revalidated at handler boundaries.
   return (kind === 'void' ? undefined : data) as T
 }
 

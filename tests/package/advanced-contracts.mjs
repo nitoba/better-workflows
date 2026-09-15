@@ -25,9 +25,9 @@ export class Odd {
     return work(value, context)
   }
 }
-for (const [provider, name] of [
-  [Even, 'even'],
-  [Odd, 'odd']
+for (const { provider, name } of [
+  { provider: Even, name: 'even' },
+  { provider: Odd, name: 'odd' }
 ]) {
   Activities()(provider)
   Activity({
