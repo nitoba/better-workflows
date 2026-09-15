@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { Cause, Effect, Exit, Result, Schema, Semaphore, Tracer } from 'effect'
+import { Cause, Effect, Exit, Result, Schema, Clock, Semaphore, Tracer } from 'effect'
 import { DurableDeferred } from 'effect/unstable/workflow'
 import { PersistedQueue } from 'effect/unstable/persistence'
 import { ActivityError, WorkflowError, toFailure } from '../errors'
@@ -7,6 +7,8 @@ import { SqlError } from 'effect/unstable/sql/SqlError'
 import type { Failure } from '../errors'
 import type { WorkflowsOptions } from '../types'
 import { decode, encode, milliseconds, validate } from './values'
+import { Permits } from './permits'
+import { effectClock } from './clock'
 import { durable, promised } from './effects'
 import type { Journal } from './journal'
 import type { RegisteredActivity } from './registry'
@@ -41,6 +43,7 @@ export function activityWorker(
   const refresh = milliseconds(options.lease?.refreshInterval ?? '10s')
   const poll = Math.min(milliseconds(options.pollInterval ?? '100ms'), refresh)
   const concurrency = options.queues[activity.options.queue]!.concurrency
+  const permits = new Permits(journal)
 
   const execute = (payload: ActivityEnvelope, delivery: number) =>
     Effect.gen(function* () {
@@ -48,16 +51,26 @@ export function activityWorker(
       if (run.control === 'cancel' || ['completed', 'failed', 'cancelled'].includes(run.state))
         return Exit.fail(cancelled)
       const owner = randomUUID()
-      const claim = yield* durable(
-        journal.claim(payload.executionId, payload.stepId, payload.attempt, delivery, owner, lease)
+      let claim = yield* durable(
+        permits.claim(activity.options.queue, payload, delivery, owner, lease)
       )
-      if (claim.state === 'completed') {
-        return claim.failure_json
-          ? Exit.fail(decode<Failure>(claim.failure_json))
-          : Exit.succeed(claim.result_json!)
+      while (claim === 'blocked') {
+        yield* Effect.sleep(poll)
+        claim = yield* durable(
+          permits.claim(activity.options.queue, payload, delivery, owner, lease)
+        )
       }
-      if (claim.owner_token !== owner) return yield* Effect.fail(new LeaseLost())
+      if (claim === 'closed') return Exit.fail(cancelled)
+      if (claim === 'stale') return yield* Effect.fail(new LeaseLost())
+      const owned = claim
+      if (owned.state === 'completed') {
+        return owned.failure_json
+          ? Exit.fail(decode<Failure>(owned.failure_json))
+          : Exit.succeed(owned.result_json!)
+      }
+      if (owned.owner_token !== owner) return yield* Effect.fail(new LeaseLost())
 
+      yield* Effect.addFinalizer(() => permits.release(owned).pipe(Effect.orDie))
       const work = promised(async (signal) => {
         const input = await validate(
           activity.options.input,
@@ -75,7 +88,7 @@ export function activityWorker(
           async heartbeat(details = null) {
             if (signal.aborted)
               throw new WorkflowError('LEASE_LOST', 'This invocation has been aborted')
-            const exit = await Effect.runPromiseExit(journal.heartbeat(claim, details))
+            const exit = await Effect.runPromiseExit(journal.heartbeat(owned, details))
             if (Exit.isFailure(exit)) {
               const error = Cause.squash(exit.cause)
               // Preserve infrastructure identity: the worker must NACK this delivery.
@@ -99,7 +112,11 @@ export function activityWorker(
               retryable: true
             })
         }),
-        Effect.result
+        Effect.result,
+        (effect) =>
+          journal.clock
+            ? Effect.provideService(effect, Clock.Clock, effectClock(journal.clock))
+            : effect
       )
 
       const monitor = Effect.gen(function* () {
@@ -112,7 +129,7 @@ export function activityWorker(
             return Result.fail(cancelled)
           if (elapsed >= refresh) {
             elapsed = 0
-            if (!(yield* durable(journal.renewClaim(claim, lease))))
+            if (!(yield* durable(permits.renew(owned, lease))))
               return yield* Effect.fail(new LeaseLost())
           }
         }
@@ -123,8 +140,8 @@ export function activityWorker(
       const result = Result.isSuccess(outcome) ? outcome.success : null
       if (
         !(yield* durable(
-          journal.finishClaim(
-            claim,
+          permits.finish(
+            owned,
             result,
             failure,
             payload.attempt < payload.maxAttempts ? payload.retryDelayMs : undefined
@@ -133,7 +150,7 @@ export function activityWorker(
       )
         return yield* Effect.fail(new LeaseLost())
       return failure ? Exit.fail(failure) : Exit.succeed(result!)
-    }).pipe(semaphore.withPermits(1))
+    }).pipe(Effect.scoped, semaphore.withPermits(1))
 
   return Effect.gen(function* () {
     const queue = yield* PersistedQueue.make({

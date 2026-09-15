@@ -1,4 +1,7 @@
 import { Effect } from 'effect'
+import { createHash } from 'node:crypto'
+import type { BusinessClock } from './clock'
+import { migrateAdvanced } from './migrations'
 import type { SqlClient } from 'effect/unstable/sql/SqlClient'
 import type { Failure } from '../errors'
 import type { HistoryPage, JsonValue } from '../types'
@@ -24,7 +27,9 @@ export interface RunRow {
   readonly failure_json: string | null
 }
 
-interface CommandRow {
+export interface CommandRow {
+  readonly scope: string
+  readonly protocol: number
   readonly step_id: string
   readonly ordinal: number
   readonly signature: string
@@ -72,10 +77,13 @@ const fail = (code: string, message: string) =>
 export class Journal {
   constructor(
     readonly sql: SqlClient,
-    readonly namespace: string
+    readonly namespace: string,
+    readonly clock?: BusinessClock
   ) {}
 
-  readonly now = () =>
+  readonly now = () => (this.clock ? Effect.sync(() => this.clock!.now()) : this.databaseNow())
+
+  readonly databaseNow = () =>
     this.sql
       .onDialectOrElse({
         pg: () =>
@@ -89,7 +97,7 @@ export class Journal {
       })
       .pipe(Effect.map((rows) => Math.floor(rows[0]!.now)))
 
-  migrate() {
+  migrateBase() {
     const sql = this.sql
     return sql.withTransaction(
       Effect.gen(function* () {
@@ -97,7 +105,7 @@ export class Journal {
         const versions = yield* sql<{
           version: number
         }>`SELECT version FROM better_workflows_schema`
-        if (versions.some((row) => row.version > 1)) {
+        if (versions.some((row) => row.version > 2)) {
           return yield* fail(
             'SCHEMA_TOO_NEW',
             'This database was migrated by a newer better-workflows version'
@@ -194,6 +202,20 @@ export class Journal {
     )
   }
 
+  migrate() {
+    const self = this
+    return self.sql.withTransaction(
+      Effect.gen(function* () {
+        yield* self.sql.onDialectOrElse({
+          pg: () => self.sql`SELECT pg_advisory_xact_lock(748023196)`,
+          orElse: () => Effect.void
+        })
+        yield* self.migrateBase()
+        yield* migrateAdvanced(self.sql)
+      })
+    )
+  }
+
   /** Caller must hold the run's transaction when adding a history event. */
   event(
     executionId: string,
@@ -214,6 +236,20 @@ export class Journal {
     })
   }
 
+  lockDedupe(name: string, key: string) {
+    return this.sql.onDialectOrElse({
+      pg: () =>
+        this
+          .sql`SELECT pg_advisory_xact_lock(hashtextextended(${JSON.stringify([this.namespace, name, key])}, 0))`,
+      orElse: () => this.sql`UPDATE better_workflows_schema SET version=version WHERE version=1`
+    })
+  }
+
+  lockRun(executionId: string) {
+    return this
+      .sql`UPDATE better_workflows_runs SET event_sequence = event_sequence WHERE execution_id = ${executionId} AND namespace = ${this.namespace}`
+  }
+
   get(executionId: string, workflowName?: string) {
     const self = this
     return Effect.gen(function* () {
@@ -230,6 +266,17 @@ export class Journal {
     const self = this
     return self.sql.withTransaction(
       Effect.gen(function* () {
+        yield* self.lockDedupe(name, key)
+        const [tombstone] = yield* self.sql<{ input_hash: string; execution_id: string }>`
+          SELECT input_hash, execution_id FROM better_workflows_tombstones
+          WHERE namespace = ${self.namespace} AND workflow_name = ${name} AND dedupe_key = ${key}`
+        if (tombstone)
+          return yield* fail(
+            tombstone.input_hash === createHash('sha256').update(input).digest('hex')
+              ? 'EXECUTION_PRUNED'
+              : 'IDEMPOTENCY_CONFLICT',
+            `Execution ${tombstone.execution_id} was pruned; its idempotency key is still reserved`
+          )
         const now = yield* self.now()
         const rows = yield* self.sql<RunRow>`INSERT INTO better_workflows_runs
         (execution_id, namespace, workflow_name, version, dedupe_key, input_json, created_at, updated_at)
@@ -315,24 +362,25 @@ export class Journal {
     stepId: string,
     ordinal: number,
     signature: string,
-    kind: string
+    kind: string,
+    scope = ''
   ) {
     const self = this
     return self.sql.withTransaction(
       Effect.gen(function* () {
         const inserted =
-          yield* self.sql`INSERT INTO better_workflows_commands(execution_id, step_id, ordinal, signature)
-        VALUES (${executionId}, ${stepId}, ${ordinal}, ${signature}) ON CONFLICT DO NOTHING RETURNING step_id`
+          yield* self.sql`INSERT INTO better_workflows_commands(execution_id, step_id, ordinal, signature, scope, protocol)
+        VALUES (${executionId}, ${stepId}, ${ordinal}, ${signature}, ${scope}, 2) ON CONFLICT DO NOTHING RETURNING step_id`
         const [row] = yield* self.sql<CommandRow>`SELECT * FROM better_workflows_commands
         WHERE execution_id = ${executionId} AND step_id = ${stepId}`
-        if (!row || row.ordinal !== ordinal || row.signature !== signature) {
+        if (!row || row.ordinal !== ordinal || row.signature !== signature || row.scope !== scope) {
           return yield* fail(
             'NON_DETERMINISTIC_WORKFLOW',
             `Command ${ordinal} (${stepId}) differs from the persisted history; retain the old workflow version`
           )
         }
         if (inserted.length)
-          yield* self.event(executionId, 'command.scheduled', { kind, ordinal }, stepId)
+          yield* self.event(executionId, 'command.scheduled', { kind, ordinal, scope }, stepId)
         yield* self.sql`UPDATE better_workflows_runs SET state = 'waiting', wait_type = ${kind}, wait_step = ${stepId}
         WHERE execution_id = ${executionId} AND namespace = ${self.namespace}
         AND state NOT IN ('completed', 'failed', 'cancelled')`
@@ -361,11 +409,11 @@ export class Journal {
     )
   }
 
-  assertEnd(executionId: string, count: number) {
+  assertEnd(executionId: string, count: number, scope = '') {
     const self = this
     return Effect.gen(function* () {
       const [row] = yield* self.sql<CommandRow>`SELECT * FROM better_workflows_commands
-        WHERE execution_id = ${executionId} AND ordinal >= ${count} LIMIT 1`
+        WHERE execution_id = ${executionId} AND scope = ${scope} AND ordinal >= ${count} LIMIT 1`
       if (row)
         return yield* fail(
           'NON_DETERMINISTIC_WORKFLOW',
@@ -509,7 +557,8 @@ export class Journal {
     const self = this
     return self.sql.withTransaction(
       Effect.gen(function* () {
-        const now = yield* self.now()
+        yield* self.lockRun(executionId)
+        const now = yield* self.databaseNow()
         yield* self.sql`INSERT INTO better_workflows_claims
         (execution_id, step_id, attempt, delivery_attempt, owner_token, lease_until, state)
         VALUES (${executionId}, ${stepId}, ${attempt}, ${delivery}, ${owner}, ${now + lease}, 'running')
@@ -530,7 +579,7 @@ export class Journal {
   renewClaim(claim: ClaimRow, lease: number) {
     const self = this
     return Effect.gen(function* () {
-      const now = yield* self.now()
+      const now = yield* self.databaseNow()
       const rows = yield* self.sql`UPDATE better_workflows_claims SET lease_until = ${now + lease}
         WHERE execution_id = ${claim.execution_id} AND step_id = ${claim.step_id} AND attempt = ${claim.attempt}
         AND owner_token = ${claim.owner_token} AND state = 'running' AND lease_until > ${now}
@@ -548,7 +597,8 @@ export class Journal {
     const self = this
     return self.sql.withTransaction(
       Effect.gen(function* () {
-        const now = yield* self.now()
+        yield* self.lockRun(claim.execution_id)
+        const now = yield* self.databaseNow()
         const rows =
           yield* self.sql`UPDATE better_workflows_claims SET state = 'completed', result_json = ${result}, failure_json = ${failure ? encode(failure) : null}
         WHERE execution_id = ${claim.execution_id} AND step_id = ${claim.step_id} AND attempt = ${claim.attempt}
@@ -563,12 +613,13 @@ export class Journal {
             claim.step_id
           )
         if (rows.length && failure?.retryable && retryDelay !== undefined) {
+          const retryAt = (yield* self.now()) + retryDelay
           yield* self.sql`INSERT INTO better_workflows_retries(execution_id, step_id, attempt, deadline)
-          VALUES (${claim.execution_id}, ${claim.step_id}, ${claim.attempt}, ${now + retryDelay}) ON CONFLICT DO NOTHING`
+          VALUES (${claim.execution_id}, ${claim.step_id}, ${claim.attempt}, ${retryAt}) ON CONFLICT DO NOTHING`
           yield* self.event(
             claim.execution_id,
             'activity.retry-scheduled',
-            { attempt: claim.attempt + 1, at: new Date(now + retryDelay).toISOString() },
+            { attempt: claim.attempt + 1, at: new Date(retryAt).toISOString() },
             claim.step_id
           )
         }
@@ -598,7 +649,8 @@ export class Journal {
     const self = this
     return self.sql.withTransaction(
       Effect.gen(function* () {
-        const now = yield* self.now()
+        yield* self.lockRun(claim.execution_id)
+        const now = yield* self.databaseNow()
         const rows = yield* self.sql`UPDATE better_workflows_claims SET lease_until = lease_until
         WHERE execution_id = ${claim.execution_id} AND step_id = ${claim.step_id} AND attempt = ${claim.attempt}
         AND owner_token = ${claim.owner_token} AND state = 'running' AND lease_until > ${now} RETURNING owner_token`

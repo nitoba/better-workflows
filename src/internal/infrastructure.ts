@@ -1,15 +1,23 @@
 import { mkdir } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
-import { Layer, ManagedRuntime, Option, Redacted } from 'effect'
+import { Effect, Layer, ManagedRuntime, Option, Redacted } from 'effect'
 import * as NodeCrypto from '@effect/platform-node/NodeCrypto'
 import { ClusterWorkflowEngine, RunnerAddress, SingleRunner } from 'effect/unstable/cluster'
 import { PersistedQueue } from 'effect/unstable/persistence'
+import { SqlClient } from 'effect/unstable/sql'
+import { migrateAll, validateMigrations } from './schema-admin'
 import { WorkflowError } from '../errors'
 import type { WorkflowsOptions } from '../types'
 import { identifier, milliseconds, positiveInteger } from './values'
 
 export function validateOptions(options: WorkflowsOptions): void {
   identifier(options.namespace, 'Namespace')
+  if (
+    options.migrations !== undefined &&
+    options.migrations !== 'run' &&
+    options.migrations !== 'validate'
+  )
+    throw new WorkflowError('INVALID_CONFIGURATION', 'migrations must be run or validate')
   const poll = milliseconds(options.pollInterval ?? '100ms')
   positiveInteger(poll, 'pollInterval')
   positiveInteger(options.execution?.workflows?.concurrency ?? 20, 'Workflow concurrency')
@@ -24,6 +32,10 @@ export function validateOptions(options: WorkflowsOptions): void {
   for (const [name, queue] of Object.entries(options.queues)) {
     identifier(name, 'Queue name')
     positiveInteger(queue.concurrency, `Queue ${name} concurrency`)
+    if (queue.globalConcurrency !== undefined)
+      positiveInteger(queue.globalConcurrency, `Queue ${name} global concurrency`)
+    if (queue.perKeyConcurrency !== undefined)
+      positiveInteger(queue.perKeyConcurrency, `Queue ${name} per-key concurrency`)
   }
   for (const queue of options.execution?.activities?.queues ?? []) {
     if (!options.queues[queue]) throw new WorkflowError('UNKNOWN_QUEUE', queue)
@@ -47,20 +59,14 @@ export function validateOptions(options: WorkflowsOptions): void {
 
 export async function makeInfrastructure(options: WorkflowsOptions) {
   validateOptions(options)
-  const config = options.storage
-  if (config.driver === 'sqlite' && config.filename !== ':memory:')
-    await mkdir(dirname(resolve(config.filename)), { recursive: true })
-  const database =
-    config.driver === 'postgres'
-      ? (await import('@effect/sql-pg/PgClient')).layer({
-          url: Redacted.make(config.connectionString),
-          maxConnections: config.maxConnections
-        })
-      : config.runtime === 'bun' || (config.runtime === 'auto' && 'Bun' in globalThis)
-        ? (await import('@effect/sql-sqlite-bun/SqliteClient')).layer({ filename: config.filename })
-        : (await import('@effect/sql-sqlite-node/SqliteClient')).layer({
-            filename: config.filename
-          })
+  const database = Layer.mergeAll(await makeDatabase(options.storage), NodeCrypto.layer)
+  const preparedDatabase = Layer.effectDiscard(
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient
+      if (options.migrations === 'validate') yield* validateMigrations(sql)
+      else yield* migrateAll(options.namespace)
+    })
+  ).pipe(Layer.provideMerge(database))
   const poll = milliseconds(options.pollInterval ?? '100ms')
   const sharding = {
     entityMessagePollInterval: poll,
@@ -94,8 +100,23 @@ export async function makeInfrastructure(options: WorkflowsOptions) {
   const layer = Layer.mergeAll(
     ClusterWorkflowEngine.layer.pipe(Layer.provide(cluster)),
     PersistedQueue.layer.pipe(Layer.provide(queueStorage))
-  ).pipe(Layer.provideMerge(Layer.mergeAll(database, NodeCrypto.layer)))
+  ).pipe(Layer.provideMerge(preparedDatabase))
   return ManagedRuntime.make(layer)
 }
 
 export type Infrastructure = Awaited<ReturnType<typeof makeInfrastructure>>
+
+export async function makeDatabase(config: WorkflowsOptions['storage']) {
+  if (config.driver === 'sqlite' && config.filename !== ':memory:')
+    await mkdir(dirname(resolve(config.filename)), { recursive: true })
+  return config.driver === 'postgres'
+    ? (await import('@effect/sql-pg/PgClient')).layer({
+        url: Redacted.make(config.connectionString),
+        maxConnections: config.maxConnections
+      })
+    : config.runtime === 'bun' || (config.runtime === 'auto' && 'Bun' in globalThis)
+      ? (await import('@effect/sql-sqlite-bun/SqliteClient')).layer({ filename: config.filename })
+      : (await import('@effect/sql-sqlite-node/SqliteClient')).layer({
+          filename: config.filename
+        })
+}

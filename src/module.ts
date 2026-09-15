@@ -1,10 +1,20 @@
 import { Module } from '@nestjs/common'
 import type { DynamicModule } from '@nestjs/common'
 import { DiscoveryModule } from '@nestjs/core'
+import { WorkflowsAdmin, WORKFLOWS_ADMIN_BACKEND } from './admin'
 import { WorkflowClient } from './client'
 import { getWorkflowToken } from './decorators'
 import type { WorkflowClass, WorkflowsAsyncOptions, WorkflowsOptions } from './types'
 import { WORKFLOWS_OPTIONS, WorkflowsRuntime } from './internal/runtime'
+
+const adminProviders = [
+  {
+    provide: WORKFLOWS_ADMIN_BACKEND,
+    inject: [WorkflowsRuntime],
+    useFactory: (runtime: WorkflowsRuntime) => runtime.adminBackend()
+  },
+  WorkflowsAdmin
+]
 
 @Module({})
 export class WorkflowsModule {
@@ -13,8 +23,12 @@ export class WorkflowsModule {
       module: WorkflowsModule,
       global: true,
       imports: [DiscoveryModule],
-      providers: [{ provide: WORKFLOWS_OPTIONS, useValue: options }, WorkflowsRuntime],
-      exports: [WorkflowsRuntime]
+      providers: [
+        { provide: WORKFLOWS_OPTIONS, useValue: options },
+        WorkflowsRuntime,
+        ...adminProviders
+      ],
+      exports: [WorkflowsRuntime, WorkflowsAdmin]
     }
   }
 
@@ -29,9 +43,10 @@ export class WorkflowsModule {
           useFactory: options.useFactory,
           inject: [...(options.inject ?? [])]
         },
-        WorkflowsRuntime
+        WorkflowsRuntime,
+        ...adminProviders
       ],
-      exports: [WorkflowsRuntime]
+      exports: [WorkflowsRuntime, WorkflowsAdmin]
     }
   }
 

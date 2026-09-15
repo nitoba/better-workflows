@@ -35,6 +35,8 @@ export interface ActivityOptions<I = unknown, O = unknown> {
   readonly output: StandardSchemaV1<O, O>
   readonly retry?: RetryOptions
   readonly timeout?: Duration
+  /** Stable key within a logical queue, evaluated on validated input. */
+  readonly key?: (input: I) => string
 }
 
 export interface SignalDefinition<I = unknown, O = I> {
@@ -87,9 +89,70 @@ export type ActivityClient<T> = {
     : never
 }
 
+export interface MapOptions<I> {
+  readonly key: (input: I, index: number) => string
+  readonly concurrency: number
+}
+
+export interface ChildOptions {
+  /** Applied durably when the parent terminates, including cancellation. */
+  readonly parentClosePolicy?: 'request-cancel' | 'abandon'
+}
+
+export interface ChildExecution {
+  readonly executionId: string
+}
+
+export interface SagaContext extends WorkflowContext {
+  readonly executionId: string
+  step<A>(
+    stepId: string,
+    execute: (context: WorkflowContext) => Promise<A>,
+    compensate: (value: A, context: WorkflowContext) => Promise<void>
+  ): Promise<A>
+}
+
+export type ParallelTasks = Readonly<Record<string, (context: WorkflowContext) => Promise<any>>>
+export type ParallelResults<T extends ParallelTasks> = {
+  readonly [K in keyof T]: Awaited<ReturnType<T[K]>>
+}
+
+export interface QueueOptions {
+  /** Local worker slots per process. */
+  readonly concurrency: number
+  /** Shared across processes in the same namespace and queue. */
+  readonly globalConcurrency?: number
+  /** Shared across processes for each Activity.key in the queue. */
+  readonly perKeyConcurrency?: number
+}
+
 export interface WorkflowContext {
   readonly executionId: string
   activities<T>(provider: Type<T>): ActivityClient<T>
+  map<I, O>(
+    stepId: string,
+    items: readonly I[],
+    options: MapOptions<I>,
+    execute: (item: I, context: WorkflowContext, index: number) => Promise<O>
+  ): Promise<O[]>
+  parallel<T extends ParallelTasks>(
+    stepId: string,
+    tasks: T,
+    options?: { readonly concurrency?: number }
+  ): Promise<ParallelResults<T>>
+  child<W extends WorkflowClass>(
+    stepId: string,
+    workflow: W,
+    input: WorkflowInput<W>,
+    options?: ChildOptions
+  ): Promise<WorkflowOutput<W>>
+  startChild<W extends WorkflowClass>(
+    stepId: string,
+    workflow: W,
+    input: WorkflowInput<W>,
+    options?: ChildOptions
+  ): Promise<ChildExecution>
+  saga<A>(stepId: string, execute: (saga: SagaContext) => Promise<A>): Promise<A>
   sleep(stepId: string, duration: Duration): Promise<void>
   waitForSignal<I, O>(
     stepId: string,
@@ -132,7 +195,8 @@ export interface WorkflowsOptions {
     readonly workflows?: { readonly enabled?: boolean; readonly concurrency?: number }
     readonly activities?: { readonly enabled?: boolean; readonly queues?: readonly string[] }
   }
-  readonly queues: Readonly<Record<string, { readonly concurrency: number }>>
+  readonly queues: Readonly<Record<string, QueueOptions>>
+  readonly migrations?: 'run' | 'validate'
   readonly pollInterval?: Duration
   readonly lease?: { readonly duration: Duration; readonly refreshInterval: Duration }
 }

@@ -1,33 +1,17 @@
 import { randomUUID } from 'node:crypto'
-import { Inject, Injectable, Logger } from '@nestjs/common'
-import type {
-  OnApplicationBootstrap,
-  OnModuleDestroy,
-  OnApplicationShutdown,
-  Type
-} from '@nestjs/common'
+import { Inject, Injectable, Logger, Optional } from '@nestjs/common'
+import type { OnApplicationBootstrap, OnModuleDestroy, OnApplicationShutdown } from '@nestjs/common'
 import { DiscoveryService } from '@nestjs/core'
-import { Cause, Effect, Exit, Option, Result, Scope, Semaphore } from 'effect'
+import { Cause, Effect, Exit, Option, Scope, Semaphore } from 'effect'
 import { SqlClient } from 'effect/unstable/sql'
-import {
-  DurableClock,
-  DurableDeferred,
-  DurableQueue,
-  Workflow,
-  WorkflowEngine
-} from 'effect/unstable/workflow'
+import { DurableDeferred, Workflow, WorkflowEngine } from 'effect/unstable/workflow'
 import { PersistedQueue } from 'effect/unstable/persistence'
 import { WorkflowError, toFailure } from '../errors'
 import type { Failure } from '../errors'
 import type {
-  ActivityClient,
-  Duration,
   ExecutionSnapshot,
   SignalDefinition,
-  StepOptions,
-  SignalWaitOptions,
   WorkflowClass,
-  WorkflowContext,
   WorkflowInput,
   WorkflowsOptions
 } from '../types'
@@ -39,9 +23,17 @@ import { decode, encode, identifier, milliseconds, validate } from './values'
 import { makeInfrastructure, validateOptions } from './infrastructure'
 import type { Infrastructure } from './infrastructure'
 import { durable, promised } from './effects'
-import { interpretAsync } from './bridge'
 import { activityQueue, retryDeferred, signalDeferred, workflowDefinition } from './wire'
 import type { EngineQueue } from './wire'
+import type { AdminBackend } from '../admin-types'
+import { SqlAdministration } from './administration'
+import { migrationStatus, validateMigrations } from './schema-admin'
+import { Permits } from './permits'
+import { WorkflowInterpreter } from './interpreter'
+import { AdvancedJournal } from './advanced-journal'
+import { WORKFLOWS_TEST_CLOCK } from './clock'
+import type { BusinessClock } from './clock'
+import { childDeferred, timerDeferred } from './wire'
 import { activityWorker } from './worker'
 
 export const WORKFLOWS_OPTIONS = Symbol.for('better-workflows/options')
@@ -49,7 +41,6 @@ type Services =
   | WorkflowEngine.WorkflowEngine
   | PersistedQueue.PersistedQueueFactory
   | SqlClient.SqlClient
-type WorkflowServices = Services | WorkflowEngine.WorkflowInstance
 const terminal = (row: RunRow) => ['completed', 'failed', 'cancelled'].includes(row.state)
 
 @Injectable()
@@ -66,11 +57,13 @@ export class WorkflowsRuntime
   private stopPromise?: Promise<void>
   private dispatchCursor = ''
   private waitCursor = ''
+  private readonly dispatchLock = Semaphore.makeUnsafe(1)
   private lastDispatchError: string | undefined
 
   constructor(
     @Inject(WORKFLOWS_OPTIONS) readonly options: WorkflowsOptions,
-    @Inject(DiscoveryService) private readonly discovery: DiscoveryService
+    @Inject(DiscoveryService) private readonly discovery: DiscoveryService,
+    @Optional() @Inject(WORKFLOWS_TEST_CLOCK) private readonly clock?: BusinessClock
   ) {
     validateOptions(options)
     this.registry = new Registry(options.namespace)
@@ -98,8 +91,9 @@ export class WorkflowsRuntime
     this.infrastructure = infrastructure
     try {
       const sql = await infrastructure.runPromise(SqlClient.SqlClient)
-      this.journal = new Journal(sql, this.options.namespace)
-      await this.run(this.journal.migrate())
+      this.journal = new Journal(sql, this.options.namespace, this.clock)
+      for (const [name, options] of Object.entries(this.options.queues))
+        await this.run(new Permits(this.journal).register(name, options))
       const workflowSlots = Semaphore.makeUnsafe(
         this.options.execution?.workflows?.concurrency ?? 20
       )
@@ -303,6 +297,11 @@ export class WorkflowsRuntime
     const { name, version, queue } = activity.options
     if (!this.options.queues[queue])
       throw new WorkflowError('UNKNOWN_QUEUE', `Configure queue ${queue} used by ${name}`)
+    if (this.options.queues[queue]?.perKeyConcurrency !== undefined && !activity.options.key)
+      throw new WorkflowError(
+        'ACTIVITY_KEY_REQUIRED',
+        `${name} must declare key for queue ${queue}`
+      )
     const key = JSON.stringify([name, version, queue])
     let definition = this.queues.get(key)
     if (!definition) {
@@ -330,152 +329,15 @@ export class WorkflowsRuntime
       const input = yield* promised(() =>
         validate(workflow.options.input, decode(payload), `${workflow.options.name} input`)
       )
-      let ordinal = 0
-      const used = new Set<string>()
-      const value = yield* interpretAsync<any, WorkflowServices>(async (dispatch) => {
-        const command = <A>(
-          stepId: string,
-          kind: string,
-          signature: string,
-          operation: Effect.Effect<A, Failure, WorkflowServices>
-        ): Promise<A> => {
-          identifier(stepId, 'stepId')
-          const sequence = ordinal++
-          return dispatch(
-            Effect.gen(function* () {
-              if (used.has(stepId))
-                return yield* Effect.fail<Failure>({
-                  code: 'NON_DETERMINISTIC_WORKFLOW',
-                  message: `Duplicate stepId: ${stepId}`,
-                  retryable: false
-                })
-              used.add(stepId)
-              yield* self.gate(executionId)
-              yield* durable(
-                self.store().beginCommand(executionId, stepId, sequence, signature, kind)
-              )
-              return yield* operation.pipe(
-                Effect.matchEffect({
-                  onSuccess: (result) =>
-                    durable(self.store().finishCommand(executionId, stepId, true)).pipe(
-                      Effect.as(result)
-                    ),
-                  onFailure: (error) =>
-                    durable(self.store().finishCommand(executionId, stepId, false)).pipe(
-                      Effect.andThen(Effect.fail(error))
-                    )
-                })
-              )
-            })
-          )
-        }
-        const context: WorkflowContext = {
-          executionId,
-          activities<T>(provider: Type<T>): ActivityClient<T> {
-            const entries = self.registry.activityContracts(provider).map((activity) => [
-              activity.method,
-              (input: any, options: StepOptions) => {
-                const stepId = options.stepId
-                const encoded = encode(input)
-                const policy = activity.options.retry
-                const retry = {
-                  maxAttempts: policy?.maxAttempts ?? 1,
-                  backoff: policy?.backoff ?? 'exponential',
-                  initialDelay: milliseconds(policy?.initialDelay ?? '1s'),
-                  maxDelay: milliseconds(policy?.maxDelay ?? '1m')
-                }
-                const timeoutMs = milliseconds(activity.options.timeout ?? '5m')
-                const signature = encode({
-                  kind: 'activity',
-                  name: activity.options.name,
-                  version: activity.options.version,
-                  queue: activity.options.queue,
-                  input: encoded,
-                  retry,
-                  timeoutMs
-                })
-                const queue = self.queue(activity)
-                const operation = Effect.gen(function* () {
-                  yield* promised(() =>
-                    validate(
-                      activity.options.input,
-                      decode(encoded),
-                      `${activity.options.name} input`
-                    )
-                  )
-                  for (let attempt = 1; attempt <= retry.maxAttempts; attempt++) {
-                    yield* self.gate(executionId)
-                    const result = yield* Effect.result(
-                      DurableQueue.process(queue, {
-                        executionId,
-                        stepId,
-                        name: activity.options.name,
-                        version: activity.options.version,
-                        input: encoded,
-                        attempt,
-                        timeoutMs,
-                        maxAttempts: retry.maxAttempts,
-                        retryDelayMs: Math.min(
-                          retry.maxDelay,
-                          retry.initialDelay *
-                            (retry.backoff === 'exponential' ? 2 ** (attempt - 1) : 1)
-                        )
-                      })
-                    )
-                    if (Result.isSuccess(result)) return decode(result.success)
-                    if (!result.failure.retryable || attempt === retry.maxAttempts)
-                      return yield* Effect.fail(result.failure)
-                    yield* DurableDeferred.await(retryDeferred(stepId, attempt))
-                  }
-                  return yield* Effect.die('Invalid retry policy escaped decorator validation')
-                })
-                return command(stepId, 'activity', signature, operation)
-              }
-            ])
-            // Safety: each generated function corresponds to a discovered @Activity method; its input/output is schema-validated.
-            return Object.fromEntries(entries) as ActivityClient<T>
-          },
-          sleep(stepId: string, duration: Duration): Promise<void> {
-            const delay = milliseconds(duration)
-            return command(
-              stepId,
-              'timer',
-              encode({ kind: 'timer', delay }),
-              DurableClock.sleep({
-                name: `sleep/${encodeURIComponent(stepId)}`,
-                duration: delay,
-                inMemoryThreshold: 0
-              })
-            )
-          },
-          waitForSignal<I, O>(
-            stepId: string,
-            signal: SignalDefinition<I, O>,
-            options?: SignalWaitOptions
-          ): Promise<O> {
-            const allowed = workflow.options.signals?.find(
-              (candidate) => candidate.name === signal.name
-            )
-            if (!allowed) throw new WorkflowError('UNKNOWN_SIGNAL', signal.name)
-            const timeout =
-              options?.timeout === undefined ? undefined : milliseconds(options.timeout)
-            const operation = Effect.gen(function* () {
-              yield* durable(self.store().wait(executionId, stepId, allowed.name, timeout))
-              const value = yield* DurableDeferred.await(signalDeferred(stepId))
-              return decode<O>(value)
-            })
-            return command(
-              stepId,
-              'signal',
-              encode({ kind: 'signal', name: signal.name, timeout: timeout ?? null }),
-              operation
-            )
-          }
-        }
-        return workflow.handler!(input, context)
-      })
-      yield* self.gate(executionId)
-      yield* durable(self.store().assertEnd(executionId, ordinal))
+      const interpreter = new WorkflowInterpreter(
+        self.store(),
+        self.registry,
+        workflow,
+        executionId,
+        () => self.gate(executionId),
+        (activity) => self.queue(activity)
+      )
+      const value = yield* interpreter.run((ctx) => workflow.handler!(input, ctx))
       return yield* promised(async () =>
         encode(await validate(workflow.options.output, value, `${workflow.options.name} output`))
       )
@@ -502,10 +364,107 @@ export class WorkflowsRuntime
     })
   }
 
+  adminBackend(): AdminBackend {
+    return {
+      migrationStatus: () => this.run(migrationStatus(this.store().sql)),
+      validateMigrations: () => this.run(validateMigrations(this.store().sql)),
+      migrate: () =>
+        Promise.reject(
+          new WorkflowError(
+            'MIGRATION_RUNTIME_ACTIVE',
+            'Use createWorkflowsAdmin before starting application workers'
+          )
+        ),
+      previewRetention: (options) => this.run(new SqlAdministration(this.store()).preview(options)),
+      pruneRetention: (plan, confirm) =>
+        this.run(new SqlAdministration(this.store()).prune(plan, confirm)),
+      setQueueLimits: async (queue, options) => {
+        await this.run(new SqlAdministration(this.store()).setQueueLimits(queue, options))
+      }
+    }
+  }
+
+  async flush(): Promise<void> {
+    await this.run(this.dispatch())
+  }
+
+  async testingSnapshot(): Promise<{ revision: string; nextDeadline: number | null }> {
+    const store = this.store()
+    const snapshot = await this.run(
+      Effect.gen(function* () {
+        const rows = yield* store.sql<{
+          execution_id: string
+          event_sequence: number
+          state: string
+          dispatched: number
+          applied_revision: number
+        }>`SELECT execution_id, event_sequence, state, dispatched, applied_revision FROM better_workflows_runs WHERE namespace = ${store.namespace} ORDER BY execution_id`
+        const [timer] = yield* store.sql<{
+          deadline: number | null
+        }>`SELECT MIN(deadline) AS deadline FROM (
+        SELECT t.deadline FROM better_workflows_timers t JOIN better_workflows_runs r ON r.execution_id=t.execution_id WHERE r.namespace=${store.namespace} AND t.delivered=0 AND r.control<>'cancel' AND r.state NOT IN ('completed','failed','cancelled')
+        UNION ALL SELECT t.deadline FROM better_workflows_retries t JOIN better_workflows_runs r ON r.execution_id=t.execution_id WHERE r.namespace=${store.namespace} AND t.delivered=0 AND r.control<>'cancel' AND r.state NOT IN ('completed','failed','cancelled')
+        UNION ALL SELECT t.deadline FROM better_workflows_waits t JOIN better_workflows_runs r ON r.execution_id=t.execution_id WHERE r.namespace=${store.namespace} AND t.state='pending' AND r.control<>'cancel' AND r.state NOT IN ('completed','failed','cancelled')
+      ) deadlines`
+        return { revision: JSON.stringify(rows), nextDeadline: timer?.deadline ?? null }
+      })
+    )
+    if (this.lastDispatchError)
+      throw new WorkflowError('TEST_DISPATCH_ERROR', this.lastDispatchError)
+    return snapshot
+  }
+
   private dispatch() {
     const self = this
     return Effect.gen(function* () {
       const journal = self.store()
+      const advanced = new AdvancedJournal(journal)
+      yield* advanced.closeChildren()
+      for (const timer of yield* advanced.dueTimers()) {
+        const run = yield* journal.get(timer.execution_id)
+        const definition = workflowDefinition(
+          self.options.namespace,
+          run.workflow_name,
+          run.version
+        )
+        const deferred = timerDeferred(timer.step_id)
+        yield* DurableDeferred.done(deferred, {
+          token: DurableDeferred.tokenFromExecutionId(deferred, {
+            workflow: definition,
+            executionId: timer.execution_id
+          }),
+          exit: Exit.void
+        })
+        yield* advanced.timerDelivered(timer)
+      }
+      for (const child of yield* advanced.readyChildren()) {
+        const parent = yield* journal.get(child.parent_id)
+        const run = yield* journal.get(child.child_id)
+        const definition = workflowDefinition(
+          self.options.namespace,
+          parent.workflow_name,
+          parent.version
+        )
+        const deferred = childDeferred(child.step_id)
+        const error =
+          run.state === 'cancelled'
+            ? {
+                code: 'CHILD_WORKFLOW_CANCELLED',
+                message: `Child ${child.child_id} was cancelled`,
+                retryable: false
+              }
+            : run.failure_json
+              ? decode<Failure>(run.failure_json)
+              : null
+        yield* DurableDeferred.done(deferred, {
+          token: DurableDeferred.tokenFromExecutionId(deferred, {
+            workflow: definition,
+            executionId: child.parent_id
+          }),
+          exit: error ? Exit.fail(error) : Exit.succeed(run.result_json!)
+        })
+        yield* advanced.childDelivered(child)
+      }
       for (const row of yield* journal.pendingDispatch()) {
         const definition = workflowDefinition(
           self.options.namespace,
@@ -584,6 +543,6 @@ export class WorkflowsRuntime
       for (const row of active) yield* self.reconcile(row)
       self.dispatchCursor = active.length === 100 ? active.at(-1)!.execution_id : ''
       self.lastDispatchError = undefined
-    })
+    }).pipe(this.dispatchLock.withPermits(1))
   }
 }

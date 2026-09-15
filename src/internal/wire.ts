@@ -33,7 +33,8 @@ export function activityQueue(namespace: string, queue: string, name: string, ve
       attempt: Schema.Number,
       timeoutMs: Schema.Number,
       maxAttempts: Schema.Number,
-      retryDelayMs: Schema.Number
+      retryDelayMs: Schema.Number,
+      concurrencyKey: Schema.optional(Schema.String)
     },
     success: Schema.String,
     error: FailureSchema,
@@ -53,4 +54,14 @@ export function signalDeferred(stepId: string) {
 
 export function retryDeferred(stepId: string, attempt: number) {
   return DurableDeferred.make(`better-workflows/retry/${encodeURIComponent(stepId)}/${attempt}`)
+}
+
+export function childDeferred(stepId: string) {
+  return DurableDeferred.make(`better-workflows/child/${encodeURIComponent(stepId)}`, {
+    success: Schema.String,
+    error: FailureSchema
+  })
+}
+export function timerDeferred(stepId: string) {
+  return DurableDeferred.make(`better-workflows/timer/${encodeURIComponent(stepId)}`)
 }

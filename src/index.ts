@@ -29,6 +29,13 @@ export type {
   CancelOptions,
   SignalDeliveryOptions,
   StepOptions,
+  MapOptions,
+  ChildOptions,
+  ChildExecution,
+  SagaContext,
+  ParallelTasks,
+  ParallelResults,
+  QueueOptions,
   WorkflowClass,
   WorkflowContext,
   WorkflowHandler,
@@ -38,3 +45,5 @@ export type {
   WorkflowsAsyncOptions,
   WorkflowsOptions
 } from './types'
+
+export { WorkflowsAdmin } from './admin'

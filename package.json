@@ -1,6 +1,6 @@
 {
   "name": "better-workflows",
-  "version": "0.1.0-alpha.1",
+  "version": "0.1.0-alpha.2",
   "description": "Durable workflows, activities, signals and timers with NestJS-native decorators and dependency injection.",
   "keywords": [
     "better-workflows",
@@ -16,6 +16,9 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/nitoba/better-workflows.git"
+  },
+  "bin": {
+    "better-workflows": "./dist/cli.mjs"
   },
   "files": [
     "dist",
@@ -41,6 +44,14 @@
     "./postgres": {
       "types": "./dist/postgres.d.mts",
       "import": "./dist/postgres.mjs"
+    },
+    "./admin": {
+      "types": "./dist/admin.d.mts",
+      "import": "./dist/admin.mjs"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.mts",
+      "import": "./dist/testing.mjs"
     }
   },
   "scripts": {
@@ -58,7 +69,7 @@
     "hooks:install": "lefthook install",
     "prepublishOnly": "bun run check",
     "example": "bun examples/reports.ts",
-    "test:node": "node tests/package/node-smoke.mjs"
+    "test:node": "node tests/package/node-smoke.mjs && node tests/package/advanced-smoke.mjs"
   },
   "dependencies": {
     "@effect/platform-node": "4.0.0-rc.115",

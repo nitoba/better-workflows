@@ -1,8 +1,11 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { Effect } from 'effect'
-import { ActivityError, toFailure } from '../errors'
+import { ActivityError, WorkflowError, toFailure } from '../errors'
 import type { Failure } from '../errors'
 import { runAsyncRound } from './async-round'
 import type { RoundControl, RoundResult } from './async-round'
+
+const currentInterpreter = new AsyncLocalStorage<symbol>()
 
 export interface Dispatcher<R> {
   <A>(operation: Effect.Effect<A, Failure, R>): Promise<A>
@@ -19,6 +22,7 @@ export function interpretAsync<A, R>(
 ): Effect.Effect<A, Failure, R> {
   return Effect.suspend(() => {
     const abort = new AbortController()
+    const identity = Symbol('workflow-interpreter')
     const commands: Effect.Effect<void, Failure, R>[] = []
     let control: RoundControl | undefined
     let outcome: RoundResult<A> | undefined
@@ -27,6 +31,11 @@ export function interpretAsync<A, R>(
 
     const dispatch: Dispatcher<R> = <T>(operation: Effect.Effect<T, Failure, R>): Promise<T> => {
       if (!control?.active) return new Promise<T>(() => {})
+      if (currentInterpreter.getStore() !== identity)
+        throw new WorkflowError(
+          'WRONG_WORKFLOW_CONTEXT',
+          'Use the context supplied to the current branch or saga, not a captured outer context'
+        )
       pending++
       return new Promise<T>((resolve, reject) => {
         commands.push(
@@ -54,7 +63,7 @@ export function interpretAsync<A, R>(
     const program = Effect.gen(function* () {
       void runAsyncRound((round) => {
         control = round
-        return execute(dispatch)
+        return currentInterpreter.run(identity, () => execute(dispatch))
       }, abort.signal).then((result) => {
         outcome = result
         wake()
