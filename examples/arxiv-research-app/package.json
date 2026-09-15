@@ -10,27 +10,27 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "start": "node --env-file=.env dist/main.js",
-    "test": "bun test"
+    "test": "bun test tests"
   },
   "dependencies": {
     "better-workflows": "github:nitoba/better-workflows#f08d38d31c276c2f5474125b6b36fa37eac79fb8",
     "@nestjs/common": "12.0.3",
     "@nestjs/core": "12.0.3",
     "@nestjs/platform-express": "12.0.3",
-    "@ai-sdk/google": "latest",
-    "ai": "latest",
-    "@llamaindex/liteparse": "latest",
-    "fast-xml-parser": "latest",
-    "nodemailer": "latest",
+    "@ai-sdk/google": "4.0.72",
+    "ai": "7.0.102",
+    "@llamaindex/liteparse": "2.14.4",
+    "fast-xml-parser": "5.11.1",
+    "nodemailer": "10.0.10",
     "reflect-metadata": "0.2.2",
     "rxjs": "7.8.2",
-    "zod": "latest"
+    "zod": "4.6.5"
   },
   "devDependencies": {
     "@nestjs/testing": "12.0.3",
     "@types/bun": "1.4.1",
-    "@types/node": "^24",
-    "@types/nodemailer": "latest",
+    "@types/node": "24.13.5",
+    "@types/nodemailer": "8.0.2",
     "typescript": "7.0.2",
     "tsdown": "0.22.14"
   }

@@ -1,4 +1,4 @@
-name: arXiv application
+name: arXiv application dependencies
 on:
   push:
     branches: ['example/arxiv-research-app']
@@ -7,7 +7,7 @@ permissions:
 jobs:
   install:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
@@ -18,20 +18,20 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: '1.4.2'
-      - name: Install independent GitHub consumer
-        working-directory: examples/arxiv-research-app
-        run: bun install
-      - name: Export public dependencies for offline validation
-        if: always()
+      - name: Install pinned GitHub consumer and compile dependency
         working-directory: examples/arxiv-research-app
         run: |
-          mkdir -p .dev-tools
-          cp "$(command -v bun)" .dev-tools/bun
-          cp "$(command -v node)" .dev-tools/node
-          tar --exclude='.git' --exclude='.env' --exclude='.npmrc' -czf /tmp/arxiv-dependencies.tar.gz node_modules bun.lock .dev-tools
+          bun install
+          node --input-type=module -e "await import('better-workflows'); await import('@llamaindex/liteparse'); console.log('GitHub package imports on Node 24')"
+          test -f node_modules/better-workflows/dist/index.d.mts
+      - name: Acquire public Mailpit test server
+        run: |
+          curl --fail --location --retry 2 -o /tmp/mailpit.tar.gz https://github.com/axllent/mailpit/releases/download/v1.27.4/mailpit-linux-amd64.tar.gz
+          echo '42d7f693cd01d60a54fe97974b6d701bddecfac1d5db3d7953160fbe009259f9  /tmp/mailpit.tar.gz' | sha256sum -c -
       - uses: actions/upload-artifact@v4
-        if: always()
         with:
-          name: arxiv-dependencies
-          path: /tmp/arxiv-dependencies.tar.gz
+          name: validated-consumer-tools
+          path: |
+            /tmp/mailpit.tar.gz
+            examples/arxiv-research-app/bun.lock
           retention-days: 1
