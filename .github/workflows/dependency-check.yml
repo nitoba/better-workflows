@@ -24,7 +24,7 @@ jobs:
           curl --fail -L https://github.com/axllent/mailpit/releases/download/v1.31.1/mailpit-linux-amd64.tar.gz -o mailpit.tar.gz
           echo '87d2652abd7c17dc99029147ff62ac671afdf7fd76630f7faf5b14125211c709  mailpit.tar.gz' | sha256sum --check
           tar -xzf mailpit.tar.gz mailpit
-          ./mailpit --version
+          ./mailpit version
       - uses: actions/upload-artifact@v4
         with:
           name: dependency-validation-and-mailpit
