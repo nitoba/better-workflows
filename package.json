@@ -1,127 +1,43 @@
 {
-  "name": "better-workflows",
-  "version": "0.1.0-alpha.3",
-  "description": "Durable workflows, activities, signals and timers with NestJS-native decorators and dependency injection.",
-  "keywords": [
-    "better-workflows",
-    "nestjs",
-    "queue",
-    "typescript"
-  ],
-  "homepage": "https://github.com/nitoba/better-workflows#readme",
-  "bugs": {
-    "url": "https://github.com/nitoba/better-workflows/issues"
-  },
-  "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/nitoba/better-workflows.git"
-  },
-  "bin": {
-    "better-workflows": "./dist/cli.mjs"
-  },
-  "files": [
-    "dist",
-    "LICENCE",
-    "README.md",
-    "CHANGELOG.md",
-    "docs"
-  ],
+  "name": "arxiv-research-workflows",
+  "version": "1.0.0",
+  "private": true,
   "type": "module",
-  "sideEffects": [
-    "./dist/index.mjs"
-  ],
-  "exports": {
-    ".": {
-      "types": "./dist/index.d.mts",
-      "import": "./dist/index.mjs"
-    },
-    "./package.json": "./package.json",
-    "./sqlite": {
-      "types": "./dist/sqlite.d.mts",
-      "import": "./dist/sqlite.mjs"
-    },
-    "./postgres": {
-      "types": "./dist/postgres.d.mts",
-      "import": "./dist/postgres.mjs"
-    },
-    "./admin": {
-      "types": "./dist/admin.d.mts",
-      "import": "./dist/admin.mjs"
-    },
-    "./testing": {
-      "types": "./dist/testing.d.mts",
-      "import": "./dist/testing.mjs"
-    }
-  },
+  "description": "NestJS 12 application demonstrating durable arXiv research and evaluated summaries with better-workflows.",
+  "packageManager": "bun@1.4.2",
+  "engines": { "node": ">=22.16.0", "bun": ">=1.4.2" },
   "scripts": {
-    "build": "tsdown",
-    "dev": "tsdown --watch",
-    "typecheck": "node node_modules/typescript/bin/tsc --noEmit",
-    "test": "bun test",
-    "test:coverage": "bun test --coverage",
-    "lint": "oxlint --type-aware src tests examples scripts tsdown.config.ts",
-    "lint:fix": "oxlint --type-aware --fix src tests examples scripts tsdown.config.ts",
-    "format": "oxfmt --write . '!tools/oxlint/**'",
-    "format:check": "oxfmt --check . '!tools/oxlint/**'",
-    "publint": "publint",
-    "check": "bun run typecheck && bun run test && bun run format:check && bun run build && bun run lint && bun run publint",
-    "hooks:install": "lefthook install",
-    "prepublishOnly": "bun run check",
-    "example": "bun examples/reports.ts",
-    "test:node": "node tests/package/node-smoke.mjs && node tests/package/advanced-smoke.mjs",
-    "example:modular": "bun examples/modular.ts"
+    "postinstall": "bun run scripts/build-workflows.ts",
+    "dev": "bun --watch src/main.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "bun dist/main.js",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test tests/unit",
+    "test:integration": "bun test tests/integration --timeout 60000",
+    "check": "bun run typecheck && bun run test && bun run build",
+    "doctor": "bun run scripts/doctor.ts",
+    "smoke:live": "bun run scripts/live-smoke.ts"
   },
   "dependencies": {
-    "@effect/platform-node": "4.0.0-rc.115",
-    "@effect/sql-pg": "4.0.0-rc.115",
-    "@effect/sql-sqlite-bun": "4.0.0-rc.115",
-    "@effect/sql-sqlite-node": "4.0.0-rc.115",
-    "@standard-schema/spec": "^1.0.0",
-    "effect": "4.0.0-rc.115"
+    "@nestjs/common": "12.0.3",
+    "@nestjs/core": "12.0.3",
+    "@nestjs/platform-fastify": "12.0.3",
+    "@ai-sdk/google": "4.0.72",
+    "ai": "7.0.102",
+    "@llamaindex/liteparse": "2.14.6",
+    "better-workflows": "github:nitoba/better-workflows#f08d38d31c276c2f5474125b6b36fa37eac79fb8",
+    "fast-xml-parser": "latest",
+    "nodemailer": "latest",
+    "reflect-metadata": "0.2.2",
+    "rxjs": "7.8.2",
+    "zod": "4.6.5"
   },
   "devDependencies": {
-    "@nestjs/common": "^12.0.0",
-    "@nestjs/core": "^12.0.0",
-    "@nestjs/testing": "^12.0.0",
-    "@oxlint/plugins": "1.78.0",
+    "@nestjs/testing": "12.0.3",
     "@types/bun": "1.4.1",
-    "@types/node": "^22.0.0",
-    "lefthook": "^2.1.10",
-    "oxfmt": "^0.63.0",
-    "oxlint": "^1.78.0",
-    "oxlint-tsgolint": "^7.0.2001",
-    "publint": "^0.3.23",
-    "reflect-metadata": "^0.2.2",
-    "rxjs": "^7.8.2",
-    "tsdown": "^0.22.14",
-    "typescript": "^7.0.2",
-    "zod": "^4.0.0"
-  },
-  "peerDependencies": {
-    "@nestjs/common": ">=12.0.0 <13.0.0",
-    "@nestjs/core": ">=12.0.0 <13.0.0",
-    "reflect-metadata": "^0.2.2",
-    "rxjs": "^7.8.2",
-    "typescript": ">=6.0.0"
-  },
-  "peerDependenciesMeta": {
-    "typescript": {
-      "optional": true
-    }
-  },
-  "devEngines": {
-    "packageManager": {
-      "name": "bun",
-      "version": "1.4.2",
-      "onFail": "error"
-    }
-  },
-  "engines": {
-    "node": ">=22.16.0"
-  },
-  "packageManager": "bun@1.4.2",
-  "trustedDependencies": [
-    "lefthook"
-  ]
+    "@types/node": "22.20.2",
+    "@types/nodemailer": "latest",
+    "tsdown": "0.22.14",
+    "typescript": "7.0.2"
+  }
 }
