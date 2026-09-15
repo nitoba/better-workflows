@@ -2,7 +2,7 @@
 
 Durable workflows for **NestJS 12**, using decorators, modules, dependency injection and `async/await`. Effect's workflow/cluster engine is private infrastructure; application code does not import Effect.
 
-**Status: `0.1.0-alpha.1`.** This repository contains an executable implementation, not just API declarations. It is an initial release candidate for application-level evaluation, not a claim that every proposed feature or failure mode is covered. No npm publication is required to run the repository.
+**Status: `0.1.0-alpha.2`.** This repository contains an executable implementation, not just API declarations. It is an initial release candidate for application-level evaluation, not a claim that every proposed feature or failure mode is covered. No npm publication is required to run the repository.
 
 ## Run the example
 
@@ -192,14 +192,37 @@ WorkflowsModule.forRoot({
 
 The address must be reachable by other runners. Optional `cluster.listenAddress` can differ from the advertised address. Keep runner sockets on a trusted private network; the library does not configure a public authenticated gateway.
 
-For API-only or activity-only processes, set `execution.workflows.enabled: false`; no runner address is required. API-only processes also set `execution.activities.enabled: false`. Orchestrators need workflow handlers; activity workers need activity handlers. Contract classes still need to be shared and imported by producers/orchestrators. Use the same namespace and database across roles. A logical queue's concurrency limit is **per process**, shared by its different activity handlers, not a distributed global limit.
+For API-only or activity-only processes, set `execution.workflows.enabled: false`; no runner address is required. API-only processes also set `execution.activities.enabled: false`. Orchestrators need workflow handlers; activity workers need activity handlers. Contract classes still need to be shared and imported by producers/orchestrators. Use the same namespace and database across roles. A logical queue's `concurrency` is **per process**, shared by its activity handlers. `globalConcurrency` and `perKeyConcurrency` add SQL-backed limits shared across processes in the same namespace and queue.
 
-## Scope of this alpha
+## Structured workflows and operations
 
-Implemented: native Nest registration/DI, durable acceptance, replay, queued activities, SQL journal/history, signal inbox, timers, persisted retries, worker result fencing, versioned definitions, pause/cancel/resume and SQLite/PostgreSQL infrastructure adapters.
+The public API also includes durable `ctx.map`, named `ctx.parallel` branches, `ctx.child` / `ctx.startChild`, scoped `ctx.saga` compensation, `WorkflowsTestingModule` with a manual business clock, and `WorkflowsAdmin` / CLI for migrations and retention.
 
-**Not implemented:** `ctx.map`, child workflows, sagas/compensations, scheduling decorators, a virtual-clock testing module, administrative migrations/retention tools, global/per-key concurrency, a queue-transport plugin API, `better-nest-mq` integration, UI or npm publishing automation. `Promise.all` is not a durable parallel primitive here; commands are interpreted sequentially. These are not hidden no-op options.
+```ts
+const results = await ctx.map(
+  'analyze-documents',
+  input.documentIds,
+  { key: (id) => id, concurrency: 3 },
+  (documentId, branch) => branch.child('analyze', AnalyzeDocumentWorkflow, { documentId })
+)
+```
 
-Schema creation/migration runs automatically at bootstrap for the pinned engine and the journal. There is no `migrations: 'validate'` option yet. There is no automatic history cleanup: retain storage, protect backups and account for growth. Do not manually prune individual journal/queue rows from active executions.
+Each branch has its own stable command path and durable admission state. A branch waiting on a signal still counts against this map's limit. Results retain input order. Use `ctx.parallel` for a typed object of named branches. Plain `Promise.all` is not the supported durable parallel primitive.
 
-See [architecture and reliability](docs/architecture.md) for storage boundaries and testing limitations.
+```ts
+queues: {
+  documents: { concurrency: 8, globalConcurrency: 4, perKeyConcurrency: 1 }
+}
+```
+
+Keyed activities declare `key: (input) => input.tenantId` in `@Activity()`. Limits cover all handlers in that queue, not just one activity. All processes must agree on shared limits; configuration drift fails at bootstrap.
+
+See the **[advanced API and operations guide](docs/advanced.md)** for complete examples of branches, children, compensation, virtual time, migrations, retention and shared limits. The **[architecture guide](docs/architecture.md)** documents recovery boundaries, compatibility and validation evidence.
+
+## Release scope
+
+This remains an alpha. External effects are at least once and must be idempotent. Business failures inside a saga scope trigger its registered compensations; suspension, infrastructure loss and forced cancellation do not masquerade as business failures. Completed saga scopes are committed, not an automatic rollback of any later workflow failure.
+
+Schema migrations can run automatically at bootstrap (`migrations: 'run'`, the default), or be applied separately before starting the application with `migrations: 'validate'`. Retention requires an explicit preview and confirmation, preserves active dependencies and keeps compact idempotency tombstones. There is no background deletion policy by default.
+
+Scheduling decorators, a visual dashboard and publication automation are outside this release. The library has no integration or dependency on an external queue library. No npm publication is performed by the development scripts.

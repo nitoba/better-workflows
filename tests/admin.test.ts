@@ -53,7 +53,7 @@ test('retention requires an intact preview, deletes terminal history and keeps i
     expect(await handle.result({ timeout: '3s' })).toBe('unique')
     await new Promise((resolve) => setTimeout(resolve, 80))
     const admin = app.module.get(WorkflowsAdmin)
-    const plan = await admin.retention.preview({ before: new Date().toISOString() })
+    const plan = await admin.retention.preview({ before: new Date(Date.now() - 20).toISOString() })
     expect(plan.blocked).toEqual([])
     expect(plan.candidates.map((item) => item.executionId)).toEqual([handle.executionId])
     const changed = { ...plan, before: '2020-01-01T00:00:00.000Z' }
@@ -141,7 +141,7 @@ test('retention ignores other namespaces, rechecks stale plans and blocks live c
     await handle.result({ timeout: '3s' })
     await new Promise((resolve) => setTimeout(resolve, 80))
     const admin = app.module.get(WorkflowsAdmin)
-    const before = new Date().toISOString()
+    const before = new Date(Date.now() - 20).toISOString()
     expect((await foreign.retention.preview({ before })).candidates).toEqual([])
     const plan = await admin.retention.preview({ before })
     db.query('UPDATE better_workflows_runs SET updated_at=updated_at+1 WHERE execution_id=?').run(

@@ -1,5 +1,5 @@
-import { mkdir } from 'node:fs/promises'
-import { dirname, resolve } from 'node:path'
+import { mkdir, realpath } from 'node:fs/promises'
+import { basename, dirname, resolve } from 'node:path'
 import { Effect, Layer, ManagedRuntime, Option, Redacted } from 'effect'
 import * as NodeCrypto from '@effect/platform-node/NodeCrypto'
 import { ClusterWorkflowEngine, RunnerAddress, SingleRunner } from 'effect/unstable/cluster'
@@ -9,6 +9,7 @@ import { migrateAll, validateMigrations } from './schema-admin'
 import { WorkflowError } from '../errors'
 import type { WorkflowsOptions } from '../types'
 import { identifier, milliseconds, positiveInteger } from './values'
+import { sharedSqlite } from './shared-sqlite'
 
 export function validateOptions(options: WorkflowsOptions): void {
   identifier(options.namespace, 'Namespace')
@@ -107,16 +108,24 @@ export async function makeInfrastructure(options: WorkflowsOptions) {
 export type Infrastructure = Awaited<ReturnType<typeof makeInfrastructure>>
 
 export async function makeDatabase(config: WorkflowsOptions['storage']) {
-  if (config.driver === 'sqlite' && config.filename !== ':memory:')
-    await mkdir(dirname(resolve(config.filename)), { recursive: true })
-  return config.driver === 'postgres'
-    ? (await import('@effect/sql-pg/PgClient')).layer({
-        url: Redacted.make(config.connectionString),
-        maxConnections: config.maxConnections
-      })
-    : config.runtime === 'bun' || (config.runtime === 'auto' && 'Bun' in globalThis)
-      ? (await import('@effect/sql-sqlite-bun/SqliteClient')).layer({ filename: config.filename })
-      : (await import('@effect/sql-sqlite-node/SqliteClient')).layer({
-          filename: config.filename
-        })
+  if (config.driver === 'postgres')
+    return (await import('@effect/sql-pg/PgClient')).layer({
+      url: Redacted.make(config.connectionString),
+      maxConnections: config.maxConnections
+    })
+  let filename = config.filename
+  if (filename !== ':memory:') {
+    await mkdir(dirname(resolve(filename)), { recursive: true })
+    try {
+      filename = await realpath(filename)
+    } catch (error) {
+      if (!(error instanceof Error) || !('code' in error) || error.code !== 'ENOENT') throw error
+      filename = resolve(await realpath(dirname(resolve(filename))), basename(filename))
+    }
+  }
+  const layer =
+    config.runtime === 'bun' || (config.runtime === 'auto' && 'Bun' in globalThis)
+      ? (await import('@effect/sql-sqlite-bun/SqliteClient')).layer({ filename })
+      : (await import('@effect/sql-sqlite-node/SqliteClient')).layer({ filename })
+  return sharedSqlite(filename, layer)
 }

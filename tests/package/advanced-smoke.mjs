@@ -121,7 +121,7 @@ try {
   assert.equal(peak, 2)
   assert.equal((await client.start('one')).created, false)
   await new Promise((resolve) => setTimeout(resolve, 150))
-  const plan = await admin.retention.preview({ before: new Date().toISOString() })
+  const plan = await admin.retention.preview({ before: new Date(Date.now() - 20).toISOString() })
   assert.equal(plan.blocked.length, 0)
   assert.equal(plan.candidates.length, 13)
   assert.equal((await admin.retention.prune(plan, { confirm: true })).deleted, 13)
