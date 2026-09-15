@@ -3,6 +3,7 @@ on:
   push:
     paths:
       - '.github/workflows/bootstrap.yml'
+      - 'package.json'
 permissions:
   contents: read
 jobs:
@@ -16,8 +17,8 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: '1.4.2'
-      - run: bun install --frozen-lockfile
-      - run: bun run typecheck && bun run build
+      - run: bun install
+      - run: bun run typecheck && bun test && bun run build
       - name: Export offline development workspace
         run: |
           cp "$(command -v bun)" .ci-bun
