@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { mkdir, rename, writeFile } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
-import { Inject, Injectable, Module } from '@nestjs/common'
+import { Injectable, Module } from '@nestjs/common'
 import { NestFactory } from '@nestjs/core'
 import { z } from 'zod'
 import {
@@ -36,12 +36,16 @@ class FileStore {
     return key
   }
 }
-@Module({ providers: [FileStore], exports: [FileStore] })
+
+@Module({
+  providers: [FileStore],
+  exports: [FileStore]
+})
 class StorageModule {}
 
 @Activities({ queue: AuditQueue })
 class AuditActivities {
-  constructor(@Inject(FileStore) private readonly files: FileStore) {}
+  constructor(private readonly files: FileStore) {}
 
   @Activity({ name: 'audit.record-report', version: 1, input: Summary, output: z.string() })
   record(summary: z.infer<typeof Summary>, context: ActivityContext): Promise<string> {
@@ -49,6 +53,7 @@ class AuditActivities {
     return this.files.put(JSON.stringify({ type: 'report-created', summary }), context)
   }
 }
+
 @Module({
   imports: [
     WorkflowsModule.forFeature({
@@ -69,12 +74,16 @@ class AuditModule {}
 class ReportsSettings {
   readonly concurrency = 2
 }
-@Module({ providers: [ReportsSettings], exports: [ReportsSettings] })
+
+@Module({
+  providers: [ReportsSettings],
+  exports: [ReportsSettings]
+})
 class SettingsModule {}
 
 @Activities({ queue: ReportQueue })
 class ReportActivities {
-  constructor(@Inject(FileStore) private readonly files: FileStore) {}
+  constructor(private readonly files: FileStore) {}
 
   @Activity({ name: 'reports.render', version: 1, input: ReportInput, output: Summary })
   async render(input: z.infer<typeof ReportInput>, context: ActivityContext) {
@@ -83,6 +92,7 @@ class ReportActivities {
     return summary
   }
 }
+
 @Workflow({ name: 'reports.generate', version: 1, input: ReportInput, output: Summary })
 class GenerateReport {
   async run(input: z.infer<typeof ReportInput>, ctx: WorkflowContext) {
@@ -91,6 +101,7 @@ class GenerateReport {
     return summary
   }
 }
+
 @Workflow({ name: 'reports.batch', version: 1, input: BatchInput, output: z.array(Summary) })
 class GenerateBatch {
   async run(input: z.infer<typeof BatchInput>, ctx: WorkflowContext) {
@@ -102,6 +113,7 @@ class GenerateBatch {
     )
   }
 }
+
 @Module({
   imports: [
     WorkflowsModule.forFeatureAsync({
@@ -126,6 +138,7 @@ class Demo {
     @InjectWorkflow(GenerateBatch) readonly batches: WorkflowClient<typeof GenerateBatch>
   ) {}
 }
+
 @Module({
   imports: [
     WorkflowsModule.forRoot({
@@ -145,6 +158,7 @@ const app = await NestFactory.createApplicationContext(AppModule, {
   abortOnError: false
 })
 app.enableShutdownHooks()
+
 try {
   const handle = await app.get(Demo).batches.start([
     { id: 'first', values: [10, 20] },
