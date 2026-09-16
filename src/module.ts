@@ -33,8 +33,32 @@ const adminProviders = [
   WorkflowsAdmin
 ]
 
+/**
+ * Nest integration for one shared durable runtime and domain-owned feature registrations.
+ * Use forRoot/forRootAsync once, then forFeature/forFeatureAsync in each domain.
+ * Registering features does not create additional database pools or workflow engines.
+ */
 @Module({})
 export class WorkflowsModule {
+  /**
+   * Configure infrastructure and optional application defaults/queues synchronously.
+   * Root queues are optional and visible to all features. Domain queues belong in
+   * forFeature. Defaults are resolved before validation and before workers start.
+   * @param options - Namespace, storage, topology and application policy.
+   * @returns Dynamic Nest module exporting infrastructure and WorkflowsAdmin; global by default.
+   * @throws Invalid settings or duplicate roots are rejected during Nest initialization.
+   * @example
+   * ```ts
+   * import { Module } from '@nestjs/common'
+   * import { WorkflowsModule } from 'better-workflows'
+   * import { sqlite } from 'better-workflows/sqlite'
+   * @Module({ imports: [WorkflowsModule.forRoot({
+   *   namespace: 'reports-app', storage: sqlite({ filename: './data/workflows.sqlite' }),
+   *   defaults: { queues: { concurrency: 4 } }
+   * })] })
+   * class AppModule {}
+   * ```
+   */
   static forRoot(options: WorkflowsOptions): DynamicModule {
     return {
       module: WorkflowsModule,
@@ -49,6 +73,28 @@ export class WorkflowsModule {
     }
   }
 
+  /**
+   * Configure the single root using a Nest dependency-injected factory.
+   * Keep module visibility in the static isGlobal option; a factory cannot change it.
+   * Imported modules must export the dependencies listed in inject.
+   * @param options - Static imports/isGlobal plus inject and a settings factory.
+   * @returns Dynamic root module whose settings resolve before bootstrap.
+   * @throws Factory errors or invalid resolved settings abort initialization.
+   * @example
+   * ```ts
+   * import { Injectable, Module } from '@nestjs/common'
+   * import { WorkflowsModule } from 'better-workflows'
+   * import { sqlite } from 'better-workflows/sqlite'
+   * @Injectable()
+   * class Settings { readonly file = './data/workflows.sqlite' }
+   * @Module({ providers: [Settings], exports: [Settings] })
+   * class SettingsModule {}
+   * const root = WorkflowsModule.forRootAsync({
+   *   imports: [SettingsModule], inject: [Settings],
+   *   useFactory: (settings: Settings) => ({ namespace: 'reports', storage: sqlite({ filename: settings.file }) })
+   * })
+   * ```
+   */
   static forRootAsync(options: WorkflowsAsyncOptions): DynamicModule {
     return {
       module: WorkflowsModule,
@@ -67,10 +113,65 @@ export class WorkflowsModule {
     }
   }
 
+  /**
+   * Register a domain's handlers, contracts, clients and queue policies.
+   * workflows registers implementations plus typed clients; activities registers worker
+   * implementations. clients and activityContracts do not instantiate implementations.
+   * Dependencies must be in this feature's imports/providers. Do not register the same
+   * handler again in an outer module. Reexport WorkflowsModule to forward capabilities.
+   * @param options - Static graph and synchronous domain configuration; not an array.
+   * @returns Feature module exporting clients and explicitly selected queue/activity capabilities.
+   * @throws Invalid ownership, scope, queue visibility or duplicate registrations fail initialization.
+   * @example
+   * ```ts
+   * import { Activities, Activity, Workflow, WorkflowsModule, defineQueue } from 'better-workflows'
+   * import type { WorkflowContext } from 'better-workflows'
+   * import { z } from 'zod'
+   * const Reports = defineQueue('reports')
+   * @Activities({ queue: Reports })
+   * class Totals {
+   *   @Activity({ name: 'reports.total', version: 1, input: z.array(z.number()), output: z.number() })
+   *   async total(values: number[]) { return values.reduce((a, b) => a + b, 0) }
+   * }
+   * @Workflow({ name: 'reports.generate', version: 1, input: z.array(z.number()), output: z.number() })
+   * class GenerateReport {
+   *   async run(values: number[], ctx: WorkflowContext) {
+   *     return ctx.activities(Totals).total(values, { stepId: 'total' })
+   *   }
+   * }
+   * const feature = WorkflowsModule.forFeature({
+   *   name: 'reports', workflows: [GenerateReport], activities: [Totals],
+   *   queues: [{ queue: Reports, concurrency: 2 }]
+   * })
+   * ```
+   */
   static forFeature(options: WorkflowsFeatureOptions): DynamicModule {
     return createFeature(options, (token) => ({ provide: token, useValue: options }))
   }
 
+  /**
+   * Register static domain structure with DI-resolved queue/default/execution values.
+   * The factory cannot return new imports, providers or handlers. All factories finish
+   * before the catalog is validated; import order never decides conflicting policies.
+   * @param options - Static feature graph, ordered dependency tokens and a configuration factory.
+   * @returns Feature module whose clients and capabilities follow normal Nest visibility.
+   * @throws Factory errors or invalid final configuration abort initialization before worker startup.
+   * @example
+   * ```ts
+   * import { Injectable, Module } from '@nestjs/common'
+   * import { WorkflowsModule, defineQueue } from 'better-workflows'
+   * @Injectable()
+   * class Settings { readonly concurrency = 2 }
+   * @Module({ providers: [Settings], exports: [Settings] })
+   * class SettingsModule {}
+   * const Reports = defineQueue('reports')
+   * const feature = WorkflowsModule.forFeatureAsync({
+   *   name: 'reports', imports: [SettingsModule], inject: [Settings],
+   *   useFactory: (settings: Settings) => ({ queues: [{ queue: Reports, concurrency: settings.concurrency }] }),
+   *   exports: { queues: [Reports] }
+   * })
+   * ```
+   */
   static forFeatureAsync(options: WorkflowsFeatureAsyncOptions): DynamicModule {
     return createFeature(options, (token) => ({
       provide: token,

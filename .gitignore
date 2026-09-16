@@ -42,3 +42,4 @@ lint.log
 manifest.txt
 
 .demo-modular/
+.jsdoc-check-*/

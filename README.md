@@ -234,3 +234,14 @@ This remains an alpha. External effects are at least once and must be idempotent
 Schema migrations can run automatically at bootstrap (`migrations: 'run'`, the default), or be applied separately before starting the application with `migrations: 'validate'`. Retention requires an explicit preview and confirmation, preserves active dependencies and keeps compact idempotency tombstones. There is no background deletion policy by default.
 
 Scheduling decorators, a visual dashboard and publication automation are outside this release. No npm publication is performed by the development scripts.
+
+## Editor documentation
+
+Public decorators, module factories, workflow clients, contexts, configuration types,
+adapters, administrative operations and testing utilities include JSDoc summaries,
+parameter/return descriptions, defaults, caveats and usage examples. The comments are
+retained in the packaged declarations for editor hover/signature help.
+
+`bun run build && bun run docs:check` checks the exported source and declaration
+graphs with TypeScript and type-checks every JSDoc example against package exports.
+See [JSDoc conventions and verification](docs/jsdoc.md) when changing the public API.

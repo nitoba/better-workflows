@@ -25,7 +25,7 @@ jobs:
       - run: bun run typecheck
       - run: bun run format:check
       - run: bun test
-      - run: bun run build && bun run publint
+      - run: bun run build && bun run docs:check && bun run publint
       - name: Run report example
         run: bun run example ci-report --approve
         env:

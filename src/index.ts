@@ -1,3 +1,10 @@
+/**
+ * NestJS-native durable workflows, queued activities, signals and structured orchestration.
+ * Register infrastructure once with WorkflowsModule and compose domain-owned features.
+ * Database adapters, standalone administration and test utilities have dedicated
+ * better-workflows/sqlite, /postgres, /admin and /testing entry points.
+ * @packageDocumentation
+ */
 export { defineQueue } from './queues'
 export type { QueueReference } from './queues'
 export {

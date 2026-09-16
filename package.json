@@ -65,12 +65,13 @@
     "format": "oxfmt --write . '!tools/oxlint/**'",
     "format:check": "oxfmt --check . '!tools/oxlint/**'",
     "publint": "publint",
-    "check": "bun run typecheck && bun run test && bun run format:check && bun run build && bun run lint && bun run publint",
+    "check": "bun run typecheck && bun run test && bun run format:check && bun run build && bun run docs:check && bun run lint && bun run publint",
     "hooks:install": "lefthook install",
     "prepublishOnly": "bun run check",
     "example": "bun examples/reports.ts",
     "test:node": "node tests/package/node-smoke.mjs && node tests/package/advanced-smoke.mjs",
-    "example:modular": "bun examples/modular.ts"
+    "example:modular": "bun examples/modular.ts",
+    "docs:check": "node scripts/check-jsdoc.mjs"
   },
   "dependencies": {
     "@effect/platform-node": "4.0.0-rc.115",
