@@ -30,7 +30,7 @@ const required = {
   ],
   better_workflows_events: ['execution_id', 'sequence', 'at'],
   better_workflows_signals: ['execution_id', 'event_key', 'consumed_by'],
-  better_workflows_waits: ['execution_id', 'step_id', 'deadline', 'delivered'],
+  better_workflows_waits: ['execution_id', 'step_id', 'deadline', 'delivered', 'wake_requested'],
   better_workflows_retries: ['execution_id', 'step_id', 'attempt', 'deadline'],
   better_workflows_claims: ['execution_id', 'step_id', 'owner_token', 'lease_until', 'state'],
   better_workflows_branches: ['execution_id', 'group_id', 'branch_key', 'ordinal', 'state'],
@@ -79,7 +79,7 @@ export function migrationStatus(sql: SqlClient.SqlClient) {
     const cluster = yield* applied('cluster_migrations', 'migration_id')
     const queue = yield* applied('better_workflows_queue_migrations', 'migration_id')
     for (const [name, versions, expected] of [
-      ['journal', journal, 2],
+      ['journal', journal, 3],
       ['cluster', cluster, 3],
       ['queue', queue, 2]
     ] as const) {
@@ -108,12 +108,12 @@ export function migrationStatus(sql: SqlClient.SqlClient) {
       Array.from({ length: count }, (_, i) => i + 1).filter((value) => !values.includes(value))
     const status: MigrationStatus = {
       engine: ENGINE_VERSION,
-      journal: { applied: journal, pending: pending(journal, 2) },
+      journal: { applied: journal, pending: pending(journal, 3) },
       cluster: { applied: cluster, pending: pending(cluster, 3) },
       queue: { applied: queue, pending: pending(queue, 2) },
       missing,
       valid:
-        journal.length === 2 && cluster.length === 3 && queue.length === 2 && missing.length === 0
+        journal.length === 3 && cluster.length === 3 && queue.length === 2 && missing.length === 0
     }
     return status
   })
@@ -152,6 +152,7 @@ export function migrateAll(namespace: string) {
           before.missing.some(
             (entry) =>
               v1Tables.has(entry.split('.')[0]!) &&
+              entry !== 'better_workflows_waits.wake_requested' &&
               !['better_workflows_commands.scope', 'better_workflows_commands.protocol'].includes(
                 entry
               )
@@ -162,10 +163,15 @@ export function migrateAll(namespace: string) {
             'Version 1 journal is missing existing tables or columns; restore a consistent backup'
           )
         if (
-          before.journal.applied.length === 2 &&
+          before.journal.applied.length >= 2 &&
           before.missing.some(
             (entry) =>
-              entry.startsWith('better_workflows_') && !entry.startsWith('better_workflows_queue')
+              entry.startsWith('better_workflows_') &&
+              !entry.startsWith('better_workflows_queue') &&
+              !(
+                before.journal.applied.length === 2 &&
+                entry === 'better_workflows_waits.wake_requested'
+              )
           )
         )
           return yield* fail(

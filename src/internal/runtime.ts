@@ -56,7 +56,6 @@ export class WorkflowsRuntime
   private stopping = false
   private stopPromise?: Promise<void>
   private dispatchCursor = ''
-  private waitCursor = ''
   private readonly dispatchLock = Semaphore.makeUnsafe(1)
   private lastDispatchError: string | undefined
 
@@ -515,7 +514,7 @@ export class WorkflowsRuntime
         })
         yield* journal.retryDelivered(retry)
       }
-      const waits = yield* journal.pendingWaits(self.waitCursor)
+      const waits = yield* journal.pendingWaits()
       for (const candidate of waits) {
         const wait = yield* journal.resolveWait(candidate)
         if (!wait || wait.state === 'pending') continue
@@ -542,7 +541,6 @@ export class WorkflowsRuntime
         })
         yield* journal.delivered(wait)
       }
-      self.waitCursor = waits.length === 100 ? waits.at(-1)!.execution_id : ''
       const active = yield* journal.activeAfter(self.dispatchCursor)
       for (const row of active) yield* self.reconcile(row)
       self.dispatchCursor = active.length === 100 ? active.at(-1)!.execution_id : ''

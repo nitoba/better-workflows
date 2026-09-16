@@ -1,4 +1,7 @@
 import { expect, test } from 'bun:test'
+import { ManagedRuntime } from 'effect'
+import * as SqliteClient from '@effect/sql-sqlite-bun/SqliteClient'
+import { SqlClient } from 'effect/unstable/sql'
 import { z } from 'zod'
 import { defineQueue, Activities, Activity, Workflow, defineSignal } from '../src'
 import type { ActivityContext, WorkflowContext } from '../src'
@@ -244,6 +247,60 @@ test('retry wakeup and failure commit atomically in the durable journal', async 
     expect(pending.some((row) => row.step_id === 'failure' && row.attempt === 1)).toBe(true)
   } finally {
     await app.close()
+  }
+})
+
+test('wait outbox wakes signals, selects only due deadlines and drains one execution without starvation', async () => {
+  const storeRuntime = ManagedRuntime.make(SqliteClient.layer({ filename: ':memory:' }))
+  try {
+    const sql = await storeRuntime.runPromise(SqlClient.SqlClient)
+    const journal = new Journal(sql, 'wait-outbox')
+    await storeRuntime.runPromise(journal.migrate())
+    await storeRuntime.runPromise(journal.accept('execution', 'workflow', 1, 'key', encode(null)))
+
+    await storeRuntime.runPromise(journal.wait('execution', 'sleeping', 'approval', undefined))
+    await storeRuntime.runPromise(journal.wait('execution', 'timed', 'approval', 60_000))
+    expect(await storeRuntime.runPromise(journal.pendingWaits())).toEqual([])
+    await storeRuntime.runPromise(
+      sql`UPDATE better_workflows_waits SET deadline = 0 WHERE execution_id = 'execution' AND step_id = 'timed'`
+    )
+    expect(
+      (await storeRuntime.runPromise(journal.pendingWaits())).map((row) => row.step_id)
+    ).toEqual(['timed'])
+    const timed = (await storeRuntime.runPromise(journal.pendingWaits()))[0]!
+    const timedOutcome = await storeRuntime.runPromise(journal.resolveWait(timed))
+    await storeRuntime.runPromise(journal.delivered(timedOutcome!))
+
+    for (let index = 0; index < 200; index++)
+      await storeRuntime.runPromise(
+        journal.wait('execution', `branch-${String(index).padStart(3, '0')}`, 'approval', undefined)
+      )
+    expect(await storeRuntime.runPromise(journal.pendingWaits())).toEqual([])
+    await storeRuntime.runPromise(journal.signal('execution', 'approval', 'signal-0', encode(0)))
+    expect(
+      (await storeRuntime.runPromise(journal.pendingWaits())).map((row) => row.step_id)
+    ).toEqual(['branch-000'])
+    for (let index = 1; index < 200; index++)
+      await storeRuntime.runPromise(
+        journal.signal('execution', 'approval', `signal-${index}`, encode(index))
+      )
+
+    let resolved = 0
+    while (true) {
+      const waits = await storeRuntime.runPromise(journal.pendingWaits())
+      if (waits.length === 0) break
+      expect(waits.length).toBeLessThanOrEqual(100)
+      for (const candidate of waits) {
+        const outcome = await storeRuntime.runPromise(journal.resolveWait(candidate))
+        if (outcome?.state !== 'pending') {
+          resolved++
+          await storeRuntime.runPromise(journal.delivered(outcome!))
+        }
+      }
+    }
+    expect(resolved).toBe(200)
+  } finally {
+    await storeRuntime.dispose()
   }
 })
 

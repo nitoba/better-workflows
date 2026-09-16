@@ -44,6 +44,7 @@ export interface WaitRow {
   readonly state: 'pending' | 'success' | 'timeout'
   readonly result_json: string | null
   readonly delivered: number
+  readonly wake_requested: number
 }
 
 export interface RetryRow {
@@ -105,7 +106,7 @@ export class Journal {
         const versions = yield* sql<{
           version: number
         }>`SELECT version FROM better_workflows_schema`
-        if (versions.some((row) => row.version > 2)) {
+        if (versions.some((row) => row.version > 3)) {
           return yield* fail(
             'SCHEMA_TOO_NEW',
             'This database was migrated by a newer better-workflows version'
@@ -445,10 +446,19 @@ export class Journal {
     const self = this
     return self.sql.withTransaction(
       Effect.gen(function* () {
+        yield* self.lockRun(executionId)
         const now = yield* self.now()
         yield* self.sql`INSERT INTO better_workflows_waits(execution_id, step_id, signal_name, deadline)
         VALUES (${executionId}, ${stepId}, ${signalName}, ${timeout === undefined ? null : now + timeout})
         ON CONFLICT DO NOTHING`
+        // A signal may have been accepted before the workflow reached this wait.
+        yield* self.sql`UPDATE better_workflows_waits SET wake_requested = 1
+        WHERE execution_id = ${executionId} AND step_id = ${stepId} AND state = 'pending' AND delivered = 0
+        AND (SELECT COUNT(*) FROM better_workflows_signals
+          WHERE execution_id = ${executionId} AND signal_name = ${signalName} AND consumed_by IS NULL) >
+          (SELECT COUNT(*) FROM better_workflows_waits
+            WHERE execution_id = ${executionId} AND signal_name = ${signalName}
+            AND state = 'pending' AND delivered = 0 AND wake_requested = 1)`
       })
     )
   }
@@ -482,6 +492,13 @@ export class Journal {
         SET signal_sequence = signal_sequence + 1 WHERE execution_id = ${executionId} RETURNING signal_sequence`
         yield* self.sql`INSERT INTO better_workflows_signals(execution_id, signal_name, event_key, sequence, payload_json, accepted_at)
         VALUES (${executionId}, ${signalName}, ${key}, ${sequence!.signal_sequence}, ${payload}, ${now})`
+        yield* self.sql`UPDATE better_workflows_waits SET wake_requested = 1
+        WHERE execution_id = ${executionId} AND step_id = (
+          SELECT step_id FROM better_workflows_waits
+          WHERE execution_id = ${executionId} AND signal_name = ${signalName}
+          AND state = 'pending' AND delivered = 0 AND wake_requested = 0
+          ORDER BY step_id LIMIT 1
+        )`
         yield* self.event(executionId, 'signal.accepted', {
           signal: signalName,
           sequence: sequence!.signal_sequence
@@ -491,12 +508,17 @@ export class Journal {
     )
   }
 
-  pendingWaits(cursor: string) {
-    return this
-      .sql<WaitRow>`SELECT w.* FROM better_workflows_waits w JOIN better_workflows_runs r ON r.execution_id = w.execution_id
-      WHERE r.namespace = ${this.namespace} AND w.delivered = 0 AND r.control <> 'cancel'
-      AND r.state NOT IN ('completed', 'failed', 'cancelled') AND w.execution_id > ${cursor}
-      ORDER BY w.execution_id, w.step_id LIMIT 100`
+  pendingWaits() {
+    const self = this
+    return Effect.gen(function* () {
+      const now = yield* self.now()
+      return yield* self.sql<WaitRow>`SELECT w.* FROM better_workflows_waits w
+        JOIN better_workflows_runs r ON r.execution_id = w.execution_id
+        WHERE r.namespace = ${self.namespace} AND w.delivered = 0
+        AND r.control <> 'cancel' AND r.state NOT IN ('completed', 'failed', 'cancelled')
+        AND (w.wake_requested = 1 OR (w.deadline IS NOT NULL AND w.deadline <= ${now}))
+        ORDER BY w.execution_id, w.step_id LIMIT 100`
+    })
   }
 
   resolveWait(wait: WaitRow) {
@@ -515,7 +537,7 @@ export class Journal {
         if (signal && (current.deadline === null || signal.accepted_at <= current.deadline)) {
           yield* self.sql`UPDATE better_workflows_signals SET consumed_by = ${wait.step_id}
           WHERE execution_id = ${wait.execution_id} AND sequence = ${signal.sequence}`
-          yield* self.sql`UPDATE better_workflows_waits SET state = 'success', result_json = ${signal.payload_json}
+          yield* self.sql`UPDATE better_workflows_waits SET state = 'success', result_json = ${signal.payload_json}, wake_requested = 1
           WHERE execution_id = ${wait.execution_id} AND step_id = ${wait.step_id}`
           yield* self.event(
             wait.execution_id,
@@ -523,10 +545,15 @@ export class Journal {
             { signal: wait.signal_name, sequence: signal.sequence },
             wait.step_id
           )
-          return { ...current, state: 'success' as const, result_json: signal.payload_json }
+          return {
+            ...current,
+            state: 'success' as const,
+            result_json: signal.payload_json,
+            wake_requested: 1
+          }
         }
         if (current.deadline !== null && now >= current.deadline) {
-          yield* self.sql`UPDATE better_workflows_waits SET state = 'timeout'
+          yield* self.sql`UPDATE better_workflows_waits SET state = 'timeout', wake_requested = 1
           WHERE execution_id = ${wait.execution_id} AND step_id = ${wait.step_id}`
           yield* self.event(
             wait.execution_id,
@@ -534,15 +561,17 @@ export class Journal {
             { signal: wait.signal_name },
             wait.step_id
           )
-          return { ...current, state: 'timeout' as const }
+          return { ...current, state: 'timeout' as const, wake_requested: 1 }
         }
-        return current
+        yield* self.sql`UPDATE better_workflows_waits SET wake_requested = 0
+        WHERE execution_id = ${wait.execution_id} AND step_id = ${wait.step_id} AND state = 'pending'`
+        return { ...current, wake_requested: 0 }
       })
     )
   }
 
   delivered(wait: WaitRow) {
-    return this.sql`UPDATE better_workflows_waits SET delivered = 1
+    return this.sql`UPDATE better_workflows_waits SET delivered = 1, wake_requested = 0
       WHERE execution_id = ${wait.execution_id} AND step_id = ${wait.step_id} AND state <> 'pending'`
   }
 
