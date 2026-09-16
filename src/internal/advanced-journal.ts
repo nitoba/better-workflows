@@ -3,6 +3,7 @@ import type { Failure } from '../errors'
 import type { ChildOptions } from '../types'
 import type { Journal, CommandRow } from './journal'
 import { encode } from './values'
+import { TelemetryAttributeKey } from './telemetry'
 
 export interface BranchRow {
   readonly branch_key: string
@@ -134,10 +135,12 @@ export class AdvancedJournal {
   ) {
     const self = this
     const closePolicy = policy ?? 'request-cancel'
-    return self.journal.sql.withTransaction(
+    let created = false
+    const operation = self.journal.sql.withTransaction(
       Effect.gen(function* () {
         yield* self.lock(parent)
-        yield* self.journal.accept(child, name, version, key, input)
+        const accepted = yield* self.journal.accept(child, name, version, key, input)
+        created = accepted.created
         const inserted = yield* self.journal
           .sql`INSERT INTO better_workflows_children(parent_id, step_id, child_id, close_policy)
         VALUES (${parent}, ${step}, ${child}, ${closePolicy}) ON CONFLICT DO NOTHING RETURNING child_id`
@@ -154,6 +157,17 @@ export class AdvancedJournal {
           )
         return row
       })
+    )
+    return operation.pipe(
+      Effect.tap(() =>
+        Effect.sync(() => {
+          if (created)
+            self.journal.telemetry?.count('workflowStarted', {
+              [TelemetryAttributeKey.workflowName]: name,
+              [TelemetryAttributeKey.workflowVersion]: version
+            })
+        })
+      )
     )
   }
 
@@ -306,7 +320,10 @@ export class AdvancedJournal {
   }
 
   timerDelivered(timer: TimerRow) {
-    return this.journal.sql`UPDATE better_workflows_timers SET delivered = 1
-      WHERE execution_id = ${timer.execution_id} AND step_id = ${timer.step_id}`
+    return this.journal.sql<{
+      execution_id: string
+    }>`UPDATE better_workflows_timers SET delivered = 1
+      WHERE execution_id = ${timer.execution_id} AND step_id = ${timer.step_id} AND delivered = 0
+      RETURNING execution_id`.pipe(Effect.map((rows) => rows.length > 0))
   }
 }

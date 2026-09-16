@@ -1,5 +1,8 @@
 import { expect, test } from 'bun:test'
-import { ManagedRuntime, Metric } from 'effect'
+import { ManagedRuntime } from 'effect'
+import { Activity, ActivityError, Activities, Workflow, defineQueue } from '../src'
+import type { ActivityContext, WorkflowContext } from '../src'
+import { z } from 'zod'
 import {
   Telemetry,
   TelemetryAttributeKey,
@@ -12,6 +15,92 @@ import {
   telemetryLayer,
   TelemetryService
 } from '../src/internal/telemetry'
+import { WorkflowsRuntime } from '../src/internal/runtime'
+import { ExecutionNotifier } from '../src/internal/notifier'
+import { testApp } from './helpers'
+
+const MetricsQueue = defineQueue('metrics')
+const MetricValue = z.union([z.string(), z.number()])
+const MetricsSignal = {
+  name: 'metrics.approval',
+  schema: z.string()
+} as const
+
+@Activities()
+class MetricsActivity {
+  @Activity({
+    name: 'metrics.echo',
+    version: 1,
+    queue: MetricsQueue,
+    input: MetricValue,
+    output: MetricValue
+  })
+  async echo(input: z.infer<typeof MetricValue>): Promise<z.infer<typeof MetricValue>> {
+    return input
+  }
+}
+
+@Workflow({
+  name: 'metrics.workflow',
+  version: 1,
+  input: MetricValue,
+  output: MetricValue,
+  signals: [MetricsSignal],
+  idempotencyKey: () => 'metrics-key'
+})
+class MetricsWorkflow {
+  async run(
+    input: z.infer<typeof MetricValue>,
+    context: WorkflowContext
+  ): Promise<z.infer<typeof MetricValue>> {
+    const value = await context.activities(MetricsActivity).echo(input, { stepId: 'echo' })
+    await context.sleep('brief-delay', '1ms')
+    await context.waitForSignal('approval', MetricsSignal, { timeout: '5s' })
+    return value
+  }
+}
+
+@Workflow({ name: 'metrics.continued', version: 1, input: MetricValue, output: MetricValue })
+class MetricsContinuedWorkflow {
+  async run(
+    input: z.infer<typeof MetricValue>,
+    context: WorkflowContext
+  ): Promise<z.infer<typeof MetricValue>> {
+    if (input === 0) return context.continueAsNew(1)
+    return input
+  }
+}
+
+@Activities()
+class MetricsRetryActivity {
+  attempts = 0
+
+  @Activity({
+    name: 'metrics.retry',
+    version: 1,
+    queue: MetricsQueue,
+    input: z.string(),
+    output: z.string(),
+    retry: { maxAttempts: 2, initialDelay: '1ms', maxDelay: '1ms' }
+  })
+  async execute(input: string, context: ActivityContext): Promise<string> {
+    this.attempts++
+    if (context.attempt === 1)
+      throw new ActivityError({
+        code: 'TEMPORARY',
+        message: 'transient business failure',
+        retryable: true
+      })
+    return input
+  }
+}
+
+@Workflow({ name: 'metrics.retry-workflow', version: 1, input: z.string(), output: z.string() })
+class MetricsRetryWorkflow {
+  async run(input: string, context: WorkflowContext): Promise<string> {
+    return context.activities(MetricsRetryActivity).execute(input, { stepId: 'retry' })
+  }
+}
 
 test('central telemetry vocabulary uses stable package prefixes', () => {
   expect(
@@ -125,7 +214,7 @@ test('telemetry metrics use isolated registries and ignore invalid observations'
     telemetry.observe('activityRetryLag', -1)
     telemetry.setGauge('notifierWaiters', 3)
 
-    const snapshots = await first.runPromise(Metric.snapshot)
+    const snapshots = (await first.runPromise(TelemetryService)).snapshot()
     const started = snapshots.find(
       (snapshot) => snapshot.id === TelemetryMetricName.workflowStarted
     )
@@ -153,8 +242,144 @@ test('telemetry metrics use isolated registries and ignore invalid observations'
     if (waiters?.type === 'Gauge') expect(waiters.state.value).toBe(3)
     expect(invalidLag).toBeUndefined()
 
-    expect(await second.runPromise(Metric.snapshot)).toEqual([])
+    expect((await second.runPromise(TelemetryService)).snapshot()).toEqual([])
   } finally {
     await Promise.all([first.dispose(), second.dispose()])
+  }
+})
+
+test('runtime emits committed workflow and activity metrics without execution labels', async () => {
+  const app = await testApp(MetricsWorkflow, {
+    providers: [MetricsActivity],
+    queues: [{ queue: MetricsQueue, concurrency: 1 }]
+  })
+  try {
+    const handle = await app.client.start('SUPER_SECRET_TEST_VALUE')
+    await handle.signal(MetricsSignal, 'approved', { idempotencyKey: 'approval-1' })
+    expect(await handle.result({ timeout: '5s' })).toBe('SUPER_SECRET_TEST_VALUE')
+    expect((await app.client.start('SUPER_SECRET_TEST_VALUE')).created).toBe(false)
+
+    const runtime = app.module.get(WorkflowsRuntime)
+    const telemetry = await runtime.run(TelemetryService)
+    const snapshots = telemetry.snapshot()
+    const count = (name: string) => {
+      const metric = snapshots.find(
+        (snapshot) => snapshot.id === name && snapshot.type === 'Counter'
+      )
+      return metric?.type === 'Counter' ? metric.state.count : 0
+    }
+    const observations = (name: string) => {
+      const metric = snapshots.find(
+        (snapshot) => snapshot.id === name && snapshot.type === 'Histogram'
+      )
+      return metric?.type === 'Histogram' ? metric.state.count : 0
+    }
+
+    expect(count(TelemetryMetricName.workflowStarted)).toBe(1)
+    expect(count(TelemetryMetricName.workflowCompleted)).toBe(1)
+    expect(count(TelemetryMetricName.activityDispatched)).toBe(1)
+    expect(count(TelemetryMetricName.activityStarted)).toBe(1)
+    expect(count(TelemetryMetricName.activityCompleted)).toBe(1)
+    expect(count(TelemetryMetricName.timerDelivered)).toBe(1)
+    expect(count(TelemetryMetricName.signalAccepted)).toBe(1)
+    expect(count(TelemetryMetricName.signalConsumed)).toBe(1)
+    expect(observations(TelemetryMetricName.workflowDuration)).toBe(1)
+    expect(observations(TelemetryMetricName.workflowChainDuration)).toBe(1)
+    expect(observations(TelemetryMetricName.activityDuration)).toBe(1)
+    expect(observations(TelemetryMetricName.activityQueueWait)).toBe(1)
+    expect(observations(TelemetryMetricName.timerLag)).toBe(1)
+    expect(observations(TelemetryMetricName.signalWaitDuration)).toBe(1)
+
+    for (const snapshot of snapshots)
+      expect(snapshot.attributes?.[TelemetryAttributeKey.executionId]).toBeUndefined()
+  } finally {
+    await app.close()
+  }
+})
+
+test('continuation metrics count generations but emit one chain duration', async () => {
+  const app = await testApp(MetricsContinuedWorkflow)
+  try {
+    const handle = await app.client.start(0)
+    expect(await handle.result({ timeout: '5s' })).toBe(1)
+
+    const telemetry = await app.module.get(WorkflowsRuntime).run(TelemetryService)
+    const snapshots = telemetry.snapshot()
+    const counter = (name: string) =>
+      snapshots.find((snapshot) => snapshot.id === name && snapshot.type === 'Counter')
+    const histogram = (name: string) =>
+      snapshots.find((snapshot) => snapshot.id === name && snapshot.type === 'Histogram')
+    expect(counter(TelemetryMetricName.workflowStarted)?.state).toMatchObject({ count: 2 })
+    expect(counter(TelemetryMetricName.workflowContinued)?.state).toMatchObject({ count: 1 })
+    expect(counter(TelemetryMetricName.workflowCompleted)?.state).toMatchObject({ count: 1 })
+    expect(histogram(TelemetryMetricName.workflowDuration)?.state).toMatchObject({ count: 2 })
+    expect(histogram(TelemetryMetricName.workflowChainDuration)?.state).toMatchObject({ count: 1 })
+  } finally {
+    await app.close()
+  }
+})
+
+test('business retries emit retry metrics without delivery redelivery metrics', async () => {
+  const app = await testApp(MetricsRetryWorkflow, {
+    providers: [MetricsRetryActivity],
+    queues: [{ queue: MetricsQueue, concurrency: 1 }]
+  })
+  try {
+    const handle = await app.client.start('retry-value')
+    expect(await handle.result({ timeout: '5s' })).toBe('retry-value')
+    expect(app.module.get(MetricsRetryActivity).attempts).toBe(2)
+
+    const telemetry = await app.module.get(WorkflowsRuntime).run(TelemetryService)
+    const snapshots = telemetry.snapshot()
+    const count = (name: string) => {
+      const metric = snapshots.find(
+        (snapshot) => snapshot.id === name && snapshot.type === 'Counter'
+      )
+      return metric?.type === 'Counter' ? metric.state.count : 0
+    }
+    const observations = (name: string) => {
+      const metric = snapshots.find(
+        (snapshot) => snapshot.id === name && snapshot.type === 'Histogram'
+      )
+      return metric?.type === 'Histogram' ? metric.state.count : 0
+    }
+
+    expect(count(TelemetryMetricName.activityFailed)).toBe(1)
+    expect(count(TelemetryMetricName.activityCompleted)).toBe(1)
+    expect(count(TelemetryMetricName.activityRetryScheduled)).toBe(1)
+    expect(count(TelemetryMetricName.activityDeliveryRetried)).toBe(0)
+    expect(observations(TelemetryMetricName.activityRetryDelay)).toBe(1)
+    expect(observations(TelemetryMetricName.activityRetryLag)).toBe(1)
+    expect(observations(TelemetryMetricName.activityDuration)).toBe(2)
+  } finally {
+    await app.close()
+  }
+})
+
+test('result notifier records fallback waits and local waiter gauge', async () => {
+  const runtime = ManagedRuntime.make(telemetryLayer)
+  try {
+    const telemetry = await runtime.runPromise(TelemetryService)
+    const notifier = new ExecutionNotifier('telemetry-notifier', async () => 0, 5, telemetry)
+    await notifier.wait('execution', 0)
+
+    const snapshots = telemetry.snapshot()
+    const fallback = snapshots.find(
+      (snapshot) => snapshot.id === TelemetryMetricName.resultFallbackPoll
+    )
+    const duration = snapshots.find(
+      (snapshot) => snapshot.id === TelemetryMetricName.resultWaitDuration
+    )
+    const waiters = snapshots.find(
+      (snapshot) => snapshot.id === TelemetryMetricName.notifierWaiters
+    )
+    expect(fallback?.type).toBe('Counter')
+    if (fallback?.type === 'Counter') expect(fallback.state.count).toBe(1)
+    expect(duration?.type).toBe('Histogram')
+    if (duration?.type === 'Histogram') expect(duration.state.count).toBe(1)
+    expect(waiters?.type).toBe('Gauge')
+    if (waiters?.type === 'Gauge') expect(waiters.state.value).toBe(0)
+  } finally {
+    await runtime.dispose()
   }
 })

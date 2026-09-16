@@ -14,6 +14,8 @@ import { DurableDeferred } from 'effect/unstable/workflow'
 import { activityDeferred, workflowDefinition } from '../src/internal/wire'
 import { encode } from '../src/internal/values'
 import { testApp, eventually } from './helpers'
+import { TelemetryMetricName, TelemetryService } from '../src/internal/telemetry'
+import { WorkflowsRuntime } from '../src/internal/runtime'
 
 const Work = defineQueue('work')
 const Wake = defineSignal('wake', z.string())
@@ -204,6 +206,21 @@ test('unknown activity becomes a blocked dead letter with metadata-only admin re
     expect((await handle.history()).events).toContainEqual(
       expect.objectContaining({ type: 'activity.dead-lettered', stepId: 'blocked-step' })
     )
+    const telemetry = await app.module.get(WorkflowsRuntime).run(TelemetryService)
+    const metricCount = (name: string) => {
+      const metric = telemetry
+        .snapshot()
+        .find((snapshot) => snapshot.id === name && snapshot.type === 'Counter')
+      return metric?.type === 'Counter' ? metric.state.count : 0
+    }
+    const metricObservationCount = (name: string) => {
+      const metric = telemetry
+        .snapshot()
+        .find((snapshot) => snapshot.id === name && snapshot.type === 'Histogram')
+      return metric?.type === 'Histogram' ? metric.state.count : 0
+    }
+    expect(metricCount(TelemetryMetricName.deadLetterCreated)).toBe(1)
+    expect(metricCount(TelemetryMetricName.activityDeadLettered)).toBe(1)
     expect(
       (await runCli(app.filename, 'dead-letters', 'list', '--state', 'open')).deadLetters
     ).toContainEqual(expect.objectContaining({ id: deadLetter!.id, state: 'open' }))
@@ -218,6 +235,9 @@ test('unknown activity becomes a blocked dead letter with metadata-only admin re
       code: 'WORKFLOW_DEAD_LETTER_DISCARDED',
       failure: { code: 'WORKFLOW_DEAD_LETTER_DISCARDED' }
     })
+    expect(metricCount(TelemetryMetricName.deadLetterDiscarded)).toBe(1)
+    expect(metricCount(TelemetryMetricName.workflowFailed)).toBe(1)
+    expect(metricObservationCount(TelemetryMetricName.workflowChainDuration)).toBe(1)
   } finally {
     await app.close()
   }

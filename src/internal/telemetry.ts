@@ -291,6 +291,8 @@ export interface TelemetryApi {
     value: number,
     attributes?: TelemetryAttributes
   ) => void
+  /** Internal test/diagnostic view of this runtime's local registry. */
+  readonly snapshot: () => ReturnType<typeof Metric.snapshotUnsafe>
 }
 
 /** Runtime-private service used by Effect programs to record best-effort metrics. */
@@ -456,7 +458,8 @@ function makeTelemetry(context: Context.Context<never>): TelemetryApi {
       if (!Number.isFinite(value) || value < 0) return
       const metric = Metric.withAttributes(GAUGES[event], metricAttributes(attributes))
       metric.updateUnsafe(value, context)
-    }
+    },
+    snapshot: () => Metric.snapshotUnsafe(context)
   }
 }
 
@@ -472,7 +475,7 @@ export const telemetryLayer = Layer.effect(
     const registry = yield* Metric.MetricRegistry
     return TelemetryService.of(makeTelemetry(Context.make(Metric.MetricRegistry, registry)))
   })
-).pipe(Layer.provideMerge(metricRegistryLayer))
+).pipe(Layer.provide(metricRegistryLayer))
 
 /** Central vocabulary consumed by later metrics, tracing and logging adapters. */
 export const Telemetry = {

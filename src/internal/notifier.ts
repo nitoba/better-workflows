@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { Predicate } from 'effect'
 import { WorkflowError } from '../errors'
 import type { PostgresStorage, SqliteStorage } from '../types'
+import type { TelemetryApi } from './telemetry'
 
 export const RESULT_WAIT_FALLBACK_INTERVAL = 5_000
 
@@ -43,6 +44,7 @@ interface Waiter {
   readonly signal: AbortSignal | undefined
   readonly resolve: () => void
   readonly reject: (error: Error) => void
+  readonly startedAt: number
   timer?: ReturnType<typeof setTimeout>
   abort?: () => void
   settled: boolean
@@ -60,7 +62,8 @@ export class ExecutionNotifier {
   constructor(
     readonly key: string,
     private readonly readRevision: (executionId: string) => Promise<number>,
-    private readonly fallbackInterval = RESULT_WAIT_FALLBACK_INTERVAL
+    private readonly fallbackInterval = RESULT_WAIT_FALLBACK_INTERVAL,
+    private readonly telemetry?: TelemetryApi
   ) {
     let subscribers = localSubscribers.get(key)
     if (!subscribers) {
@@ -110,6 +113,7 @@ export class ExecutionNotifier {
         signal: options.signal,
         resolve,
         reject,
+        startedAt: Date.now(),
         settled: false
       }
       let executionWaiters = this.waiters.get(executionId)
@@ -118,6 +122,7 @@ export class ExecutionNotifier {
         this.waiters.set(executionId, executionWaiters)
       }
       executionWaiters.add(waiter)
+      this.updateGauge()
 
       waiter.abort = () =>
         this.reject(
@@ -141,7 +146,7 @@ export class ExecutionNotifier {
                 waiter,
                 new WorkflowError('WAIT_TIMEOUT', 'Result wait timed out; workflow continues')
               )
-            : this.resolve(waiter),
+            : this.fallback(waiter),
         Math.min(timeout, this.fallbackInterval)
       )
 
@@ -183,6 +188,12 @@ export class ExecutionNotifier {
     waiter.reject(error)
   }
 
+  private fallback(waiter: Waiter): void {
+    if (waiter.settled) return
+    this.telemetry?.count('resultFallbackPoll')
+    this.resolve(waiter)
+  }
+
   private finish(waiter: Waiter): void {
     waiter.settled = true
     if (waiter.timer !== undefined) clearTimeout(waiter.timer)
@@ -190,6 +201,12 @@ export class ExecutionNotifier {
     const waiters = this.waiters.get(waiter.executionId)
     waiters?.delete(waiter)
     if (waiters?.size === 0) this.waiters.delete(waiter.executionId)
+    this.telemetry?.observe('resultWaitDuration', Math.max(0, Date.now() - waiter.startedAt))
+    this.updateGauge()
+  }
+
+  private updateGauge(): void {
+    this.telemetry?.setGauge('notifierWaiters', this.waiterCount)
   }
 }
 

@@ -14,6 +14,7 @@ import type { RegisteredActivity } from './registry'
 import { ActivityTransport, activityMetadata, type ActivityDelivery } from './activity-transport'
 import { ActivityEnvelopeSchema, activityDeferred } from './wire'
 import type { ActivityEnvelope } from './wire'
+import { TelemetryAttributeKey } from './telemetry'
 
 class LeaseLost extends Error {
   constructor() {
@@ -68,6 +69,12 @@ function decodeEnvelope(payload: string): ActivityEnvelope {
   }
 }
 
+const activityMetricAttributes = (activity: RegisteredActivity) => ({
+  [TelemetryAttributeKey.activityName]: activity.options.name,
+  [TelemetryAttributeKey.activityVersion]: activity.options.version,
+  [TelemetryAttributeKey.queueName]: activity.options.queue
+})
+
 export function activityWorker(
   queue: string,
   activities: readonly RegisteredActivity[],
@@ -96,6 +103,7 @@ export function activityWorker(
     delivery: ActivityDelivery
   ) =>
     Effect.gen(function* () {
+      const attributes = activityMetricAttributes(activity)
       const run = yield* durable(journal.get(payload.executionId))
       if (
         run.control === 'cancel' ||
@@ -109,14 +117,30 @@ export function activityWorker(
       // A blocked delivery is released without changing its transport attempt.
       if (claim === 'blocked') return yield* Effect.fail(new ActivityPermitBlocked())
       if (claim === 'closed') return Exit.fail(cancelled)
-      if (claim === 'stale') return yield* Effect.fail(new LeaseLost())
+      if (claim === 'stale') {
+        journal.telemetry?.count('activityLeaseLost', attributes)
+        return yield* Effect.fail(new LeaseLost())
+      }
       const owned = claim
       if (owned.state === 'completed') {
         return owned.failure_json
           ? Exit.fail(decode<Failure>(owned.failure_json))
           : Exit.succeed(owned.result_json!)
       }
-      if (owned.owner_token !== owner) return yield* Effect.fail(new LeaseLost())
+      if (owned.owner_token !== owner) {
+        journal.telemetry?.count('activityLeaseLost', attributes)
+        return yield* Effect.fail(new LeaseLost())
+      }
+
+      journal.telemetry?.count('activityStarted', attributes)
+      if (permits.usesPermits(owned) && delivery.acquiredAt !== null) {
+        const permitAt = yield* durable(journal.databaseNow())
+        journal.telemetry?.observe(
+          'activityPermitWait',
+          Math.max(0, permitAt - delivery.acquiredAt),
+          attributes
+        )
+      }
 
       yield* Effect.addFinalizer(() => permits.release(owned).pipe(Effect.orDie))
       const work = promised(async (signal) => {
@@ -176,27 +200,45 @@ export function activityWorker(
             return Result.fail(cancelled)
           if (elapsed >= refresh) {
             elapsed = 0
-            if (!(yield* durable(permits.renew(owned, lease))))
+            if (!(yield* durable(permits.renew(owned, lease)))) {
+              journal.telemetry?.count('activityLeaseLost', attributes)
               return yield* Effect.fail(new LeaseLost())
+            }
           }
         }
       })
 
+      let handlerFinished = false
+      const handlerStartedAt = Date.now()
+      const measuredWork = work.pipe(
+        Effect.tap(() =>
+          Effect.sync(() => {
+            handlerFinished = true
+          })
+        )
+      )
       return yield* Effect.gen(function* () {
-        const outcome = yield* Effect.raceFirst(work, monitor)
+        const outcome = yield* Effect.raceFirst(measuredWork, monitor)
         const failure = Result.isFailure(outcome) ? outcome.failure : null
         const result = Result.isSuccess(outcome) ? outcome.success : null
-        if (
-          !(yield* durable(
-            permits.finish(
-              owned,
-              result,
-              failure,
-              failure && payload.attempt < payload.maxAttempts ? payload.retryDelayMs : undefined
-            )
-          ))
-        )
+        const retryDelay =
+          failure && payload.attempt < payload.maxAttempts ? payload.retryDelayMs : undefined
+        if (!(yield* durable(permits.finish(owned, result, failure, retryDelay)))) {
+          journal.telemetry?.count('activityLeaseLost', attributes)
           return yield* Effect.fail(new LeaseLost())
+        }
+        if (handlerFinished)
+          journal.telemetry?.observe(
+            'activityDuration',
+            Math.max(0, Date.now() - handlerStartedAt),
+            attributes
+          )
+        if (failure) journal.telemetry?.count('activityFailed', attributes)
+        else journal.telemetry?.count('activityCompleted', attributes)
+        if (retryDelay !== undefined) {
+          journal.telemetry?.count('activityRetryScheduled', attributes)
+          journal.telemetry?.observe('activityRetryDelay', retryDelay, attributes)
+        }
         return failure ? Exit.fail(failure) : Exit.succeed(result!)
       }).pipe(semaphore.withPermits(1))
     }).pipe(Effect.scoped)
@@ -273,7 +315,10 @@ export function activityWorker(
       token: envelope.token,
       exit: outcome.success
     })
-    if (!(yield* durable(transport.complete(delivery)))) yield* Effect.fail(new LeaseLost())
+    if (!(yield* durable(transport.complete(delivery)))) {
+      journal.telemetry?.count('activityLeaseLost', activityMetricAttributes(activity))
+      yield* Effect.fail(new LeaseLost())
+    }
   })
 
   const worker = Effect.gen(function* () {

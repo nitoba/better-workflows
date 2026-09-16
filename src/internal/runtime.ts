@@ -37,7 +37,8 @@ import type { BusinessClock } from './clock'
 import { childDeferred, timerDeferred } from './wire'
 import { activityWorker } from './worker'
 import { ActivityTransport } from './activity-transport'
-import { TelemetryService } from './telemetry'
+import { TelemetryAttributeKey, TelemetryService } from './telemetry'
+import type { TelemetryApi } from './telemetry'
 import {
   executionNotificationChannel,
   executionNotificationPayload,
@@ -66,6 +67,7 @@ export class WorkflowsRuntime
   private journal: Journal | undefined
   private activityTransport: ActivityTransport | undefined
   private notifier: ExecutionNotifier | undefined
+  private telemetry: TelemetryApi | undefined
   private ready = false
   private stopping = false
   private stopPromise?: Promise<void>
@@ -73,6 +75,9 @@ export class WorkflowsRuntime
   private safetySweepAt = Date.now() + safetySweepInterval
   private readonly dispatchLock = Semaphore.makeUnsafe(1)
   private lastDispatchError: string | undefined
+  private dispatcherFailed = false
+  private lastSuccessfulDispatchAt: number | undefined
+  private lastDispatchFailureAt: number | undefined
 
   constructor(
     @Inject(WORKFLOWS_OPTIONS) readonly options: WorkflowsOptions,
@@ -104,11 +109,16 @@ export class WorkflowsRuntime
     this.infrastructure = infrastructure
     try {
       const sql = await infrastructure.runPromise(SqlClient.SqlClient)
+      const telemetry = await infrastructure.runPromise(TelemetryService)
+      this.telemetry = telemetry
       const notifierKey = executionNotifierKey(this.options.storage, this.options.namespace)
-      this.journal = new Journal(sql, this.options.namespace, this.clock, notifierKey)
+      this.journal = new Journal(sql, this.options.namespace, this.clock, notifierKey, telemetry)
       const journal = this.journal
-      this.notifier = new ExecutionNotifier(notifierKey, (executionId) =>
-        this.run(journal.revision(executionId))
+      this.notifier = new ExecutionNotifier(
+        notifierKey,
+        (executionId) => this.run(journal.revision(executionId)),
+        undefined,
+        telemetry
       )
       if (this.options.storage.driver === 'postgres') {
         const pg = await infrastructure.runPromise(PgClient.PgClient)
@@ -177,6 +187,7 @@ export class WorkflowsRuntime
                 if (Cause.hasInterruptsOnly(cause)) return Effect.failCause(cause)
                 return Effect.sync(() => {
                   self.lastDispatchError = Cause.pretty(cause)
+                  self.lastDispatchFailureAt = Date.now()
                   self.logger.error(self.lastDispatchError)
                 })
               })
@@ -190,6 +201,7 @@ export class WorkflowsRuntime
       this.infrastructure = undefined
       this.journal = undefined
       this.activityTransport = undefined
+      this.telemetry = undefined
       this.notifier?.shutdown()
       this.notifier = undefined
       throw error
@@ -231,8 +243,10 @@ export class WorkflowsRuntime
     notifier: ExecutionNotifier
   ): void {
     const channel = executionNotificationChannel(this.options.namespace)
+    const telemetry = this.journal?.telemetry
     this.infrastructure!.runFork(
       Effect.gen(function* () {
+        let everConnected = false
         while (true) {
           const listening = yield* Effect.exit(
             Effect.provide(
@@ -240,6 +254,8 @@ export class WorkflowsRuntime
                 Effect.gen(function* () {
                   const client = yield* PgClient.makeClient(config)
                   const queue = yield* client.listen(channel)
+                  if (everConnected) telemetry?.count('notifierReconnect')
+                  everConnected = true
                   notifier.reconnected()
                   while (true) {
                     const notification = yield* Queue.take(queue)
@@ -294,6 +310,11 @@ export class WorkflowsRuntime
     const accepted = await this.run(
       this.store().accept(executionId, entry.options.name, entry.options.version, key, encoded)
     )
+    if (accepted.created)
+      this.telemetry?.count('workflowStarted', {
+        [TelemetryAttributeKey.workflowName]: accepted.row.workflow_name,
+        [TelemetryAttributeKey.workflowVersion]: accepted.row.version
+      })
     return { executionId: accepted.row.execution_id, created: accepted.created }
   }
 
@@ -560,7 +581,8 @@ export class WorkflowsRuntime
 
   private dispatch() {
     const self = this
-    return Effect.gen(function* () {
+    const startedAt = Date.now()
+    const operation = Effect.gen(function* () {
       const journal = self.store()
       const advanced = new AdvancedJournal(journal)
       yield* advanced.closeChildren()
@@ -579,7 +601,19 @@ export class WorkflowsRuntime
           }),
           exit: Exit.void
         })
-        yield* advanced.timerDelivered(timer)
+        const deliveredAt = yield* journal.now()
+        if (yield* advanced.timerDelivered(timer)) {
+          const attributes = {
+            [TelemetryAttributeKey.workflowName]: run.workflow_name,
+            [TelemetryAttributeKey.workflowVersion]: run.version
+          }
+          self.telemetry?.count('timerDelivered', attributes)
+          self.telemetry?.observe(
+            'timerLag',
+            Math.max(0, Number(deliveredAt) - Number(timer.deadline)),
+            attributes
+          )
+        }
       }
       for (const child of yield* advanced.readyChildren()) {
         const parent = yield* journal.get(child.parent_id)
@@ -667,7 +701,22 @@ export class WorkflowsRuntime
           }),
           exit: Exit.void
         })
-        yield* journal.retryDelivered(retry)
+        const deliveredAt = yield* journal.now()
+        if (yield* journal.retryDelivered(retry)) {
+          const identity = yield* journal.activityMetricIdentity(retry.execution_id, retry.step_id)
+          const attributes = identity
+            ? {
+                [TelemetryAttributeKey.activityName]: identity.activityName,
+                [TelemetryAttributeKey.activityVersion]: identity.activityVersion,
+                [TelemetryAttributeKey.queueName]: identity.queueName
+              }
+            : {}
+          self.telemetry?.observe(
+            'activityRetryLag',
+            Math.max(0, Number(deliveredAt) - Number(retry.deadline)),
+            attributes
+          )
+        }
       }
       const waits = yield* journal.pendingWaits()
       for (const candidate of waits) {
@@ -702,7 +751,37 @@ export class WorkflowsRuntime
         self.safetySweepCursor = active.length === 100 ? active.at(-1)!.execution_id : ''
         self.safetySweepAt = Date.now() + safetySweepInterval
       }
-      self.lastDispatchError = undefined
-    }).pipe(this.dispatchLock.withPermits(1))
+    })
+    const measured = operation.pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          self.telemetry?.observe(
+            'dispatcherIterationDuration',
+            Math.max(0, Date.now() - startedAt)
+          )
+        })
+      )
+    )
+    return measured.pipe(
+      Effect.tap(() =>
+        Effect.sync(() => {
+          if (self.dispatcherFailed) self.telemetry?.count('dispatcherRecovery')
+          self.dispatcherFailed = false
+          self.lastDispatchError = undefined
+          self.lastSuccessfulDispatchAt = Date.now()
+        })
+      ),
+      Effect.tapCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.void
+          : Effect.sync(() => {
+              self.lastDispatchError = Cause.pretty(cause)
+              self.dispatcherFailed = true
+              self.lastDispatchFailureAt = Date.now()
+              self.telemetry?.count('dispatcherFailure')
+            })
+      ),
+      this.dispatchLock.withPermits(1)
+    )
   }
 }

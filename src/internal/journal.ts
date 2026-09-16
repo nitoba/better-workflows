@@ -1,4 +1,4 @@
-import { Effect } from 'effect'
+import { Effect, Schema } from 'effect'
 import { createHash } from 'node:crypto'
 import type { BusinessClock } from './clock'
 import { migrateAdvanced } from './migrations'
@@ -7,6 +7,8 @@ import type { Failure } from '../errors'
 import type { HistoryPage, JsonValue } from '../types'
 import { decode, encode } from './values'
 import { executionNotificationChannel, publishLocalExecutionChange } from './notifier'
+import { TelemetryAttributeKey } from './telemetry'
+import type { TelemetryApi, TelemetryAttributes } from './telemetry'
 
 export interface RunRow {
   readonly execution_id: string
@@ -88,6 +90,12 @@ export interface ClaimRow {
   readonly failure_json: string | null
 }
 
+export interface ActivityMetricIdentity {
+  readonly activityName: string
+  readonly activityVersion: number
+  readonly queueName: string
+}
+
 interface SignalRow {
   readonly sequence: number
   readonly payload_json: string
@@ -97,13 +105,58 @@ interface SignalRow {
 const fail = (code: string, message: string) =>
   Effect.fail<Failure>({ code, message, retryable: false })
 
+const workflowMetricAttributes = (row: Pick<RunRow, 'workflow_name' | 'version'>) => ({
+  [TelemetryAttributeKey.workflowName]: row.workflow_name,
+  [TelemetryAttributeKey.workflowVersion]: row.version
+})
+
+const ActivitySignatureSchema = Schema.Struct({
+  kind: Schema.Literal('activity'),
+  name: Schema.String,
+  version: Schema.Number,
+  queue: Schema.String
+})
+
+const activityIdentityFromSignature = (signature: string): ActivityMetricIdentity | undefined => {
+  try {
+    const value: unknown = decode<unknown>(signature)
+    const record = Schema.decodeUnknownSync(ActivitySignatureSchema)(value)
+    if (!Number.isSafeInteger(record.version)) return undefined
+    return {
+      activityName: record.name,
+      activityVersion: record.version,
+      queueName: record.queue
+    }
+  } catch {
+    try {
+      const value = Schema.decodeUnknownSync(Schema.Tuple([Schema.String, Schema.String]))(
+        decode<unknown>(signature)
+      )
+      const record = Schema.decodeUnknownSync(ActivitySignatureSchema)(decode<unknown>(value[0]))
+      if (!Number.isSafeInteger(record.version)) return undefined
+      return {
+        activityName: record.name,
+        activityVersion: record.version,
+        queueName: record.queue
+      }
+    } catch {
+      return undefined
+    }
+  }
+}
+
 export class Journal {
   constructor(
     readonly sql: SqlClient,
     readonly namespace: string,
     readonly clock?: BusinessClock,
-    readonly localNotifierKey = namespace
+    readonly localNotifierKey = namespace,
+    readonly telemetry?: TelemetryApi
   ) {}
+
+  private workflowAttributes(row: Pick<RunRow, 'workflow_name' | 'version'>) {
+    return workflowMetricAttributes(row)
+  }
 
   readonly now = () => (this.clock ? Effect.sync(() => this.clock!.now()) : this.databaseNow())
 
@@ -390,7 +443,10 @@ export class Journal {
    */
   continueAsNew(executionId: string, nextExecutionId: string, key: string, input: string) {
     const self = this
-    return self.sql.withTransaction(
+    let transitioned = false
+    let sourceCreatedAt: number | undefined
+    let transitionedAt: number | undefined
+    const operation = self.sql.withTransaction(
       Effect.gen(function* () {
         yield* self.lockRun(executionId)
         const current = yield* self.get(executionId)
@@ -425,6 +481,7 @@ export class Journal {
             'TERMINAL_EXECUTION',
             `Cannot continue terminal execution ${executionId}`
           )
+        sourceCreatedAt = Number(current.created_at)
         if (current.control !== 'run')
           return yield* fail(
             'CONTROL_CONFLICT',
@@ -458,6 +515,7 @@ export class Journal {
         }
 
         const now = yield* self.now()
+        transitionedAt = Number(now)
         yield* self.sql`INSERT INTO better_workflows_runs
           (execution_id, namespace, workflow_name, version, dedupe_key, input_json,
            created_at, updated_at, state, chain_id, generation, continued_from)
@@ -474,6 +532,7 @@ export class Journal {
             'STORAGE_CONFLICT',
             `Execution ${executionId} changed while continuing as new`
           )
+        transitioned = true
         yield* self.event(executionId, 'workflow.continued', {
           fromExecutionId: executionId,
           toExecutionId: nextExecutionId,
@@ -486,6 +545,23 @@ export class Journal {
         })
         return yield* self.get(nextExecutionId)
       })
+    )
+    return operation.pipe(
+      Effect.tap((row) =>
+        Effect.sync(() => {
+          if (transitioned) {
+            const attributes = self.workflowAttributes(row)
+            self.telemetry?.count('workflowStarted', attributes)
+            self.telemetry?.count('workflowContinued', attributes)
+            if (sourceCreatedAt !== undefined && transitionedAt !== undefined)
+              self.telemetry?.observe(
+                'workflowDuration',
+                Math.max(0, transitionedAt - sourceCreatedAt),
+                attributes
+              )
+          }
+        })
+      )
     )
   }
 
@@ -641,10 +717,12 @@ export class Journal {
 
   complete(executionId: string, result: string | null, failure: Failure | null, cancelled = false) {
     const self = this
-    return self.sql.withTransaction(
+    const operation = self.sql.withTransaction(
       Effect.gen(function* () {
         const state = cancelled ? 'cancelled' : failure ? 'failed' : 'completed'
         const now = yield* self.now()
+        const [current] = yield* self.sql<RunRow>`SELECT * FROM better_workflows_runs
+          WHERE execution_id = ${executionId} AND namespace = ${self.namespace}`
         const rows = yield* self.sql`UPDATE better_workflows_runs
         SET state = ${state}, result_json = ${result}, failure_json = ${failure ? encode(failure) : null}, wait_type = NULL, wait_step = NULL
         WHERE execution_id = ${executionId} AND namespace = ${self.namespace}
@@ -655,17 +733,66 @@ export class Journal {
             `workflow.${state}`,
             failure ? { code: failure.code, message: failure.message } : null
           )
-        if (cancelled)
-          yield* self.sql`UPDATE better_workflows_dead_letters
+        const discarded = cancelled
+          ? yield* self.sql<{
+              queue_name: string
+              activity_name: string | null
+              activity_version: number | null
+              reason_code: string
+            }>`UPDATE better_workflows_dead_letters
             SET state='discarded', discard_reason='Owner execution was cancelled', updated_at=${now}
             WHERE namespace=${self.namespace} AND execution_id=${executionId}
-            AND state IN ('open','requeued')`
+            AND state IN ('open','requeued') RETURNING queue_name, activity_name, activity_version, reason_code`
+          : []
         if (cancelled)
           yield* self.sql`UPDATE better_workflows_activity_deliveries
             SET state='failed', acquired_at=NULL, acquired_by=NULL, updated_at=${now}
             WHERE namespace=${self.namespace} AND execution_id=${executionId}
             AND state IN ('pending','processing')`
+        let chainCreatedAt: number | undefined
+        if (rows.length && current) {
+          const [chain] = yield* self.sql<{ created_at: number; generation: number }>`SELECT
+            MIN(created_at) AS created_at, MAX(generation) AS generation
+            FROM better_workflows_runs WHERE namespace=${self.namespace} AND chain_id=${current.chain_id}`
+          if (chain && Number(chain.generation) === Number(current.generation))
+            chainCreatedAt = Number(chain.created_at)
+        }
+        return { changed: rows.length > 0, current, state, now, chainCreatedAt, discarded }
       })
+    )
+    return operation.pipe(
+      Effect.tap(({ changed, current, state, now, chainCreatedAt, discarded }) =>
+        Effect.sync(() => {
+          if (changed && current) {
+            const attributes = self.workflowAttributes(current)
+            if (state === 'completed') self.telemetry?.count('workflowCompleted', attributes)
+            else if (state === 'failed') self.telemetry?.count('workflowFailed', attributes)
+            else self.telemetry?.count('workflowCancelled', attributes)
+            self.telemetry?.observe(
+              'workflowDuration',
+              Math.max(0, Number(now) - Number(current.created_at)),
+              attributes
+            )
+            if (chainCreatedAt !== undefined)
+              self.telemetry?.observe(
+                'workflowChainDuration',
+                Math.max(0, Number(now) - chainCreatedAt),
+                attributes
+              )
+          }
+          for (const row of discarded) {
+            const attributes: TelemetryAttributes = {
+              [TelemetryAttributeKey.queueName]: row.queue_name,
+              [TelemetryAttributeKey.deadLetterReason]: row.reason_code
+            }
+            if (row.activity_name !== null)
+              attributes[TelemetryAttributeKey.activityName] = row.activity_name
+            if (row.activity_version !== null)
+              attributes[TelemetryAttributeKey.activityVersion] = row.activity_version
+            self.telemetry?.count('deadLetterDiscarded', attributes)
+          }
+        })
+      )
     )
   }
 
@@ -716,7 +843,7 @@ export class Journal {
 
   signal(executionId: string, signalName: string, key: string, payload: string) {
     const self = this
-    return self.sql.withTransaction(
+    const operation = self.sql.withTransaction(
       Effect.gen(function* () {
         // The run row serializes signal acceptance, consumption and timeout decisions on both databases.
         yield* self.sql`UPDATE better_workflows_runs SET signal_sequence = signal_sequence
@@ -765,6 +892,16 @@ export class Journal {
         return { accepted: true }
       })
     )
+    return operation.pipe(
+      Effect.tap(({ accepted }) =>
+        Effect.sync(() => {
+          if (accepted)
+            self.telemetry?.count('signalAccepted', {
+              [TelemetryAttributeKey.signalName]: signalName
+            })
+        })
+      )
+    )
   }
 
   pendingWaits() {
@@ -782,7 +919,10 @@ export class Journal {
 
   resolveWait(wait: WaitRow) {
     const self = this
-    return self.sql.withTransaction(
+    let resolution: 'consumed' | 'timeout' | undefined
+    let resolvedAt: number | undefined
+    let waitStartedAt: number | undefined
+    const operation = self.sql.withTransaction(
       Effect.gen(function* () {
         yield* self.sql`UPDATE better_workflows_runs SET signal_sequence = signal_sequence
         WHERE execution_id = ${wait.execution_id} AND namespace = ${self.namespace}`
@@ -790,6 +930,10 @@ export class Journal {
         WHERE execution_id = ${wait.execution_id} AND step_id = ${wait.step_id}`
         if (!current || current.state !== 'pending') return current
         const now = yield* self.now()
+        const [scheduled] = yield* self.sql<{ at: number }>`SELECT at FROM better_workflows_events
+          WHERE execution_id=${wait.execution_id} AND step_id=${wait.step_id}
+          AND type='command.scheduled' ORDER BY sequence LIMIT 1`
+        waitStartedAt = scheduled ? Number(scheduled.at) : undefined
         const [signal] = yield* self.sql<SignalRow>`SELECT * FROM better_workflows_signals
         WHERE execution_id = ${wait.execution_id} AND signal_name = ${wait.signal_name} AND consumed_by IS NULL
         ORDER BY sequence LIMIT 1`
@@ -804,6 +948,8 @@ export class Journal {
             { signal: wait.signal_name, sequence: signal.sequence },
             wait.step_id
           )
+          resolution = 'consumed'
+          resolvedAt = Number(now)
           return {
             ...current,
             state: 'success' as const,
@@ -820,6 +966,8 @@ export class Journal {
             { signal: wait.signal_name },
             wait.step_id
           )
+          resolution = 'timeout'
+          resolvedAt = Number(now)
           return { ...current, state: 'timeout' as const, wake_requested: 1 }
         }
         yield* self.sql`UPDATE better_workflows_waits SET wake_requested = 0
@@ -827,11 +975,45 @@ export class Journal {
         return { ...current, wake_requested: 0 }
       })
     )
+    return operation.pipe(
+      Effect.tap(() =>
+        Effect.sync(() => {
+          if (resolution === 'consumed') {
+            self.telemetry?.count('signalConsumed', {
+              [TelemetryAttributeKey.signalName]: wait.signal_name
+            })
+            if (waitStartedAt !== undefined && resolvedAt !== undefined)
+              self.telemetry?.observe(
+                'signalWaitDuration',
+                Math.max(0, resolvedAt - waitStartedAt),
+                { [TelemetryAttributeKey.signalName]: wait.signal_name }
+              )
+          } else if (resolution === 'timeout') {
+            self.telemetry?.count('signalTimeout', {
+              [TelemetryAttributeKey.signalName]: wait.signal_name
+            })
+            if (waitStartedAt !== undefined && resolvedAt !== undefined)
+              self.telemetry?.observe(
+                'signalWaitDuration',
+                Math.max(0, resolvedAt - waitStartedAt),
+                { [TelemetryAttributeKey.signalName]: wait.signal_name }
+              )
+          }
+        })
+      )
+    )
   }
 
   delivered(wait: WaitRow) {
     return this.sql`UPDATE better_workflows_waits SET delivered = 1, wake_requested = 0
       WHERE execution_id = ${wait.execution_id} AND step_id = ${wait.step_id} AND state <> 'pending'`
+  }
+
+  activityMetricIdentity(executionId: string, stepId: string) {
+    return this.sql<{ signature: string }>`SELECT signature FROM better_workflows_commands
+      WHERE execution_id=${executionId} AND step_id=${stepId}`.pipe(
+      Effect.map((rows) => (rows[0] ? activityIdentityFromSignature(rows[0].signature) : undefined))
+    )
   }
 
   claim(
@@ -942,8 +1124,9 @@ export class Journal {
   }
 
   retryDelivered(retry: RetryRow) {
-    return this.sql`UPDATE better_workflows_retries SET delivered = 1
-      WHERE execution_id = ${retry.execution_id} AND step_id = ${retry.step_id} AND attempt = ${retry.attempt}`
+    return this.sql<{ execution_id: string }>`UPDATE better_workflows_retries SET delivered = 1
+      WHERE execution_id = ${retry.execution_id} AND step_id = ${retry.step_id} AND attempt = ${retry.attempt}
+      AND delivered = 0 RETURNING execution_id`.pipe(Effect.map((rows) => rows.length > 0))
   }
 
   heartbeat(claim: ClaimRow, details: JsonValue) {

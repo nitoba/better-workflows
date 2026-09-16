@@ -12,6 +12,8 @@ import type {
 import { WorkflowError } from '../errors'
 import { encode, identifier, positiveInteger } from './values'
 import type { Journal, RunRow } from './journal'
+import { TelemetryAttributeKey } from './telemetry'
+import type { TelemetryAttributes } from './telemetry'
 
 export interface ActivityDelivery {
   readonly sequence: number
@@ -20,6 +22,7 @@ export interface ActivityDelivery {
   readonly id: string
   readonly payload: string
   readonly deliveryAttempt: number
+  readonly createdAt: number
   readonly acquiredAt: number | null
   readonly acquiredBy: string | null
   readonly deadLetterId: string | null
@@ -44,6 +47,7 @@ interface DeliveryRow {
   readonly acquired_at: number | null
   readonly acquired_by: string | null
   readonly dead_letter_id: string | null
+  readonly created_at: number
 }
 
 interface DeadLetterRow {
@@ -69,6 +73,19 @@ interface DeadLetterRow {
 
 const terminal = (state: RunRow['state']) =>
   ['continued', 'completed', 'failed', 'cancelled'].includes(state)
+
+const activityMetricAttributes = (
+  queue: string,
+  activityName: string | null,
+  activityVersion: number | null,
+  reason?: string
+): TelemetryAttributes => {
+  const attributes: TelemetryAttributes = { [TelemetryAttributeKey.queueName]: queue }
+  if (activityName !== null) attributes[TelemetryAttributeKey.activityName] = activityName
+  if (activityVersion !== null) attributes[TelemetryAttributeKey.activityVersion] = activityVersion
+  if (reason !== undefined) attributes[TelemetryAttributeKey.deadLetterReason] = reason
+  return attributes
+}
 
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- JSON.parse produces an untrusted value at the transport boundary.
 const metadataFromParsed = (value: unknown): ActivityMetadata => {
@@ -108,6 +125,7 @@ function toDelivery(row: DeliveryRow): ActivityDelivery {
     id: row.delivery_id,
     payload: row.payload_json,
     deliveryAttempt: Number(row.attempts),
+    createdAt: Number(row.created_at),
     acquiredAt: row.acquired_at === null ? null : Number(row.acquired_at),
     acquiredBy: row.acquired_by,
     deadLetterId: row.dead_letter_id
@@ -249,7 +267,10 @@ export class DeadLetterStore {
   ) {
     const self = this
     const id = this.idFor(delivery)
-    return self.journal.sql.withTransaction(
+    let inserted = false
+    let resolved = false
+    let discarded = false
+    const operation = self.journal.sql.withTransaction(
       Effect.gen(function* () {
         const now = yield* self.journal.databaseNow()
         if (metadata.executionId) yield* self.journal.lockRun(metadata.executionId)
@@ -271,7 +292,7 @@ export class DeadLetterStore {
             `Activity delivery ${delivery.id} is no longer owned by this worker`
           )
         }
-        const inserted = yield* self.journal.sql`INSERT INTO better_workflows_dead_letters
+        const insertedRows = yield* self.journal.sql`INSERT INTO better_workflows_dead_letters
           (id, namespace, queue_name, delivery_id, execution_id, step_id, activity_name,
            activity_version, business_attempt, delivery_attempt, reason_code, reason_message,
            first_failed_at, updated_at, state, payload_json)
@@ -280,24 +301,32 @@ export class DeadLetterStore {
             ${metadata.activityVersion}, ${metadata.businessAttempt}, ${delivery.deliveryAttempt},
             ${reasonCode}, ${reasonMessage.slice(0, 4096)}, ${now}, ${now}, 'open', ${delivery.payload})
           ON CONFLICT(namespace, delivery_id) DO NOTHING RETURNING id`
+        inserted = insertedRows.length > 0
         const [existing] = yield* self.row(id)
         if (!existing)
           return yield* failure('STORAGE_CONFLICT', `Dead letter ${id} was not persisted`)
-        if (delivery.deadLetterId)
-          yield* self.journal
-            .sql`UPDATE better_workflows_dead_letters SET state='resolved', updated_at=${now}
-            WHERE namespace=${self.journal.namespace} AND id=${delivery.deadLetterId} AND state='requeued'`
-        if (inserted.length && metadata.executionId) {
+        if (delivery.deadLetterId) {
+          const resolvedRows = yield* self.journal.sql<{
+            id: string
+          }>`UPDATE better_workflows_dead_letters SET state='resolved', updated_at=${now}
+            WHERE namespace=${self.journal.namespace} AND id=${delivery.deadLetterId} AND state='requeued'
+            RETURNING id`
+          resolved = resolvedRows.length > 0
+        }
+        if (inserted && metadata.executionId) {
           const [run] = yield* self.journal.sql<RunRow>`SELECT * FROM better_workflows_runs
             WHERE execution_id=${metadata.executionId} AND namespace=${self.journal.namespace}`
           if (run && (run.control === 'cancel' || terminal(run.state))) {
-            yield* self.journal.sql`UPDATE better_workflows_dead_letters
+            const discardedRows = yield* self.journal.sql<{
+              id: string
+            }>`UPDATE better_workflows_dead_letters
               SET state='discarded', discard_reason=${
                 run.control === 'cancel' || run.state === 'cancelled'
                   ? 'Owner execution was cancelled'
                   : 'Owner execution is terminal'
               }, updated_at=${now}
-              WHERE namespace=${self.journal.namespace} AND id=${id} AND state='open'`
+              WHERE namespace=${self.journal.namespace} AND id=${id} AND state='open' RETURNING id`
+            discarded = discardedRows.length > 0
           } else {
             yield* self.journal
               .sql`UPDATE better_workflows_runs SET state='blocked', wait_type='activity', wait_step=${metadata.stepId}
@@ -324,6 +353,24 @@ export class DeadLetterStore {
         return toDeadLetter(existing, false)
       })
     )
+    return operation.pipe(
+      Effect.tap(() =>
+        Effect.sync(() => {
+          const attributes = activityMetricAttributes(
+            delivery.queue,
+            metadata.activityName,
+            metadata.activityVersion,
+            reasonCode
+          )
+          if (inserted) {
+            self.journal.telemetry?.count('deadLetterCreated', attributes)
+            self.journal.telemetry?.count('activityDeadLettered', attributes)
+          }
+          if (resolved) self.journal.telemetry?.count('deadLetterResolved', attributes)
+          if (discarded) self.journal.telemetry?.count('deadLetterDiscarded', attributes)
+        })
+      )
+    )
   }
 
   requeue(
@@ -334,11 +381,14 @@ export class DeadLetterStore {
       deliveryId: string,
       initialAttempt: number,
       deadLetterId: string
-    ) => Effect.Effect<void, Failure | SqlError, never>
+    ) => Effect.Effect<boolean, Failure | SqlError, never>
   ) {
     identifier(id, 'Dead-letter ID')
     const self = this
-    return self.journal.sql.withTransaction(
+    let requeued = false
+    let dispatched = false
+    let metricCurrent: DeadLetterRow | undefined
+    const operation = self.journal.sql.withTransaction(
       Effect.gen(function* () {
         const [current] = yield* self.row(id)
         if (!current)
@@ -360,9 +410,10 @@ export class DeadLetterStore {
             'TERMINAL_EXECUTION',
             `Execution ${run.execution_id} is ${run.state === 'cancelled' || run.control === 'cancel' ? 'cancelled' : 'terminal'}`
           )
+        metricCurrent = current
         const count = Number(current.requeue_count) + 1
         const deliveryId = `${id}:r${count}`
-        yield* offer(
+        dispatched = yield* offer(
           current.queue_name,
           current.payload_json,
           deliveryId,
@@ -370,9 +421,12 @@ export class DeadLetterStore {
           id
         )
         const now = yield* self.journal.databaseNow()
-        yield* self.journal.sql`UPDATE better_workflows_dead_letters
+        const requeuedRows = yield* self.journal.sql<{
+          id: string
+        }>`UPDATE better_workflows_dead_letters
           SET state='requeued', requeue_count=${count}, updated_at=${now}
-          WHERE namespace=${self.journal.namespace} AND id=${id} AND state='open'`
+          WHERE namespace=${self.journal.namespace} AND id=${id} AND state='open' RETURNING id`
+        requeued = requeuedRows.length > 0
         if (run && run.state === 'blocked') {
           const remaining = yield* self.journal.sql`SELECT id FROM better_workflows_dead_letters
             WHERE namespace=${self.journal.namespace} AND execution_id=${run.execution_id}
@@ -392,9 +446,24 @@ export class DeadLetterStore {
             },
             current.step_id
           )
-        const [updated] = yield* self.row(id)
-        return toDeadLetter(updated!, false)
+        const [updatedRow] = yield* self.row(id)
+        return toDeadLetter(updatedRow!, false)
       })
+    )
+    return operation.pipe(
+      Effect.tap(() =>
+        Effect.sync(() => {
+          if (!requeued || !metricCurrent) return
+          const attributes = activityMetricAttributes(
+            metricCurrent.queue_name,
+            metricCurrent.activity_name,
+            metricCurrent.activity_version,
+            metricCurrent.reason_code
+          )
+          self.journal.telemetry?.count('deadLetterRequeued', attributes)
+          if (dispatched) self.journal.telemetry?.count('activityDispatched', attributes)
+        })
+      )
     )
   }
 
@@ -405,7 +474,16 @@ export class DeadLetterStore {
     if (options.reason.length > 4096)
       throw new WorkflowError('INVALID_REASON', 'Discard reasons are limited to 4096 characters')
     const self = this
-    return self.journal.sql.withTransaction(
+    let discarded: ReadonlyArray<{
+      queue_name: string
+      activity_name: string | null
+      activity_version: number | null
+      reason_code: string
+    }> = []
+    let failedRun: RunRow | undefined
+    let failedAt: number | undefined
+    let failedChainCreatedAt: number | undefined
+    const operation = self.journal.sql.withTransaction(
       Effect.gen(function* () {
         const [current] = yield* self.row(id)
         if (!current)
@@ -423,11 +501,16 @@ export class DeadLetterStore {
             WHERE execution_id=${current.execution_id} AND namespace=${self.journal.namespace}`)[0]
         }
         const now = yield* self.journal.databaseNow()
-        yield* self.journal
-          .sql`UPDATE better_workflows_dead_letters SET state='discarded', discard_reason=${options.reason}, updated_at=${now}
+        discarded = yield* self.journal.sql<{
+          queue_name: string
+          activity_name: string | null
+          activity_version: number | null
+          reason_code: string
+        }>`UPDATE better_workflows_dead_letters SET state='discarded', discard_reason=${options.reason}, updated_at=${now}
           WHERE namespace=${self.journal.namespace}
           AND (id=${id} OR (execution_id=${current.execution_id} AND execution_id IS NOT NULL))
-          AND state IN ('open','requeued')`
+          AND state IN ('open','requeued')
+          RETURNING queue_name, activity_name, activity_version, reason_code`
         yield* self.journal.sql`UPDATE better_workflows_activity_deliveries SET state='failed',
           acquired_at=NULL, acquired_by=NULL, updated_at=${now}
           WHERE namespace=${self.journal.namespace} AND state IN ('pending','processing')
@@ -438,11 +521,22 @@ export class DeadLetterStore {
             message: options.reason,
             retryable: false
           }
-          yield* self.journal.sql`UPDATE better_workflows_runs SET state='failed', control='cancel',
+          const failed = yield* self.journal.sql<{
+            execution_id: string
+          }>`UPDATE better_workflows_runs SET state='failed', control='cancel',
             control_revision=control_revision+1, wait_type=NULL, wait_step=NULL,
             result_json=NULL, failure_json=${encode(operational)}
             WHERE execution_id=${run.execution_id} AND namespace=${self.journal.namespace}
-            AND state NOT IN ('continued','completed','failed','cancelled')`
+            AND state NOT IN ('continued','completed','failed','cancelled') RETURNING execution_id`
+          if (failed.length) {
+            failedRun = run
+            failedAt = now
+            const [chain] = yield* self.journal.sql<{
+              created_at: number
+            }>`SELECT MIN(created_at) AS created_at
+              FROM better_workflows_runs WHERE namespace=${self.journal.namespace} AND chain_id=${run.chain_id}`
+            if (chain) failedChainCreatedAt = Number(chain.created_at)
+          }
           yield* self.journal.event(
             run.execution_id,
             'activity.dead-letter-discarded',
@@ -460,6 +554,40 @@ export class DeadLetterStore {
         const [updated] = yield* self.row(id)
         return toDeadLetter(updated!, false)
       })
+    )
+    return operation.pipe(
+      Effect.tap(() =>
+        Effect.sync(() => {
+          for (const row of discarded)
+            self.journal.telemetry?.count(
+              'deadLetterDiscarded',
+              activityMetricAttributes(
+                row.queue_name,
+                row.activity_name,
+                row.activity_version,
+                row.reason_code
+              )
+            )
+          if (failedRun && failedAt !== undefined) {
+            const attributes = {
+              [TelemetryAttributeKey.workflowName]: failedRun.workflow_name,
+              [TelemetryAttributeKey.workflowVersion]: failedRun.version
+            }
+            self.journal.telemetry?.count('workflowFailed', attributes)
+            self.journal.telemetry?.observe(
+              'workflowDuration',
+              Math.max(0, failedAt - Number(failedRun.created_at)),
+              attributes
+            )
+            if (failedChainCreatedAt !== undefined)
+              self.journal.telemetry?.observe(
+                'workflowChainDuration',
+                Math.max(0, failedAt - failedChainCreatedAt),
+                attributes
+              )
+          }
+        })
+      )
     )
   }
 
@@ -496,6 +624,7 @@ function offerInTransaction(
           `Activity delivery ${deliveryId} differs from its existing payload`
         )
     }
+    return inserted.length > 0
   })
 }
 
@@ -509,9 +638,9 @@ export class ActivityTransport {
 
   offer(queue: string, payload: string, deliveryId: string) {
     const self = this
-    return self.journal.sql.withTransaction(
+    const operation = self.journal.sql.withTransaction(
       Effect.gen(function* () {
-        yield* offerInTransaction(
+        return yield* offerInTransaction(
           self.journal,
           queue,
           payload,
@@ -521,6 +650,21 @@ export class ActivityTransport {
           yield* self.journal.databaseNow()
         )
       })
+    )
+    return operation.pipe(
+      Effect.tap((inserted) =>
+        Effect.sync(() => {
+          if (inserted)
+            self.journal.telemetry?.count(
+              'activityDispatched',
+              activityMetricAttributes(
+                queue,
+                activityMetadata(payload).activityName,
+                activityMetadata(payload).activityVersion
+              )
+            )
+        })
+      )
     )
   }
 
@@ -534,7 +678,7 @@ export class ActivityTransport {
   ) {
     const self = this
     return Effect.gen(function* () {
-      yield* offerInTransaction(
+      return yield* offerInTransaction(
         self.journal,
         queue,
         payload,
@@ -566,7 +710,19 @@ export class ActivityTransport {
           ORDER BY visible_at, sequence LIMIT 1
         ) RETURNING *`
       const row = rows[0]
-      return row ? toDelivery(row) : undefined
+      if (!row) return undefined
+      const delivery = toDelivery(row)
+      if (delivery.deliveryAttempt === 1)
+        self.journal.telemetry?.observe(
+          'activityQueueWait',
+          Math.max(0, now - delivery.createdAt),
+          activityMetricAttributes(
+            queue,
+            activityMetadata(delivery.payload).activityName,
+            activityMetadata(delivery.payload).activityVersion
+          )
+        )
+      return delivery
     })
   }
 
@@ -574,11 +730,25 @@ export class ActivityTransport {
     const self = this
     return Effect.gen(function* () {
       const now = yield* self.journal.databaseNow()
-      yield* self.journal.sql`UPDATE better_workflows_activity_deliveries SET state='pending',
+      const rows = yield* self.journal.sql<{
+        delivery_id: string
+      }>`UPDATE better_workflows_activity_deliveries SET state='pending',
         acquired_at=NULL, acquired_by=NULL,
         visible_at=${now + delay}, last_failure=${reason.slice(0, 4096)}, updated_at=${now}
         WHERE namespace=${self.journal.namespace} AND queue_name=${delivery.queue}
-        AND delivery_id=${delivery.id} AND state='processing' AND acquired_by=${delivery.acquiredBy}`
+        AND delivery_id=${delivery.id} AND state='processing' AND acquired_by=${delivery.acquiredBy}
+        RETURNING delivery_id`
+      const retried = rows.length > 0
+      if (retried)
+        self.journal.telemetry?.count(
+          'activityDeliveryRetried',
+          activityMetricAttributes(
+            delivery.queue,
+            activityMetadata(delivery.payload).activityName,
+            activityMetadata(delivery.payload).activityVersion
+          )
+        )
+      return retried
     })
   }
 
@@ -586,17 +756,32 @@ export class ActivityTransport {
     const self = this
     return Effect.gen(function* () {
       const instant = yield* self.journal.databaseNow()
-      yield* self.journal.sql`UPDATE better_workflows_activity_deliveries SET state='pending',
+      const rows = yield* self.journal.sql<{
+        delivery_id: string
+      }>`UPDATE better_workflows_activity_deliveries SET state='pending',
         attempts=CASE WHEN attempts>0 THEN attempts-1 ELSE 0 END, acquired_at=NULL, acquired_by=NULL,
         visible_at=${instant + delay}, updated_at=${instant}
       WHERE namespace=${self.journal.namespace} AND queue_name=${delivery.queue}
-      AND delivery_id=${delivery.id} AND state='processing' AND acquired_by=${delivery.acquiredBy}`
+      AND delivery_id=${delivery.id} AND state='processing' AND acquired_by=${delivery.acquiredBy}
+      RETURNING delivery_id`
+      const released = rows.length > 0
+      if (released)
+        self.journal.telemetry?.count(
+          'activityDeliveryRetried',
+          activityMetricAttributes(
+            delivery.queue,
+            activityMetadata(delivery.payload).activityName,
+            activityMetadata(delivery.payload).activityVersion
+          )
+        )
+      return released
     })
   }
 
   complete(delivery: ActivityDelivery) {
     const self = this
-    return self.journal.sql.withTransaction(
+    let resolved = false
+    const operation = self.journal.sql.withTransaction(
       Effect.gen(function* () {
         const now = yield* self.journal.databaseNow()
         const metadata = activityMetadata(delivery.payload)
@@ -608,9 +793,12 @@ export class ActivityTransport {
           AND delivery_id=${delivery.id} AND state='processing' AND acquired_by=${delivery.acquiredBy}
           RETURNING delivery_id`
         if (rows.length && delivery.deadLetterId)
-          yield* self.journal
-            .sql`UPDATE better_workflows_dead_letters SET state='resolved', updated_at=${now}
-            WHERE namespace=${self.journal.namespace} AND id=${delivery.deadLetterId} AND state='requeued'`
+          resolved = yield* self.journal.sql<{
+            id: string
+          }>`UPDATE better_workflows_dead_letters SET state='resolved', updated_at=${now}
+            WHERE namespace=${self.journal.namespace} AND id=${delivery.deadLetterId} AND state='requeued'`.pipe(
+            Effect.map((updated) => updated.length > 0)
+          )
         if (rows.length && delivery.deadLetterId) {
           if (metadata.executionId) {
             const remaining = yield* self.journal.sql`SELECT id FROM better_workflows_dead_letters
@@ -624,6 +812,21 @@ export class ActivityTransport {
         }
         return rows.length > 0
       })
+    )
+    return operation.pipe(
+      Effect.tap((completed) =>
+        Effect.sync(() => {
+          if (completed && resolved && delivery.deadLetterId)
+            self.journal.telemetry?.count(
+              'deadLetterResolved',
+              activityMetricAttributes(
+                delivery.queue,
+                activityMetadata(delivery.payload).activityName,
+                activityMetadata(delivery.payload).activityVersion
+              )
+            )
+        })
+      )
     )
   }
 

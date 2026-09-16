@@ -161,6 +161,10 @@ export class Permits {
     })
   }
 
+  usesPermits(claim: ActivityClaim): boolean {
+    return claim[CLAIM_RECEIPT].usesPermits
+  }
+
   release(claim: ActivityClaim) {
     if (!claim[CLAIM_RECEIPT].usesPermits) return Effect.void
     return this.journal
