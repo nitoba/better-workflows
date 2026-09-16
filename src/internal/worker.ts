@@ -22,6 +22,13 @@ class LeaseLost extends Error {
   }
 }
 
+class ActivityPermitBlocked extends Error {
+  constructor() {
+    super('Activity delivery is waiting for a concurrency permit')
+    this.name = 'ActivityPermitBlocked'
+  }
+}
+
 const cancelled: Failure = {
   code: 'WORKFLOW_CANCELLED',
   message: 'Workflow cancellation was requested',
@@ -53,15 +60,13 @@ export function activityWorker(
       if (run.control === 'cancel' || ['completed', 'failed', 'cancelled'].includes(run.state))
         return Exit.fail(cancelled)
       const owner = randomUUID()
-      let claim = yield* durable(
+      const claim = yield* durable(
         permits.claim(activity.options.queue, payload, delivery, owner, lease)
       )
-      while (claim === 'blocked') {
-        yield* Effect.sleep(poll)
-        claim = yield* durable(
-          permits.claim(activity.options.queue, payload, delivery, owner, lease)
-        )
-      }
+      // A blocked delivery must leave the queue callback so another item can
+      // be admitted. PersistedQueue retries this transport failure without
+      // turning it into the activity's business result.
+      if (claim === 'blocked') return yield* Effect.fail(new ActivityPermitBlocked())
       if (claim === 'closed') return Exit.fail(cancelled)
       if (claim === 'stale') return yield* Effect.fail(new LeaseLost())
       const owned = claim
@@ -137,22 +142,24 @@ export function activityWorker(
         }
       })
 
-      const outcome = yield* Effect.raceFirst(work, monitor)
-      const failure = Result.isFailure(outcome) ? outcome.failure : null
-      const result = Result.isSuccess(outcome) ? outcome.success : null
-      if (
-        !(yield* durable(
-          permits.finish(
-            owned,
-            result,
-            failure,
-            payload.attempt < payload.maxAttempts ? payload.retryDelayMs : undefined
-          )
-        ))
-      )
-        return yield* Effect.fail(new LeaseLost())
-      return failure ? Exit.fail(failure) : Exit.succeed(result!)
-    }).pipe(Effect.scoped, semaphore.withPermits(1))
+      return yield* Effect.gen(function* () {
+        const outcome = yield* Effect.raceFirst(work, monitor)
+        const failure = Result.isFailure(outcome) ? outcome.failure : null
+        const result = Result.isSuccess(outcome) ? outcome.success : null
+        if (
+          !(yield* durable(
+            permits.finish(
+              owned,
+              result,
+              failure,
+              payload.attempt < payload.maxAttempts ? payload.retryDelayMs : undefined
+            )
+          ))
+        )
+          return yield* Effect.fail(new LeaseLost())
+        return failure ? Exit.fail(failure) : Exit.succeed(result!)
+      }).pipe(semaphore.withPermits(1))
+    }).pipe(Effect.scoped)
 
   return Effect.gen(function* () {
     const queue = yield* PersistedQueue.make({
@@ -199,6 +206,9 @@ export function activityWorker(
       .pipe(
         Effect.catchCause((cause) => {
           if (Cause.hasInterruptsOnly(cause)) return Effect.failCause(cause)
+          const error = Cause.findError(cause)
+          if (Result.isSuccess(error) && error.success instanceof ActivityPermitBlocked)
+            return Effect.sleep(poll)
           return Effect.logWarning('Activity delivery will be retried', Cause.pretty(cause)).pipe(
             Effect.andThen(Effect.sleep(poll))
           )

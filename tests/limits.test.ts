@@ -7,7 +7,7 @@ import { defineQueue, Activities, Activity, Workflow } from '../src'
 import type { WorkflowContext, ActivityContext } from '../src'
 import { Journal } from '../src/internal/journal'
 import { Permits } from '../src/internal/permits'
-import { testApp } from './helpers'
+import { eventually, testApp } from './helpers'
 
 @Activities()
 class Keyed {
@@ -50,6 +50,53 @@ class Batches {
   }
 }
 
+const adversarialItems = [
+  { id: 'A1', key: 'A' },
+  { id: 'A2', key: 'A' },
+  { id: 'A3', key: 'A' },
+  { id: 'A4', key: 'A' },
+  { id: 'B1', key: 'B' },
+  { id: 'B2', key: 'B' }
+] as const
+
+@Activities()
+class FairnessKeyed {
+  readonly started: string[] = []
+  readonly finished: string[] = []
+
+  @Activity({
+    name: 'limits.fairness',
+    version: 1,
+    queue: defineQueue('work'),
+    input: z.object({ key: z.string(), id: z.string() }),
+    output: z.string(),
+    key: (input) => input.key
+  })
+  async run(input: { key: string; id: string }) {
+    this.started.push(input.id)
+    await new Promise((resolve) => setTimeout(resolve, input.id === 'A1' ? 500 : 20))
+    this.finished.push(input.id)
+    return input.id
+  }
+}
+
+@Workflow({
+  name: 'limits.fairness-batch',
+  version: 1,
+  input: z.string(),
+  output: z.array(z.string())
+})
+class FairnessBatch {
+  run(_input: string, ctx: WorkflowContext) {
+    return ctx.map(
+      'many',
+      adversarialItems,
+      { key: (item) => item.id, concurrency: 6 },
+      (item, branch) => branch.activities(FairnessKeyed).run(item, { stepId: 'work' })
+    )
+  }
+}
+
 test('queue global and per-key permits enforce shared limits independently of local and branch slots', async () => {
   const app = await testApp(Batches, {
     providers: [Keyed],
@@ -64,6 +111,26 @@ test('queue global and per-key permits enforce shared limits independently of lo
     expect(handler.peak).toBe(2)
     expect([...handler.peaksByKey.values()]).toEqual([1, 1, 1])
     expect(handler.seen.length).toBe(8)
+  } finally {
+    await app.close()
+  }
+}, 12000)
+
+test('blocked keyed deliveries yield the queue to a later key', async () => {
+  const app = await testApp(FairnessBatch, {
+    providers: [FairnessKeyed],
+    queues: [{ queue: defineQueue('work'), concurrency: 4, perKeyConcurrency: 1 }]
+  })
+  try {
+    const handle = await app.client.start('adversarial')
+    const handler = app.module.get(FairnessKeyed)
+    await eventually(
+      async () => handler.started.includes('A1') && handler.started.includes('B1'),
+      (started) => started,
+      2000
+    )
+    expect(handler.finished).not.toContain('A1')
+    expect(await handle.result({ timeout: '8s' })).toEqual(adversarialItems.map((item) => item.id))
   } finally {
     await app.close()
   }
