@@ -617,24 +617,37 @@ export class Journal {
   ) {
     const self = this
     return self.sql.withTransaction(
-      Effect.gen(function* () {
-        yield* self.lockRun(executionId)
-        const now = yield* self.databaseNow()
-        yield* self.sql`INSERT INTO better_workflows_claims
-        (execution_id, step_id, attempt, delivery_attempt, owner_token, lease_until, state)
-        VALUES (${executionId}, ${stepId}, ${attempt}, ${delivery}, ${owner}, ${now + lease}, 'running')
-        ON CONFLICT DO NOTHING`
-        yield* self.sql`UPDATE better_workflows_claims SET delivery_attempt = ${delivery}, owner_token = ${owner}, lease_until = ${now + lease}
-        WHERE execution_id = ${executionId} AND step_id = ${stepId} AND attempt = ${attempt}
-        AND state = 'running' AND delivery_attempt < ${delivery}`
-        const [claim] = yield* self.sql<ClaimRow>`SELECT * FROM better_workflows_claims
-        WHERE execution_id = ${executionId} AND step_id = ${stepId} AND attempt = ${attempt}`
-        if (claim?.owner_token === owner && claim.state === 'running') {
-          yield* self.event(executionId, 'activity.started', { attempt, delivery }, stepId)
-        }
-        return claim!
-      })
+      self.claimInTransaction(executionId, stepId, attempt, delivery, owner, lease)
     )
+  }
+
+  /** Claim an activity while the caller owns the surrounding transaction. */
+  claimInTransaction(
+    executionId: string,
+    stepId: string,
+    attempt: number,
+    delivery: number,
+    owner: string,
+    lease: number
+  ) {
+    const self = this
+    return Effect.gen(function* () {
+      yield* self.lockRun(executionId)
+      const now = yield* self.databaseNow()
+      yield* self.sql`INSERT INTO better_workflows_claims
+      (execution_id, step_id, attempt, delivery_attempt, owner_token, lease_until, state)
+      VALUES (${executionId}, ${stepId}, ${attempt}, ${delivery}, ${owner}, ${now + lease}, 'running')
+      ON CONFLICT DO NOTHING`
+      yield* self.sql`UPDATE better_workflows_claims SET delivery_attempt = ${delivery}, owner_token = ${owner}, lease_until = ${now + lease}
+      WHERE execution_id = ${executionId} AND step_id = ${stepId} AND attempt = ${attempt}
+      AND state = 'running' AND delivery_attempt < ${delivery}`
+      const [claim] = yield* self.sql<ClaimRow>`SELECT * FROM better_workflows_claims
+      WHERE execution_id = ${executionId} AND step_id = ${stepId} AND attempt = ${attempt}`
+      if (claim?.owner_token === owner && claim.state === 'running') {
+        yield* self.event(executionId, 'activity.started', { attempt, delivery }, stepId)
+      }
+      return claim!
+    })
   }
 
   renewClaim(claim: ClaimRow, lease: number) {

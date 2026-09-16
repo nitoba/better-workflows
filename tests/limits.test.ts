@@ -189,3 +189,38 @@ test('SQL admission is atomic, releases on completion, rejects drift and fences 
     await runtime.dispose()
   }
 })
+
+test('unlimited queues use only the activity claim receipt', async () => {
+  const runtime = ManagedRuntime.make(SqliteClient.layer({ filename: ':memory:' }))
+  try {
+    const sql = await runtime.runPromise(SqlClient.SqlClient)
+    const journal = new Journal(sql, 'unlimited')
+    const permits = new Permits(journal)
+    await runtime.runPromise(journal.migrate())
+    await runtime.runPromise(permits.register('q', { concurrency: 8 }))
+    await runtime.runPromise(journal.accept('run', 'wf', 1, 'run', '"input"'))
+    await runtime.runPromise(sql`CREATE TRIGGER reject_limit_updates BEFORE UPDATE ON better_workflows_limits
+      BEGIN SELECT RAISE(ABORT, 'queue row lock used'); END`)
+    await runtime.runPromise(sql`DROP TABLE better_workflows_permits`)
+
+    const claim = await runtime.runPromise(
+      permits.claim(
+        'q',
+        {
+          executionId: 'run',
+          stepId: 'step',
+          attempt: 1
+        },
+        1,
+        'owner',
+        1000
+      )
+    )
+    if (claim === 'blocked' || claim === 'closed' || claim === 'stale') throw new Error(claim)
+    expect(await runtime.runPromise(permits.renew(claim, 1000))).toBe(true)
+    expect(await runtime.runPromise(permits.finish(claim, '"done"', null))).toBe(true)
+    await runtime.runPromise(permits.release(claim))
+  } finally {
+    await runtime.dispose()
+  }
+})
