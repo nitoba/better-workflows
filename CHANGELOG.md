@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.0-alpha.4
+
+- Added queue admission fast paths for queues without distributed limits and per-key-only admission without a global queue-row lock.
+
 ## 0.1.0-alpha.3
 
 Breaking registration refactor: replace array-only `forFeature` and string/dictionary queues with domain-owned object registrations and `defineQueue` references. No compatibility overloads.

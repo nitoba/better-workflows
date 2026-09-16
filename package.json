@@ -1,6 +1,6 @@
 {
   "name": "better-workflows",
-  "version": "0.1.0-alpha.3",
+  "version": "0.1.0-alpha.4",
   "description": "Durable workflows, activities, signals and timers with NestJS-native decorators and dependency injection.",
   "keywords": [
     "better-workflows",

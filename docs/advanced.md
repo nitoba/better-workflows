@@ -1,6 +1,6 @@
 # Advanced workflows and operations
 
-Examples use the real alpha.3 API. Workflows and activities are normal Nest providers. Keep I/O in activities and retain old handler versions while executions need replay. All persisted results and branch values must be plain JSON (or a root void result).
+Examples use the real alpha.4 API. Workflows and activities are normal Nest providers. Keep I/O in activities and retain old handler versions while executions need replay. All persisted results and branch values must be plain JSON (or a root void result).
 
 ## Durable map and parallel branches
 
