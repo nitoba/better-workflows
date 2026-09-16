@@ -11,6 +11,8 @@ export interface Dispatcher<R> {
   <A>(operation: Effect.Effect<A, Failure, R>): Promise<A>
 }
 
+export type SuspendRound = () => Promise<never>
+
 /**
  * Interpret durable commands on the SAME Effect fiber as the workflow. A
  * DurableDeferred suspension interrupts that fiber, not a JavaScript Promise.
@@ -18,7 +20,7 @@ export interface Dispatcher<R> {
  * Commands submitted together are processed in submission order.
  */
 export function interpretAsync<A, R>(
-  execute: (dispatch: Dispatcher<R>) => Promise<A>
+  execute: (dispatch: Dispatcher<R>, suspend: SuspendRound) => Promise<A>
 ): Effect.Effect<A, Failure, R> {
   return Effect.suspend(() => {
     const abort = new AbortController()
@@ -59,11 +61,15 @@ export function interpretAsync<A, R>(
         wake()
       })
     }
+    const suspend: SuspendRound = () => {
+      if (!control?.active) return new Promise<never>(() => {})
+      return control.park<never>()
+    }
 
     const program = Effect.gen(function* () {
       void runAsyncRound((round) => {
         control = round
-        return currentInterpreter.run(identity, () => execute(dispatch))
+        return currentInterpreter.run(identity, () => execute(dispatch, suspend))
       }, abort.signal).then((result) => {
         outcome = result
         wake()

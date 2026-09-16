@@ -1,7 +1,7 @@
 import { Effect } from 'effect'
 import type { SqlClient } from 'effect/unstable/sql/SqlClient'
 
-export const JOURNAL_VERSION = 4
+export const JOURNAL_VERSION = 5
 export const ENGINE_VERSION = '4.0.0-rc.115'
 
 /** All DDL is transactional on the supported PostgreSQL and SQLite adapters. */
@@ -87,6 +87,31 @@ export function migrateAdvanced(sql: SqlClient) {
     )`
     yield* sql`CREATE INDEX IF NOT EXISTS better_workflows_reconciliation_outbox
       ON better_workflows_reconciliations(namespace, delivered, execution_id)`
-    yield* sql`INSERT INTO better_workflows_schema(version) VALUES (4)`
+    yield* sql`INSERT INTO better_workflows_schema(version) VALUES (4) ON CONFLICT DO NOTHING`
+    if (!versions.some((row) => row.version === 5)) {
+      const columns = yield* sql.onDialectOrElse({
+        pg: () =>
+          sql<{ name: string }>`SELECT column_name AS name FROM information_schema.columns
+            WHERE table_schema=current_schema() AND table_name='better_workflows_runs'`,
+        orElse: () => sql<{ name: string }>`PRAGMA table_info(better_workflows_runs)`
+      })
+      const existing = new Set(columns.map((column) => column.name))
+      if (!existing.has('chain_id'))
+        yield* sql`ALTER TABLE better_workflows_runs ADD COLUMN chain_id TEXT`
+      if (!existing.has('generation'))
+        yield* sql`ALTER TABLE better_workflows_runs ADD COLUMN generation INTEGER NOT NULL DEFAULT 0`
+      if (!existing.has('continued_from'))
+        yield* sql`ALTER TABLE better_workflows_runs ADD COLUMN continued_from TEXT`
+      if (!existing.has('continued_to'))
+        yield* sql`ALTER TABLE better_workflows_runs ADD COLUMN continued_to TEXT`
+      yield* sql`UPDATE better_workflows_runs SET chain_id = execution_id WHERE chain_id IS NULL`
+      yield* sql`CREATE UNIQUE INDEX IF NOT EXISTS better_workflows_chain_generation
+        ON better_workflows_runs(namespace, chain_id, generation)`
+      yield* sql`CREATE UNIQUE INDEX IF NOT EXISTS better_workflows_continued_to
+        ON better_workflows_runs(namespace, continued_to) WHERE continued_to IS NOT NULL`
+      yield* sql`CREATE INDEX IF NOT EXISTS better_workflows_chain
+        ON better_workflows_runs(namespace, chain_id, generation)`
+      yield* sql`INSERT INTO better_workflows_schema(version) VALUES (5)`
+    }
   })
 }

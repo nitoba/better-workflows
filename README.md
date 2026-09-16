@@ -219,6 +219,8 @@ Retrieve a handle later with `client.getHandle(executionId)`. `result({ timeout,
 
 `pause()` prevents advancement at durable command boundaries. Already running activities may finish. `resume()` releases a pause; it does not reset failed executions. `cancel({ reason })` requests durable cooperative cancellation and aborts running activities through their `AbortSignal`. Cancellation is not rollback. `app.close()` or process restart does not imply cancellation. Enable Nest shutdown hooks for signal-driven graceful shutdown.
 
+Long-lived workflows can bound their history with `await ctx.continueAsNew(nextInput)`. The current execution becomes `continued` and a new generation starts with the same contract and version; the input is validated again before the transition is committed. This control is available only on the root context, and `handle.result()` follows the continuation chain automatically while `describe()` remains specific to the execution being inspected.
+
 ## Retries and idempotency
 
 ```ts

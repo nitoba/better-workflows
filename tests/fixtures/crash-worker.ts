@@ -54,6 +54,8 @@ class Files {
 })
 class CrashWorkflow {
   async run(input: string, ctx: WorkflowContext): Promise<string> {
+    if (scenario === 'continue' && input === 'continue-start')
+      return ctx.continueAsNew('continue-final')
     const result = await ctx.activities(Files).write(input, { stepId: 'write' })
     if (scenario === 'signal') await ctx.waitForSignal('approval', Approval)
     if (scenario === 'timer') await ctx.sleep('timer', '2s')
@@ -67,7 +69,7 @@ class CrashWorkflow {
       namespace: 'crash-tests',
       storage: sqlite({ filename }),
       queues: [{ queue: defineQueue('work'), concurrency: 1 }],
-      pollInterval: '20ms',
+      pollInterval: scenario === 'continue' ? '5s' : '20ms',
       lease: { duration: '600ms', refreshInterval: '150ms' }
     }),
     WorkflowsModule.forFeature({ name: 'crash', workflows: [CrashWorkflow], activities: [Files] })
@@ -78,7 +80,8 @@ class AppModule {}
 try {
   const app = await NestFactory.createApplicationContext(AppModule, { logger: false })
   const client = app.get<WorkflowClient<typeof CrashWorkflow>>(getWorkflowToken(CrashWorkflow))
-  const handle = await client.start('crash-id')
+  const initialInput = scenario === 'continue' ? 'continue-start' : 'crash-id'
+  const handle = await client.start(initialInput)
   if (mode === 'recover') {
     if (scenario === 'signal')
       await handle.signal(Approval, true, { idempotencyKey: 'approval-event' })
@@ -96,11 +99,13 @@ try {
       const snapshot = await handle.describe()
       const history = await handle.history()
       const ready =
-        scenario === 'signal'
-          ? snapshot.waitingOn?.stepId === 'approval'
-          : scenario === 'timer'
-            ? snapshot.waitingOn?.stepId === 'timer'
-            : history.events.some((event) => event.type === 'activity.failed')
+        scenario === 'continue'
+          ? snapshot.status === 'continued'
+          : scenario === 'signal'
+            ? snapshot.waitingOn?.stepId === 'approval'
+            : scenario === 'timer'
+              ? snapshot.waitingOn?.stepId === 'timer'
+              : history.events.some((event) => event.type === 'activity.failed')
       if (ready) break
       await new Promise((resolve) => setTimeout(resolve, 10))
     }

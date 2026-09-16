@@ -64,7 +64,7 @@ export interface MigrationStatus {
  */
 export interface RetentionOptions {
   /**
-   * UTC ISO timestamp; only terminal runs last updated strictly before it are scanned.
+   * UTC ISO timestamp; only terminal executions (including continued generations) last updated strictly before it are scanned.
    * Future or invalid cutoffs are rejected.
    */
   readonly before: string
@@ -75,7 +75,7 @@ export interface RetentionOptions {
   readonly limit?: number
 }
 /**
- * Terminal execution eligible at preview time; revalidated during prune.
+ * Terminal execution eligible at preview time; continuation chains are selected as a unit and revalidated during prune.
  */
 export interface RetentionCandidate {
   /**

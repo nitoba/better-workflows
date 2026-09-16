@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.0-alpha.6 (in progress)
+
+- Added `WorkflowContext.continueAsNew()` with atomic continuation chains, `continued` execution snapshots, chain-aware results and retention.
+- Added forward-only journal migration v5 and crash-recovery coverage for continuation dispatch.
+
 ## 0.1.0-alpha.5
 
 - Optional contract-first workflow declarations with `@WorkflowContract` and `@Workflow(contract)` handlers.

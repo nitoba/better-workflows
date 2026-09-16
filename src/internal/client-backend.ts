@@ -18,7 +18,19 @@ export interface ClientBackend {
   row(
     workflow: WorkflowContractClass,
     id: string
-  ): Promise<{ readonly result_json: string | null; readonly version: number }>
+  ): Promise<{
+    readonly result_json: string | null
+    readonly version: number
+    readonly state:
+      | 'accepted'
+      | 'running'
+      | 'waiting'
+      | 'continued'
+      | 'completed'
+      | 'failed'
+      | 'cancelled'
+    readonly continued_to: string | null
+  }>
   history(
     workflow: WorkflowContractClass,
     id: string,

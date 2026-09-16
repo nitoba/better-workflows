@@ -65,7 +65,7 @@ export class WorkflowInterpreter {
       let ordinal = 0
       const used = new Set<string>()
       const scope = path.length ? JSON.stringify(path) : ''
-      const result = yield* interpretAsync<A, WorkflowServices>(async (dispatch) => {
+      const result = yield* interpretAsync<A, WorkflowServices>(async (dispatch, suspend) => {
         const command = <T>(
           step: string,
           kind: string,
@@ -170,6 +170,45 @@ export class WorkflowInterpreter {
         }
         const context: WorkflowContext = {
           executionId: self.executionId,
+          // oxlint-disable-next-line anti-slop/no-unknown-parameters -- The workflow contract schema validates the continuation input below.
+          continueAsNew(input: unknown): Promise<never> {
+            if (path.length > 0)
+              throw new WorkflowError(
+                'CONTINUE_AS_NEW_NOT_ROOT',
+                'continueAsNew is only available on the root workflow context'
+              )
+            const encoded = encode(input)
+            return dispatch(
+              Effect.gen(function* () {
+                yield* self.gate()
+                const current = yield* durable(self.journal.get(self.executionId))
+                const key = createHash('sha256')
+                  .update(
+                    JSON.stringify([
+                      'continue-as-new',
+                      self.executionId,
+                      current.generation,
+                      'root'
+                    ])
+                  )
+                  .digest('hex')
+                yield* promised(() =>
+                  validate(
+                    self.workflow.options.input,
+                    decode(encoded),
+                    `${self.workflow.options.name} input`
+                  )
+                )
+                const nextExecutionId = yield* self.workflow.definition.executionId({
+                  key,
+                  input: encoded
+                })
+                yield* durable(
+                  self.journal.continueAsNew(self.executionId, nextExecutionId, key, encoded)
+                )
+              })
+            ).then(() => suspend())
+          },
           activities<T>(provider: Type<T>): ActivityClient<T> {
             const entries = self.registry.activitiesFor(self.workflow, provider).map((activity) => [
               activity.method,
@@ -473,6 +512,15 @@ export class WorkflowInterpreter {
             let ordinal = 0
             const saga: SagaContext = {
               ...context,
+              // A saga context is not the root workflow context, even when the
+              // saga itself was opened from the root interpreter.
+              // oxlint-disable-next-line anti-slop/no-unknown-parameters -- The public context contract uses unknown for continuation input.
+              continueAsNew(_input: unknown): Promise<never> {
+                throw new WorkflowError(
+                  'CONTINUE_AS_NEW_NOT_ROOT',
+                  'continueAsNew is only available on the root workflow context'
+                )
+              },
               step<T>(
                 step: string,
                 run: (ctx: WorkflowContext) => Promise<T>,
@@ -532,7 +580,11 @@ export class WorkflowInterpreter {
         : Result.isFailure(forward)
           ? forward.failure
           : failure('SAGA_FAILED', 'Saga failed')
-      if (original.code === 'NON_DETERMINISTIC_WORKFLOW') return yield* Effect.fail(original)
+      if (
+        original.code === 'NON_DETERMINISTIC_WORKFLOW' ||
+        original.code === 'CONTINUE_AS_NEW_NOT_ROOT'
+      )
+        return yield* Effect.fail(original)
       yield* durable(self.advanced.sagaState(self.executionId, id, 'compensating', null, original))
       const compensations = yield* durable(self.advanced.compensations(self.executionId, id))
       for (const row of compensations) {
@@ -548,7 +600,11 @@ export class WorkflowInterpreter {
             [...path, ['compensate', row.step_id]]
           )
         )
-        if (Result.isFailure(result) && result.failure.code === 'NON_DETERMINISTIC_WORKFLOW')
+        if (
+          Result.isFailure(result) &&
+          (result.failure.code === 'NON_DETERMINISTIC_WORKFLOW' ||
+            result.failure.code === 'CONTINUE_AS_NEW_NOT_ROOT')
+        )
           return yield* Effect.fail(result.failure)
         yield* durable(
           self.advanced.finishCompensation(

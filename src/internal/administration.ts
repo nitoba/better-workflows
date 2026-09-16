@@ -7,7 +7,8 @@ import type { Journal, RunRow } from './journal'
 import { encode, identifier, positiveInteger } from './values'
 import { workflowDefinition } from './wire'
 
-const terminal = (run: RunRow) => ['completed', 'failed', 'cancelled'].includes(run.state)
+const terminal = (run: RunRow) =>
+  ['continued', 'completed', 'failed', 'cancelled'].includes(run.state)
 const fail = (code: string, message: string) =>
   Effect.fail<Failure>({ code, message, retryable: false })
 const hash = (value: string) => createHash('sha256').update(value).digest('hex')
@@ -45,10 +46,14 @@ export class SqlAdministration {
     return Effect.gen(function* () {
       if (!terminal(run)) return 'execution-active'
       const now = yield* self.journal.databaseNow()
-      const linked = yield* sql`SELECT c.child_id FROM better_workflows_children c
-        JOIN better_workflows_runs other ON other.execution_id = CASE WHEN c.parent_id=${run.execution_id} THEN c.child_id ELSE c.parent_id END
-        WHERE (c.parent_id=${run.execution_id} OR c.child_id=${run.execution_id}) AND other.state NOT IN ('completed','failed','cancelled') LIMIT 1`
-      if (linked.length) return 'active-parent-or-child'
+      const linked = yield* sql<{ execution_id: string }>`SELECT CASE
+          WHEN c.parent_id=${run.execution_id} THEN c.child_id ELSE c.parent_id END AS execution_id
+        FROM better_workflows_children c
+        WHERE c.parent_id=${run.execution_id} OR c.child_id=${run.execution_id}`
+      for (const relation of linked) {
+        const owner = yield* self.journal.followContinuation(relation.execution_id)
+        if (!terminal(owner)) return 'active-parent-or-child'
+      }
       const claims =
         yield* sql`SELECT owner_token FROM better_workflows_claims WHERE execution_id=${run.execution_id} AND state='running' AND lease_until>${now} LIMIT 1`
       if (claims.length) return 'live-activity-claim'
@@ -62,10 +67,12 @@ export class SqlAdministration {
           WHERE execution_id=${run.execution_id} AND namespace=${self.journal.namespace} AND delivered=0 LIMIT 1`
       if (reconciliation.length) return 'pending-reconciliation'
       const entity = `Workflow/${workflowDefinition(self.journal.namespace, run.workflow_name, run.version)._tag}`
-      const messages =
-        yield* sql`SELECT id FROM cluster_messages WHERE entity_id=${run.execution_id}
-        AND entity_type IN (${entity}, 'Workflow/-/DurableClock') AND processed=FALSE LIMIT 1`
-      if (messages.length) return 'unprocessed-engine-message'
+      if (run.state !== 'continued') {
+        const messages =
+          yield* sql`SELECT id FROM cluster_messages WHERE entity_id=${run.execution_id}
+          AND entity_type IN (${entity}, 'Workflow/-/DurableClock') AND processed=FALSE LIMIT 1`
+        if (messages.length) return 'unprocessed-engine-message'
+      }
       return null
     })
   }
@@ -86,13 +93,49 @@ export class SqlAdministration {
         return yield* fail('INVALID_RETENTION', 'Retention cutoff cannot be in the future')
       const runs = yield* self.journal
         .sql<RunRow>`SELECT * FROM better_workflows_runs WHERE namespace=${self.journal.namespace}
-        AND state IN ('completed','failed','cancelled') AND updated_at<${before} ORDER BY execution_id LIMIT ${limit}`
+        AND state IN ('continued','completed','failed','cancelled') AND updated_at<${before} ORDER BY execution_id LIMIT ${limit}`
       const candidates: RetentionPlan['candidates'][number][] = []
       const blocked: RetentionPlan['blocked'][number][] = []
+      const seenChains = new Set<string>()
       for (const run of runs) {
-        const reason = yield* self.reason(run)
-        if (reason) blocked.push({ executionId: run.execution_id, reason })
-        else candidates.push({ executionId: run.execution_id, updatedAt: run.updated_at })
+        if (seenChains.has(run.chain_id)) continue
+        seenChains.add(run.chain_id)
+        const chain = yield* self.journal.sql<RunRow>`SELECT * FROM better_workflows_runs
+          WHERE namespace=${self.journal.namespace} AND chain_id=${run.chain_id} ORDER BY generation, execution_id`
+        const byId = new Map(chain.map((member) => [member.execution_id, member]))
+        const broken =
+          chain.some((member, index) =>
+            index === 0
+              ? member.continued_from !== null
+              : member.continued_from !== chain[index - 1]!.execution_id
+          ) ||
+          chain.some(
+            (member) =>
+              member.state === 'continued' &&
+              (!member.continued_to || !byId.has(member.continued_to))
+          )
+        const chainReason = broken
+          ? 'broken-continuation-chain'
+          : chain.some((member) => !terminal(member))
+            ? 'continuation-chain-active'
+            : chain.some((member) => member.updated_at >= before)
+              ? 'continuation-chain-not-expired'
+              : null
+        if (chainReason) {
+          blocked.push({ executionId: run.execution_id, reason: chainReason })
+          continue
+        }
+        const chainCandidates: RetentionPlan['candidates'][number][] = []
+        for (const member of chain) {
+          const reason = yield* self.reason(member)
+          if (reason) {
+            blocked.push({ executionId: member.execution_id, reason })
+            chainCandidates.length = 0
+            break
+          }
+          chainCandidates.push({ executionId: member.execution_id, updatedAt: member.updated_at })
+        }
+        candidates.push(...chainCandidates)
       }
       const plan = {
         namespace: self.journal.namespace,
@@ -162,6 +205,43 @@ export class SqlAdministration {
             return yield* fail('RETENTION_PLAN_STALE', `Execution ${run.execution_id}: ${reason}`)
           selected.push(locked)
         }
+        const selectedIds = new Set(selected.map((run) => run.execution_id))
+        for (const run of selected) {
+          const chain = yield* sql<{
+            execution_id: string
+          }>`SELECT execution_id FROM better_workflows_runs
+            WHERE namespace=${self.journal.namespace} AND chain_id=${run.chain_id}`
+          if (chain.some((member) => !selectedIds.has(member.execution_id)))
+            return yield* fail(
+              'RETENTION_PLAN_STALE',
+              `Continuation chain for ${run.execution_id} was not selected as a unit`
+            )
+          const chainRows = yield* sql<
+            Pick<
+              RunRow,
+              'execution_id' | 'generation' | 'state' | 'continued_from' | 'continued_to'
+            >
+          >`SELECT execution_id, generation, state, continued_from, continued_to
+            FROM better_workflows_runs WHERE namespace=${self.journal.namespace} AND chain_id=${run.chain_id}
+            ORDER BY generation, execution_id`
+          const chainIds = new Set(chainRows.map((member) => member.execution_id))
+          const broken =
+            chainRows.some((member, index) =>
+              index === 0
+                ? member.continued_from !== null
+                : member.continued_from !== chainRows[index - 1]!.execution_id
+            ) ||
+            chainRows.some(
+              (member) =>
+                member.state === 'continued' &&
+                (!member.continued_to || !chainIds.has(member.continued_to))
+            )
+          if (broken)
+            return yield* fail(
+              'RETENTION_PLAN_STALE',
+              `Continuation chain for ${run.execution_id} is inconsistent`
+            )
+        }
         for (const run of selected) {
           const entity = `Workflow/${workflowDefinition(self.journal.namespace, run.workflow_name, run.version)._tag}`
           yield* sql`INSERT INTO better_workflows_tombstones(execution_id,namespace,workflow_name,version,dedupe_key,input_hash,state,pruned_at)
@@ -199,7 +279,7 @@ export class SqlAdministration {
       Effect.gen(function* () {
         yield* sql`UPDATE better_workflows_limits SET queue_name=queue_name WHERE namespace=${namespace} AND queue_name=${queue}`
         const active =
-          yield* sql`SELECT execution_id FROM better_workflows_runs WHERE namespace=${namespace} AND state NOT IN ('completed','failed','cancelled') LIMIT 1`
+          yield* sql`SELECT execution_id FROM better_workflows_runs WHERE namespace=${namespace} AND state NOT IN ('continued','completed','failed','cancelled') LIMIT 1`
         if (active.length)
           return yield* fail(
             'NAMESPACE_NOT_DRAINED',

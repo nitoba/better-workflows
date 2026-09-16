@@ -16,7 +16,14 @@ export interface RunRow {
   readonly input_json: string
   readonly created_at: number
   readonly updated_at: number
-  readonly state: 'accepted' | 'running' | 'waiting' | 'completed' | 'failed' | 'cancelled'
+  readonly state:
+    | 'accepted'
+    | 'running'
+    | 'waiting'
+    | 'continued'
+    | 'completed'
+    | 'failed'
+    | 'cancelled'
   readonly control: 'run' | 'pause' | 'cancel'
   readonly control_revision: number
   readonly applied_revision: number
@@ -25,6 +32,10 @@ export interface RunRow {
   readonly wait_step: string | null
   readonly result_json: string | null
   readonly failure_json: string | null
+  readonly chain_id: string
+  readonly generation: number
+  readonly continued_from: string | null
+  readonly continued_to: string | null
 }
 
 export interface CommandRow {
@@ -114,7 +125,7 @@ export class Journal {
         const versions = yield* sql<{
           version: number
         }>`SELECT version FROM better_workflows_schema`
-        if (versions.some((row) => row.version > 4)) {
+        if (versions.some((row) => row.version > 5)) {
           return yield* fail(
             'SCHEMA_TOO_NEW',
             'This database was migrated by a newer better-workflows version'
@@ -271,6 +282,42 @@ export class Journal {
     })
   }
 
+  /** Resolve a child continuation chain without treating an active generation as terminal. */
+  followContinuation(executionId: string) {
+    const self = this
+    return Effect.gen(function* () {
+      const seen = new Set<string>()
+      let row = yield* self.get(executionId)
+      while (true) {
+        if (seen.has(row.execution_id))
+          return yield* fail(
+            'STORAGE_INTEGRITY',
+            `Continuation chain contains a cycle at execution ${row.execution_id}`
+          )
+        seen.add(row.execution_id)
+        if (row.state !== 'continued') return row
+        if (!row.continued_to)
+          return yield* fail(
+            'STORAGE_INTEGRITY',
+            `Execution ${row.execution_id} is continued without a next generation`
+          )
+        const next = yield* self.get(row.continued_to)
+        if (
+          next.workflow_name !== row.workflow_name ||
+          next.version !== row.version ||
+          next.chain_id !== row.chain_id ||
+          next.generation !== row.generation + 1 ||
+          next.continued_from !== row.execution_id
+        )
+          return yield* fail(
+            'STORAGE_INTEGRITY',
+            `Continuation ${next.execution_id} does not match execution ${row.execution_id}`
+          )
+        row = next
+      }
+    })
+  }
+
   accept(executionId: string, name: string, version: number, key: string, input: string) {
     const self = this
     return self.sql.withTransaction(
@@ -288,8 +335,8 @@ export class Journal {
           )
         const now = yield* self.now()
         const rows = yield* self.sql<RunRow>`INSERT INTO better_workflows_runs
-        (execution_id, namespace, workflow_name, version, dedupe_key, input_json, created_at, updated_at)
-        VALUES (${executionId}, ${self.namespace}, ${name}, ${version}, ${key}, ${input}, ${now}, ${now})
+        (execution_id, namespace, workflow_name, version, dedupe_key, input_json, created_at, updated_at, chain_id, generation)
+        VALUES (${executionId}, ${self.namespace}, ${name}, ${version}, ${key}, ${input}, ${now}, ${now}, ${executionId}, 0)
         ON CONFLICT(namespace, workflow_name, dedupe_key) DO NOTHING RETURNING *`
         const created = rows.length > 0
         const [existing] = created
@@ -310,15 +357,121 @@ export class Journal {
     )
   }
 
+  /**
+   * Atomically replace one execution with the next generation of its chain.
+   * The caller supplies the engine-derived next ID, while the journal owns the
+   * state transition and all replay/idempotency checks.
+   */
+  continueAsNew(executionId: string, nextExecutionId: string, key: string, input: string) {
+    const self = this
+    return self.sql.withTransaction(
+      Effect.gen(function* () {
+        yield* self.lockRun(executionId)
+        const current = yield* self.get(executionId)
+        const nextGeneration = current.generation + 1
+        const expectedChain = current.chain_id
+        if (current.state === 'continued') {
+          if (current.continued_to !== nextExecutionId)
+            return yield* fail(
+              'STORAGE_INTEGRITY',
+              `Execution ${executionId} already continued to a different generation`
+            )
+          const [next] = yield* self.sql<RunRow>`SELECT * FROM better_workflows_runs
+            WHERE execution_id = ${nextExecutionId} AND namespace = ${self.namespace}`
+          if (
+            !next ||
+            next.chain_id !== expectedChain ||
+            next.generation !== nextGeneration ||
+            next.continued_from !== executionId ||
+            next.workflow_name !== current.workflow_name ||
+            next.version !== current.version ||
+            next.dedupe_key !== key ||
+            next.input_json !== input
+          )
+            return yield* fail(
+              'STORAGE_INTEGRITY',
+              `Continuation ${nextExecutionId} is missing or does not match execution ${executionId}`
+            )
+          return next
+        }
+        if (['completed', 'failed', 'cancelled'].includes(current.state))
+          return yield* fail(
+            'TERMINAL_EXECUTION',
+            `Cannot continue terminal execution ${executionId}`
+          )
+        if (current.control !== 'run')
+          return yield* fail(
+            'CONTROL_CONFLICT',
+            `Execution ${executionId} has an outstanding ${current.control} control request`
+          )
+        if (nextExecutionId === executionId)
+          return yield* fail(
+            'STORAGE_INTEGRITY',
+            'A continuation cannot reuse its current execution ID'
+          )
+
+        const [existing] = yield* self.sql<RunRow>`SELECT * FROM better_workflows_runs
+          WHERE namespace = ${self.namespace} AND chain_id = ${expectedChain} AND generation = ${nextGeneration}`
+        if (existing) {
+          if (
+            existing.execution_id !== nextExecutionId ||
+            existing.workflow_name !== current.workflow_name ||
+            existing.version !== current.version ||
+            existing.dedupe_key !== key ||
+            existing.input_json !== input ||
+            existing.continued_from !== executionId
+          )
+            return yield* fail(
+              'STORAGE_INTEGRITY',
+              `Continuation generation ${nextGeneration} conflicts with execution ${executionId}`
+            )
+          return yield* fail(
+            'STORAGE_INTEGRITY',
+            `Continuation ${nextExecutionId} exists before its source transition committed`
+          )
+        }
+
+        const now = yield* self.now()
+        yield* self.sql`INSERT INTO better_workflows_runs
+          (execution_id, namespace, workflow_name, version, dedupe_key, input_json,
+           created_at, updated_at, state, chain_id, generation, continued_from)
+          VALUES (${nextExecutionId}, ${self.namespace}, ${current.workflow_name}, ${current.version},
+            ${key}, ${input}, ${now}, ${now}, 'accepted', ${expectedChain}, ${nextGeneration}, ${executionId})`
+        const updated = yield* self.sql`UPDATE better_workflows_runs
+          SET state = 'continued', wait_type = NULL, wait_step = NULL, continued_to = ${nextExecutionId}
+          WHERE execution_id = ${executionId} AND namespace = ${self.namespace}
+          AND control = 'run'
+          AND state NOT IN ('continued', 'completed', 'failed', 'cancelled')
+          RETURNING execution_id`
+        if (!updated.length)
+          return yield* fail(
+            'STORAGE_CONFLICT',
+            `Execution ${executionId} changed while continuing as new`
+          )
+        yield* self.event(executionId, 'workflow.continued', {
+          fromExecutionId: executionId,
+          toExecutionId: nextExecutionId,
+          generation: nextGeneration
+        })
+        yield* self.event(nextExecutionId, 'workflow.continue-as-new', {
+          fromExecutionId: executionId,
+          toExecutionId: nextExecutionId,
+          generation: nextGeneration
+        })
+        return yield* self.get(nextExecutionId)
+      })
+    )
+  }
+
   pendingDispatch() {
     return this.sql<RunRow>`SELECT * FROM better_workflows_runs WHERE namespace = ${this.namespace}
       AND (dispatched = 0 OR control_revision > applied_revision) AND control <> 'pause'
-      AND state NOT IN ('completed', 'failed', 'cancelled') ORDER BY created_at, execution_id LIMIT 100`
+      AND state NOT IN ('continued', 'completed', 'failed', 'cancelled') ORDER BY created_at, execution_id LIMIT 100`
   }
 
   activeAfter(cursor: string) {
     return this.sql<RunRow>`SELECT * FROM better_workflows_runs WHERE namespace = ${this.namespace}
-      AND dispatched = 1 AND state NOT IN ('completed', 'failed', 'cancelled')
+      AND dispatched = 1 AND state NOT IN ('continued', 'completed', 'failed', 'cancelled')
       AND execution_id > ${cursor} ORDER BY execution_id LIMIT 100`
   }
 
@@ -336,7 +489,7 @@ export class Journal {
         const rows =
           yield* self.sql`UPDATE better_workflows_runs SET control = ${action}, control_revision = control_revision + 1
         WHERE execution_id = ${executionId} AND namespace = ${self.namespace}
-        AND control <> ${action} AND state NOT IN ('completed', 'failed', 'cancelled')
+        AND control <> ${action} AND state NOT IN ('continued', 'completed', 'failed', 'cancelled')
         AND control <> 'cancel' RETURNING execution_id`
         if (rows.length > 0)
           yield* self.event(
@@ -347,7 +500,10 @@ export class Journal {
         const row = yield* self.get(executionId)
         if (
           action === 'run' &&
-          (row.state === 'failed' || row.state === 'cancelled' || row.control === 'cancel')
+          (row.state === 'continued' ||
+            row.state === 'failed' ||
+            row.state === 'cancelled' ||
+            row.control === 'cancel')
         ) {
           return yield* fail(
             'TERMINAL_EXECUTION',
@@ -363,7 +519,7 @@ export class Journal {
     return this
       .sql`UPDATE better_workflows_runs SET state = 'running', wait_type = NULL, wait_step = NULL
       WHERE execution_id = ${executionId} AND namespace = ${this.namespace}
-      AND state NOT IN ('completed', 'failed', 'cancelled')`
+      AND state NOT IN ('continued', 'completed', 'failed', 'cancelled')`
   }
 
   beginCommand(
@@ -392,7 +548,7 @@ export class Journal {
           yield* self.event(executionId, 'command.scheduled', { kind, ordinal, scope }, stepId)
         yield* self.sql`UPDATE better_workflows_runs SET state = 'waiting', wait_type = ${kind}, wait_step = ${stepId}
         WHERE execution_id = ${executionId} AND namespace = ${self.namespace}
-        AND state NOT IN ('completed', 'failed', 'cancelled')`
+        AND state NOT IN ('continued', 'completed', 'failed', 'cancelled')`
       })
     )
   }
@@ -413,7 +569,7 @@ export class Journal {
           )
         yield* self.sql`UPDATE better_workflows_runs SET state = 'running', wait_type = NULL, wait_step = NULL
         WHERE execution_id = ${executionId} AND namespace = ${self.namespace} AND wait_step = ${stepId}
-        AND state NOT IN ('completed', 'failed', 'cancelled')`
+        AND state NOT IN ('continued', 'completed', 'failed', 'cancelled')`
       })
     )
   }
@@ -439,7 +595,7 @@ export class Journal {
         const rows = yield* self.sql`UPDATE better_workflows_runs
         SET state = ${state}, result_json = ${result}, failure_json = ${failure ? encode(failure) : null}, wait_type = NULL, wait_step = NULL
         WHERE execution_id = ${executionId} AND namespace = ${self.namespace}
-        AND state NOT IN ('completed', 'failed', 'cancelled') RETURNING execution_id`
+        AND state NOT IN ('continued', 'completed', 'failed', 'cancelled') RETURNING execution_id`
         if (rows.length)
           yield* self.event(
             executionId,
@@ -502,6 +658,12 @@ export class Journal {
         // The run row serializes signal acceptance, consumption and timeout decisions on both databases.
         yield* self.sql`UPDATE better_workflows_runs SET signal_sequence = signal_sequence
         WHERE execution_id = ${executionId} AND namespace = ${self.namespace}`
+        const run = yield* self.get(executionId)
+        if (run.state === 'continued')
+          return yield* fail(
+            'TERMINAL_EXECUTION',
+            'Cannot send a new signal to a continued execution'
+          )
         const [existing] = yield* self.sql<SignalRow>`SELECT * FROM better_workflows_signals
         WHERE execution_id = ${executionId} AND signal_name = ${signalName} AND event_key = ${key}`
         if (existing) {
@@ -512,8 +674,10 @@ export class Journal {
             )
           return { accepted: false }
         }
-        const run = yield* self.get(executionId)
-        if (run.control === 'cancel' || ['completed', 'failed', 'cancelled'].includes(run.state)) {
+        if (
+          run.control === 'cancel' ||
+          ['continued', 'completed', 'failed', 'cancelled'].includes(run.state)
+        ) {
           return yield* fail(
             'TERMINAL_EXECUTION',
             'Cannot send a new signal to a terminal execution'
@@ -547,7 +711,7 @@ export class Journal {
       return yield* self.sql<WaitRow>`SELECT w.* FROM better_workflows_waits w
         JOIN better_workflows_runs r ON r.execution_id = w.execution_id
         WHERE r.namespace = ${self.namespace} AND w.delivered = 0
-        AND r.control <> 'cancel' AND r.state NOT IN ('completed', 'failed', 'cancelled')
+        AND r.control <> 'cancel' AND r.state NOT IN ('continued', 'completed', 'failed', 'cancelled')
         AND (w.wake_requested = 1 OR (w.deadline IS NOT NULL AND w.deadline <= ${now}))
         ORDER BY w.execution_id, w.step_id LIMIT 100`
     })
@@ -709,7 +873,7 @@ export class Journal {
       return yield* self.sql<RetryRow>`SELECT t.* FROM better_workflows_retries t
         JOIN better_workflows_runs r ON r.execution_id = t.execution_id
         WHERE r.namespace = ${self.namespace} AND t.delivered = 0 AND t.deadline <= ${now}
-        AND r.control <> 'cancel' AND r.state NOT IN ('completed', 'failed', 'cancelled')
+        AND r.control <> 'cancel' AND r.state NOT IN ('continued', 'completed', 'failed', 'cancelled')
         ORDER BY t.deadline, t.execution_id LIMIT 100`
     })
   }

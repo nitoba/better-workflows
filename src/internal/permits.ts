@@ -86,7 +86,10 @@ export class Permits {
 
         yield* self.journal.lockRun(payload.executionId)
         const run = yield* self.journal.get(payload.executionId)
-        if (run.control === 'cancel' || ['completed', 'failed', 'cancelled'].includes(run.state))
+        if (
+          run.control === 'cancel' ||
+          ['continued', 'completed', 'failed', 'cancelled'].includes(run.state)
+        )
           return 'closed' as const
         const [existing] =
           yield* sql<ClaimRow>`SELECT * FROM better_workflows_claims WHERE execution_id = ${payload.executionId} AND step_id = ${payload.stepId} AND attempt = ${payload.attempt}`

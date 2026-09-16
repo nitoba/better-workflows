@@ -1,5 +1,6 @@
 import { expect, test } from 'bun:test'
 import { spawn } from 'node:child_process'
+import { Database } from 'bun:sqlite'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -94,3 +95,56 @@ for (const scenario of ['signal', 'timer', 'retry']) {
     }
   }, 20000)
 }
+
+test('SIGKILL after an atomic continuation commit recovers the pending next generation', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'workflow-continue-crash-'))
+  const first = worker(directory, 'continue', 'wait')
+  let second: ReturnType<typeof worker> | undefined
+  try {
+    const checkpoint = await first.message
+    expect(checkpoint.type).toBe('checkpoint')
+    const firstExit = once(first.child, 'exit')
+    first.child.kill('SIGKILL')
+    expect((await firstExit)[1]).toBe('SIGKILL')
+    second = worker(directory, 'continue', 'recover')
+    const done = await second.message
+    expect(done.type).toBe('complete')
+    expect(done.executionId).toBe(checkpoint.executionId)
+    expect(done.created).toBe(false)
+    expect(done.result).toBe('continue-final')
+
+    const db = new Database(join(directory, 'db.sqlite'))
+    // SAFETY: the query selects exactly the fields represented by this test row shape.
+    const rows = db
+      .query(
+        `SELECT execution_id, state, generation, continued_from, continued_to
+         FROM better_workflows_runs WHERE namespace='crash-tests' ORDER BY generation`
+      )
+      .all() as {
+      execution_id: string
+      state: string
+      generation: number
+      continued_from: string | null
+      continued_to: string | null
+    }[]
+    expect(rows).toHaveLength(2)
+    expect(rows[0]).toMatchObject({
+      execution_id: checkpoint.executionId,
+      state: 'continued',
+      generation: 0,
+      continued_from: null,
+      continued_to: rows[1]!.execution_id
+    })
+    expect(rows[1]).toMatchObject({
+      state: 'completed',
+      generation: 1,
+      continued_from: checkpoint.executionId,
+      continued_to: null
+    })
+    db.close()
+  } finally {
+    first.child.kill('SIGKILL')
+    second?.child.kill('SIGKILL')
+    await rm(directory, { recursive: true, force: true })
+  }
+}, 20000)

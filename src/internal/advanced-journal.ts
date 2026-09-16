@@ -162,8 +162,8 @@ export class AdvancedJournal {
       JOIN better_workflows_runs p ON p.execution_id = c.parent_id
       JOIN better_workflows_runs r ON r.execution_id = c.child_id
       WHERE p.namespace = ${this.journal.namespace} AND c.delivered = 0
-      AND r.state IN ('completed', 'failed', 'cancelled')
-      AND p.control <> 'cancel' AND p.state NOT IN ('completed', 'failed', 'cancelled') ORDER BY c.parent_id, c.step_id LIMIT 100`
+      AND r.state IN ('continued', 'completed', 'failed', 'cancelled')
+      AND p.control <> 'cancel' AND p.state NOT IN ('continued', 'completed', 'failed', 'cancelled') ORDER BY c.parent_id, c.step_id LIMIT 100`
   }
 
   childDelivered(child: ChildRow) {
@@ -179,12 +179,13 @@ export class AdvancedJournal {
           .sql<ChildRow>`SELECT c.* FROM better_workflows_children c
         JOIN better_workflows_runs p ON p.execution_id = c.parent_id
         WHERE p.namespace = ${self.journal.namespace} AND c.close_applied = 0
-        AND (p.control = 'cancel' OR p.state IN ('completed', 'failed', 'cancelled'))
+        AND (p.control = 'cancel' OR p.state IN ('continued', 'completed', 'failed', 'cancelled'))
         ORDER BY c.parent_id, c.step_id LIMIT 100`
         for (const child of children) {
           if (child.close_policy === 'request-cancel') {
+            const owner = yield* self.journal.followContinuation(child.child_id)
             yield* self.journal.control(
-              child.child_id,
+              owner.execution_id,
               'cancel',
               `Parent ${child.parent_id} closed`
             )
@@ -299,7 +300,7 @@ export class AdvancedJournal {
       return yield* self.journal.sql<TimerRow>`SELECT t.* FROM better_workflows_timers t
         JOIN better_workflows_runs r ON r.execution_id = t.execution_id
         WHERE r.namespace = ${self.journal.namespace} AND t.delivered = 0 AND t.deadline <= ${now}
-        AND r.control <> 'cancel' AND r.state NOT IN ('completed', 'failed', 'cancelled')
+        AND r.control <> 'cancel' AND r.state NOT IN ('continued', 'completed', 'failed', 'cancelled')
         ORDER BY t.deadline, t.execution_id, t.step_id LIMIT 100`
     })
   }

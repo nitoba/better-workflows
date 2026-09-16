@@ -371,6 +371,7 @@ export interface ChildExecution {
  * Workflow context with compensatable steps, available only inside WorkflowContext.saga.
  * Use the callback-provided contexts for forward and undo commands; capturing an
  * outer context for nested durable operations is rejected instead of deadlocking.
+ * `continueAsNew` is rejected on this context because it is not the root context.
  */
 export interface SagaContext extends WorkflowContext {
   /**
@@ -667,6 +668,16 @@ export interface WorkflowContext {
    * Stable identifier for this workflow execution; shared by its branch and saga contexts.
    */
   readonly executionId: string
+  /**
+   * Finish this execution and start a clean next generation of the same
+   * workflow contract. Only the root workflow context may invoke this control
+   * operation; it never resolves because the current execution is replaced.
+   * @param input - New input validated by the current workflow contract.
+   * @returns A promise that never resolves when the transition is accepted.
+   * @throws WorkflowError with CONTINUE_AS_NEW_NOT_ROOT from a branch or saga context.
+   */
+  // oxlint-disable-next-line anti-slop/no-unknown-parameters -- The current contract schema validates this public boundary at runtime.
+  continueAsNew(input: unknown): Promise<never>
   /**
    * Create a typed durable-call proxy for an owned or imported activities contract.
    * Calling a proxy method dispatches work to its resolved queue and records its result;
@@ -1073,7 +1084,8 @@ export interface WorkflowsAsyncOptions extends Pick<ModuleMetadata, 'imports'> {
  * Observable lifecycle state, not a worker-delivery or progress-percentage value.
  * accepted: persisted, awaiting dispatch; running: interpreter advancing; waiting:
  * one or more durable commands pending; paused: cooperative pause requested;
- * cancelling: cancellation being reconciled; completed/failed/cancelled: terminal.
+ * cancelling: cancellation being reconciled; continued: this execution was
+ * replaced by a next generation; completed/failed/cancelled: terminal.
  */
 export type ExecutionStatus =
   | 'accepted'
@@ -1081,6 +1093,7 @@ export type ExecutionStatus =
   | 'waiting'
   | 'paused'
   | 'cancelling'
+  | 'continued'
   | 'completed'
   | 'failed'
   | 'cancelled'
@@ -1104,9 +1117,22 @@ export interface ExecutionSnapshot {
    */
   readonly version: number
   /**
-   * Observed lifecycle/control state. Only completed, failed and cancelled are terminal.
+   * Observed lifecycle/control state. Continued, completed, failed and cancelled are terminal for this execution.
    */
   readonly status: ExecutionStatus
+  /**
+   * Next generation when this execution ended through continueAsNew.
+   */
+  readonly continuation?: {
+    /**
+     * Execution identifier of the next generation.
+     */
+    readonly executionId: string
+    /**
+     * Zero-based generation number of the next execution.
+     */
+    readonly generation: number
+  }
   /**
    * Acceptance timestamp as a UTC ISO 8601 string.
    */

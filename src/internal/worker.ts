@@ -57,7 +57,10 @@ export function activityWorker(
   const execute = (activity: RegisteredActivity, payload: ActivityEnvelope, delivery: number) =>
     Effect.gen(function* () {
       const run = yield* durable(journal.get(payload.executionId))
-      if (run.control === 'cancel' || ['completed', 'failed', 'cancelled'].includes(run.state))
+      if (
+        run.control === 'cancel' ||
+        ['continued', 'completed', 'failed', 'cancelled'].includes(run.state)
+      )
         return Exit.fail(cancelled)
       const owner = randomUUID()
       const claim = yield* durable(

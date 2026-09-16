@@ -18,7 +18,11 @@ const required = {
     'input_json',
     'state',
     'control',
-    'event_sequence'
+    'event_sequence',
+    'chain_id',
+    'generation',
+    'continued_from',
+    'continued_to'
   ],
   better_workflows_commands: [
     'execution_id',
@@ -86,7 +90,7 @@ export function migrationStatus(sql: SqlClient.SqlClient) {
     const cluster = yield* applied('cluster_migrations', 'migration_id')
     const queue = yield* applied('better_workflows_queue_migrations', 'migration_id')
     for (const [name, versions, expected] of [
-      ['journal', journal, 4],
+      ['journal', journal, 5],
       ['cluster', cluster, 3],
       ['queue', queue, 2]
     ] as const) {
@@ -115,12 +119,12 @@ export function migrationStatus(sql: SqlClient.SqlClient) {
       Array.from({ length: count }, (_, i) => i + 1).filter((value) => !values.includes(value))
     const status: MigrationStatus = {
       engine: ENGINE_VERSION,
-      journal: { applied: journal, pending: pending(journal, 4) },
+      journal: { applied: journal, pending: pending(journal, 5) },
       cluster: { applied: cluster, pending: pending(cluster, 3) },
       queue: { applied: queue, pending: pending(queue, 2) },
       missing,
       valid:
-        journal.length === 4 && cluster.length === 3 && queue.length === 2 && missing.length === 0
+        journal.length === 5 && cluster.length === 3 && queue.length === 2 && missing.length === 0
     }
     return status
   })
@@ -178,6 +182,15 @@ export function migrateAll(namespace: string) {
               !(
                 before.journal.applied.length === 2 &&
                 entry === 'better_workflows_waits.wake_requested'
+              ) &&
+              !(
+                before.journal.applied.length === 4 &&
+                [
+                  'better_workflows_runs.chain_id',
+                  'better_workflows_runs.generation',
+                  'better_workflows_runs.continued_from',
+                  'better_workflows_runs.continued_to'
+                ].includes(entry)
               )
           )
         )

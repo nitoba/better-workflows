@@ -41,7 +41,8 @@ type Services =
   | WorkflowEngine.WorkflowEngine
   | PersistedQueue.PersistedQueueFactory
   | SqlClient.SqlClient
-const terminal = (row: RunRow) => ['completed', 'failed', 'cancelled'].includes(row.state)
+const terminal = (row: RunRow) =>
+  ['continued', 'completed', 'failed', 'cancelled'].includes(row.state)
 const safetySweepInterval = 60_000
 
 @Injectable()
@@ -261,10 +262,37 @@ export class WorkflowsRuntime
       createdAt: new Date(row.created_at).toISOString(),
       updatedAt: new Date(row.updated_at).toISOString()
     }
+    let withContinuation = snapshot
+    if (row.state === 'continued') {
+      if (!row.continued_to)
+        throw new WorkflowError(
+          'STORAGE_INTEGRITY',
+          `Execution ${row.execution_id} is continued without a next generation`
+        )
+      const next = await this.run(this.store().get(row.continued_to))
+      if (
+        next.workflow_name !== row.workflow_name ||
+        next.version !== row.version ||
+        next.chain_id !== row.chain_id ||
+        next.generation !== row.generation + 1 ||
+        next.continued_from !== row.execution_id
+      )
+        throw new WorkflowError(
+          'STORAGE_INTEGRITY',
+          `Continuation ${row.continued_to} does not match execution ${row.execution_id}`
+        )
+      withContinuation = {
+        ...snapshot,
+        continuation: {
+          executionId: next.execution_id,
+          generation: next.generation
+        }
+      }
+    }
     const withWait =
       row.wait_type && row.wait_step
-        ? { ...snapshot, waitingOn: { type: row.wait_type, stepId: row.wait_step } }
-        : snapshot
+        ? { ...withContinuation, waitingOn: { type: row.wait_type, stepId: row.wait_step } }
+        : withContinuation
     return row.failure_json ? { ...withWait, failure: decode<Failure>(row.failure_json) } : withWait
   }
 
@@ -425,9 +453,9 @@ export class WorkflowsRuntime
         const [timer] = yield* store.sql<{
           deadline: number | null
         }>`SELECT MIN(deadline) AS deadline FROM (
-        SELECT t.deadline FROM better_workflows_timers t JOIN better_workflows_runs r ON r.execution_id=t.execution_id WHERE r.namespace=${store.namespace} AND t.delivered=0 AND r.control<>'cancel' AND r.state NOT IN ('completed','failed','cancelled')
-        UNION ALL SELECT t.deadline FROM better_workflows_retries t JOIN better_workflows_runs r ON r.execution_id=t.execution_id WHERE r.namespace=${store.namespace} AND t.delivered=0 AND r.control<>'cancel' AND r.state NOT IN ('completed','failed','cancelled')
-        UNION ALL SELECT t.deadline FROM better_workflows_waits t JOIN better_workflows_runs r ON r.execution_id=t.execution_id WHERE r.namespace=${store.namespace} AND t.state='pending' AND r.control<>'cancel' AND r.state NOT IN ('completed','failed','cancelled')
+        SELECT t.deadline FROM better_workflows_timers t JOIN better_workflows_runs r ON r.execution_id=t.execution_id WHERE r.namespace=${store.namespace} AND t.delivered=0 AND r.control<>'cancel' AND r.state NOT IN ('continued','completed','failed','cancelled')
+        UNION ALL SELECT t.deadline FROM better_workflows_retries t JOIN better_workflows_runs r ON r.execution_id=t.execution_id WHERE r.namespace=${store.namespace} AND t.delivered=0 AND r.control<>'cancel' AND r.state NOT IN ('continued','completed','failed','cancelled')
+        UNION ALL SELECT t.deadline FROM better_workflows_waits t JOIN better_workflows_runs r ON r.execution_id=t.execution_id WHERE r.namespace=${store.namespace} AND t.state='pending' AND r.control<>'cancel' AND r.state NOT IN ('continued','completed','failed','cancelled')
       ) deadlines`
         return { revision: JSON.stringify(rows), nextDeadline: timer?.deadline ?? null }
       })
@@ -462,7 +490,8 @@ export class WorkflowsRuntime
       }
       for (const child of yield* advanced.readyChildren()) {
         const parent = yield* journal.get(child.parent_id)
-        const run = yield* journal.get(child.child_id)
+        const run = yield* journal.followContinuation(child.child_id)
+        if (!['completed', 'failed', 'cancelled'].includes(run.state)) continue
         const definition = workflowDefinition(
           self.options.namespace,
           parent.workflow_name,

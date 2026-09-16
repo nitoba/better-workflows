@@ -215,7 +215,7 @@ export class WorkflowHandle<W extends WorkflowContractClass> {
   }
 
   /**
-   * Poll until this execution completes, then return its version-correct output.
+   * Poll until this execution (and any continueAsNew generations) completes, then return its version-correct output.
    * This wait is local to the caller: timeout/abort never cancels the workflow and does
    * not use the test business clock. Without timeout or abort, it can wait indefinitely.
    * A result is not reinterpreted using a newer workflow version's output type.
@@ -244,12 +244,14 @@ export class WorkflowHandle<W extends WorkflowContractClass> {
   async result(options?: ResultWaitOptions): Promise<WorkflowOutput<W>> {
     const deadline =
       options?.timeout === undefined ? Infinity : Date.now() + milliseconds(options.timeout)
+    let executionId = this.executionId
+    const seen = new Set<string>([executionId])
     while (true) {
       if (options?.signal?.aborted)
         throw new WorkflowError('WAIT_ABORTED', 'Result wait was aborted; workflow continues')
-      const snapshot = await this.describe()
+      const snapshot = await this.runtime.describe(this.workflow, executionId)
       if (snapshot.status === 'completed') {
-        const row = await this.runtime.row(this.workflow, this.executionId)
+        const row = await this.runtime.row(this.workflow, executionId)
         if (row.version !== this.runtime.resultVersion(this.workflow)) {
           throw new WorkflowError(
             'RESULT_VERSION_MISMATCH',
@@ -264,7 +266,25 @@ export class WorkflowHandle<W extends WorkflowContractClass> {
           message: 'Workflow was cancelled',
           retryable: false
         }
-        throw new WorkflowExecutionError(this.executionId, failure)
+        throw new WorkflowExecutionError(executionId, failure)
+      }
+      if (snapshot.status === 'continued') {
+        const next = snapshot.continuation?.executionId
+        if (!next)
+          throw new WorkflowError(
+            'STORAGE_INTEGRITY',
+            `Execution ${executionId} is continued without a next generation`
+          )
+        if (Date.now() >= deadline)
+          throw new WorkflowError('WAIT_TIMEOUT', 'Result wait timed out; workflow continues')
+        if (seen.has(next))
+          throw new WorkflowError(
+            'STORAGE_INTEGRITY',
+            `Continuation chain contains a cycle at execution ${next}`
+          )
+        seen.add(next)
+        executionId = next
+        continue
       }
       if (Date.now() >= deadline)
         throw new WorkflowError('WAIT_TIMEOUT', 'Result wait timed out; workflow continues')
