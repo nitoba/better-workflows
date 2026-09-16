@@ -215,9 +215,10 @@ export class WorkflowHandle<W extends WorkflowContractClass> {
   }
 
   /**
-   * Poll until this execution (and any continueAsNew generations) completes, then return its version-correct output.
-   * This wait is local to the caller: timeout/abort never cancels the workflow and does
-   * not use the test business clock. Without timeout or abort, it can wait indefinitely.
+   * Wait until this execution (and any continueAsNew generations) completes, then return
+   * its version-correct output. Waiting is notification-first with a low-frequency
+   * reliability fallback; timeout/abort never cancels the workflow and does not use the
+   * test business clock. Without timeout or abort, it can wait indefinitely.
    * A result is not reinterpreted using a newer workflow version's output type.
    * @param options - Optional real-time wait timeout and caller AbortSignal.
    * @returns Successful result using this client's workflow output type.
@@ -286,24 +287,13 @@ export class WorkflowHandle<W extends WorkflowContractClass> {
         executionId = next
         continue
       }
+      const current = await this.runtime.row(this.workflow, executionId)
+      if (['continued', 'completed', 'failed', 'cancelled'].includes(current.state)) continue
       if (Date.now() >= deadline)
         throw new WorkflowError('WAIT_TIMEOUT', 'Result wait timed out; workflow continues')
-      await new Promise<void>((resolve, reject) => {
-        const signal = options?.signal
-        const abort = () => {
-          clearTimeout(timer)
-          signal?.removeEventListener('abort', abort)
-          reject(new WorkflowError('WAIT_ABORTED', 'Result wait was aborted; workflow continues'))
-        }
-        const timer = setTimeout(
-          () => {
-            signal?.removeEventListener('abort', abort)
-            resolve()
-          },
-          Math.min(100, deadline - Date.now())
-        )
-        signal?.addEventListener('abort', abort, { once: true })
-        if (signal?.aborted) abort()
+      await this.runtime.wait(this.workflow, executionId, current.event_sequence, {
+        signal: options?.signal,
+        timeout: deadline === Infinity ? undefined : deadline - Date.now()
       })
     }
   }

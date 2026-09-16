@@ -1,10 +1,11 @@
 # Changelog
 
-## 0.1.0-alpha.6 (in progress)
+## 0.1.0-alpha.6
 
 - Added `WorkflowContext.continueAsNew()` with atomic continuation chains, `continued` execution snapshots, chain-aware results and retention.
 - Added forward-only journal migration v5 and crash-recovery coverage for continuation dispatch.
 - Added application-owned SQL activity deliveries and dead-letter administration for operational failures, with `blocked` executions, metadata-first `list/get/requeue/discard` APIs, CLI commands, safe retention, cancellation fencing and forward-only journal migration v6.
+- Added notification-first `WorkflowHandle.result()` waits with SQLite wake-ups, shared PostgreSQL `LISTEN`/`NOTIFY`, revision-based race protection, reconnect rechecks and a low-frequency fallback.
 
 ## 0.1.0-alpha.5
 

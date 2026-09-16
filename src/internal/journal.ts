@@ -6,6 +6,7 @@ import type { SqlClient } from 'effect/unstable/sql/SqlClient'
 import type { Failure } from '../errors'
 import type { HistoryPage, JsonValue } from '../types'
 import { decode, encode } from './values'
+import { executionNotificationChannel, publishLocalExecutionChange } from './notifier'
 
 export interface RunRow {
   readonly execution_id: string
@@ -29,6 +30,7 @@ export interface RunRow {
   readonly control_revision: number
   readonly applied_revision: number
   readonly dispatched: number
+  readonly event_sequence: number
   readonly wait_type: string | null
   readonly wait_step: string | null
   readonly result_json: string | null
@@ -99,7 +101,8 @@ export class Journal {
   constructor(
     readonly sql: SqlClient,
     readonly namespace: string,
-    readonly clock?: BusinessClock
+    readonly clock?: BusinessClock,
+    readonly localNotifierKey = namespace
   ) {}
 
   readonly now = () => (this.clock ? Effect.sync(() => this.clock!.now()) : this.databaseNow())
@@ -253,7 +256,18 @@ export class Journal {
         RETURNING event_sequence`
       if (!row) return yield* fail('EXECUTION_NOT_FOUND', executionId)
       yield* self.sql`INSERT INTO better_workflows_events(execution_id, sequence, at, type, step_id, details_json)
-        VALUES (${executionId}, ${row.event_sequence}, ${now}, ${type}, ${stepId}, ${encode(details)})`
+         VALUES (${executionId}, ${row.event_sequence}, ${now}, ${type}, ${stepId}, ${encode(details)})`
+      publishLocalExecutionChange(self.localNotifierKey, executionId, row.event_sequence)
+      yield* self.sql.onDialectOrElse({
+        pg: () =>
+          self.sql`SELECT pg_notify(${executionNotificationChannel(self.namespace)}, ${JSON.stringify(
+            {
+              executionId,
+              revision: row.event_sequence
+            }
+          )})`,
+        orElse: () => Effect.void
+      })
     })
   }
 
@@ -280,6 +294,17 @@ export class Journal {
         return yield* fail('EXECUTION_NOT_FOUND', executionId)
       }
       return row
+    })
+  }
+
+  revision(executionId: string) {
+    const self = this
+    return Effect.gen(function* () {
+      const [row] = yield* self.sql<{ event_sequence: number }>`SELECT event_sequence
+        FROM better_workflows_runs
+        WHERE execution_id=${executionId} AND namespace=${self.namespace}`
+      if (!row) return yield* fail('EXECUTION_NOT_FOUND', executionId)
+      return row.event_sequence
     })
   }
 
@@ -526,9 +551,17 @@ export class Journal {
         const blocked = yield* self.sql`SELECT id FROM better_workflows_dead_letters
           WHERE namespace=${self.namespace} AND execution_id=${executionId}
           AND state IN ('open','requeued') LIMIT 1`
-        yield* self.sql`UPDATE better_workflows_runs SET state = ${blocked.length ? 'blocked' : 'running'}, wait_type = NULL, wait_step = NULL
-          WHERE execution_id = ${executionId} AND namespace = ${self.namespace}
-          AND state NOT IN ('continued', 'completed', 'failed', 'cancelled')`
+        const state = blocked.length ? 'blocked' : 'running'
+        const changed =
+          yield* self.sql`UPDATE better_workflows_runs SET state = ${state}, wait_type = NULL, wait_step = NULL
+           WHERE execution_id = ${executionId} AND namespace = ${self.namespace}
+           AND state NOT IN ('continued', 'completed', 'failed', 'cancelled') AND state <> ${state}
+           RETURNING execution_id`
+        if (changed.length)
+          yield* self.event(
+            executionId,
+            state === 'blocked' ? 'workflow.blocked' : 'workflow.running'
+          )
       })
     )
   }

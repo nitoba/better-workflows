@@ -10,6 +10,7 @@ import { SqlAdministration } from './internal/administration'
 import { migrateAll, migrationStatus, validateMigrations } from './internal/schema-admin'
 import { identifier } from './internal/values'
 import { WorkflowError, toFailure } from './errors'
+import { executionNotifierKey } from './internal/notifier'
 import type {
   AdminBackend,
   AdminOptions,
@@ -256,7 +257,12 @@ export async function createWorkflowsAdmin(
   )
   try {
     const sql = await runtime.runPromise(SqlClient.SqlClient)
-    const journal = new Journal(sql, options.namespace)
+    const journal = new Journal(
+      sql,
+      options.namespace,
+      undefined,
+      executionNotifierKey(options.storage, options.namespace)
+    )
     const admin = new SqlAdministration(journal)
     const run = async <A, E>(effect: Effect.Effect<A, E, SqlClient.SqlClient | Crypto.Crypto>) => {
       const exit = await runtime.runPromiseExit(effect)

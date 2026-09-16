@@ -19,6 +19,7 @@ export interface ClientBackend {
     workflow: WorkflowContractClass,
     id: string
   ): Promise<{
+    readonly event_sequence: number
     readonly result_json: string | null
     readonly version: number
     readonly state:
@@ -32,6 +33,12 @@ export interface ClientBackend {
       | 'cancelled'
     readonly continued_to: string | null
   }>
+  wait(
+    workflow: WorkflowContractClass,
+    id: string,
+    afterRevision: number,
+    options: { readonly signal?: AbortSignal | undefined; readonly timeout?: number | undefined }
+  ): Promise<void>
   history(
     workflow: WorkflowContractClass,
     id: string,

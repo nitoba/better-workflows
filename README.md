@@ -2,7 +2,7 @@
 
 Durable workflows for **NestJS 12**, using decorators, modules, dependency injection and `async/await`. Effect's workflow/cluster engine is private infrastructure; application code does not import Effect.
 
-**Status: `0.1.0-alpha.5`.** This repository contains an executable implementation, not just API declarations. It is an initial release candidate for application-level evaluation, not a claim that every proposed feature or failure mode is covered. No npm publication is required to run the repository.
+**Status: `0.1.0-alpha.6`.** This repository contains an executable implementation, not just API declarations. It is an initial release candidate for application-level evaluation, not a claim that every proposed feature or failure mode is covered. No npm publication is required to run the repository.
 
 ## Run the example
 
@@ -215,7 +215,7 @@ const page = await handle.history({ after: 0, limit: 100 })
 
 `start()` resolves after a transaction durably accepts the execution and its dispatch outbox record. Acceptance does not mean completion or even that a worker has started. This is suitable for an HTTP `202` response; the library does not install public HTTP endpoints.
 
-Retrieve a handle later with `client.getHandle(executionId)`. `result({ timeout, signal })` only bounds the caller's local wait; it does **not** cancel the workflow.
+Retrieve a handle later with `client.getHandle(executionId)`. `result({ timeout, signal })` only bounds the caller's local wait; it does **not** cancel the workflow. Result waits are notification-first: SQLite wakes local waiters in memory, PostgreSQL uses one shared `LISTEN` connection per runtime, and a 5-second fallback rechecks the database if a notification is lost.
 
 `pause()` prevents advancement at durable command boundaries. Already running activities may finish. `resume()` releases a pause; it does not reset failed executions. `cancel({ reason })` requests durable cooperative cancellation and aborts running activities through their `AbortSignal`. Cancellation is not rollback. `app.close()` or process restart does not imply cancellation. Enable Nest shutdown hooks for signal-driven graceful shutdown.
 

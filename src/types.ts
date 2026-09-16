@@ -191,7 +191,7 @@ export interface SignalWaitOptions {
 export interface ResultWaitOptions {
   /**
    * Maximum local wait, measured with real time. Expiry raises WAIT_TIMEOUT.
-   * It bounds polling, not an in-flight storage request.
+   * It bounds notification/fallback waiting, not an in-flight storage request.
    * @defaultValue No deadline
    */
   readonly timeout?: Duration

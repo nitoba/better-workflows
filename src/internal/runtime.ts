@@ -2,8 +2,10 @@ import { randomUUID } from 'node:crypto'
 import { Inject, Injectable, Logger, Optional } from '@nestjs/common'
 import type { OnApplicationBootstrap, OnModuleDestroy, OnApplicationShutdown } from '@nestjs/common'
 import { DiscoveryService } from '@nestjs/core'
-import { Cause, Effect, Exit, Option, Scope, Semaphore } from 'effect'
+import { Cause, Effect, Exit, Option, Queue, Scope, Semaphore } from 'effect'
+import * as PgClient from '@effect/sql-pg/PgClient'
 import { SqlClient } from 'effect/unstable/sql'
+import * as Reactivity from 'effect/unstable/reactivity/Reactivity'
 import { DurableDeferred, Workflow, WorkflowEngine } from 'effect/unstable/workflow'
 import { PersistedQueue } from 'effect/unstable/persistence'
 import { WorkflowError, toFailure } from '../errors'
@@ -35,12 +37,19 @@ import type { BusinessClock } from './clock'
 import { childDeferred, timerDeferred } from './wire'
 import { activityWorker } from './worker'
 import { ActivityTransport } from './activity-transport'
+import {
+  executionNotificationChannel,
+  executionNotificationPayload,
+  executionNotifierKey,
+  ExecutionNotifier
+} from './notifier'
 
 export const WORKFLOWS_OPTIONS = Symbol.for('better-workflows/options')
 type Services =
   | WorkflowEngine.WorkflowEngine
   | PersistedQueue.PersistedQueueFactory
   | SqlClient.SqlClient
+  | PgClient.PgClient
 const terminal = (row: RunRow) =>
   ['continued', 'completed', 'failed', 'cancelled'].includes(row.state)
 const safetySweepInterval = 60_000
@@ -54,6 +63,7 @@ export class WorkflowsRuntime
   private infrastructure: Infrastructure | undefined
   private journal: Journal | undefined
   private activityTransport: ActivityTransport | undefined
+  private notifier: ExecutionNotifier | undefined
   private ready = false
   private stopping = false
   private stopPromise?: Promise<void>
@@ -92,7 +102,16 @@ export class WorkflowsRuntime
     this.infrastructure = infrastructure
     try {
       const sql = await infrastructure.runPromise(SqlClient.SqlClient)
-      this.journal = new Journal(sql, this.options.namespace, this.clock)
+      const notifierKey = executionNotifierKey(this.options.storage, this.options.namespace)
+      this.journal = new Journal(sql, this.options.namespace, this.clock, notifierKey)
+      const journal = this.journal
+      this.notifier = new ExecutionNotifier(notifierKey, (executionId) =>
+        this.run(journal.revision(executionId))
+      )
+      if (this.options.storage.driver === 'postgres') {
+        const pg = await infrastructure.runPromise(PgClient.PgClient)
+        this.startPostgresNotifier(pg.config, this.notifier)
+      }
       this.activityTransport = new ActivityTransport(this.journal)
       for (const [name, options] of this.registry.queues.entries())
         await this.run(new Permits(this.journal).register(name, options))
@@ -169,6 +188,8 @@ export class WorkflowsRuntime
       this.infrastructure = undefined
       this.journal = undefined
       this.activityTransport = undefined
+      this.notifier?.shutdown()
+      this.notifier = undefined
       throw error
     }
   }
@@ -177,6 +198,7 @@ export class WorkflowsRuntime
     if (!this.stopPromise) {
       this.stopping = true
       this.ready = false
+      this.notifier?.shutdown()
       this.stopPromise = this.infrastructure?.dispose() ?? Promise.resolve()
     }
     await this.stopPromise
@@ -200,6 +222,40 @@ export class WorkflowsRuntime
         'Initialize the Nest application before using workflow clients'
       )
     return this.journal
+  }
+
+  private startPostgresNotifier(
+    config: PgClient.PgClientConfig,
+    notifier: ExecutionNotifier
+  ): void {
+    const channel = executionNotificationChannel(this.options.namespace)
+    this.infrastructure!.runFork(
+      Effect.gen(function* () {
+        while (true) {
+          const listening = yield* Effect.exit(
+            Effect.provide(
+              Effect.scoped(
+                Effect.gen(function* () {
+                  const client = yield* PgClient.makeClient(config)
+                  const queue = yield* client.listen(channel)
+                  notifier.reconnected()
+                  while (true) {
+                    const notification = yield* Queue.take(queue)
+                    const payload = executionNotificationPayload(notification.payload)
+                    if (payload) notifier.publish(payload.executionId, payload.revision)
+                  }
+                })
+              ),
+              Reactivity.layer
+            )
+          )
+          if (Exit.isFailure(listening) && Cause.hasInterruptsOnly(listening.cause))
+            return yield* Effect.failCause(listening.cause)
+          notifier.reconnected()
+          yield* Effect.sleep(1_000)
+        }
+      })
+    )
   }
 
   async run<A, E>(effect: Effect.Effect<A, E, Services>): Promise<A> {
@@ -242,6 +298,17 @@ export class WorkflowsRuntime
   async row(workflow: WorkflowContractClass, id: string): Promise<RunRow> {
     const entry = this.registry.contract(workflow)
     return this.run(this.store().get(id, entry.options.name))
+  }
+
+  async wait(
+    _workflow: WorkflowContractClass,
+    executionId: string,
+    afterRevision: number,
+    options: { readonly signal?: AbortSignal | undefined; readonly timeout?: number | undefined }
+  ): Promise<void> {
+    if (!this.notifier)
+      throw new WorkflowError('RUNTIME_NOT_READY', 'The workflow runtime is not running')
+    await this.notifier.wait(executionId, afterRevision, options)
   }
 
   resultVersion(workflow: WorkflowContractClass): number {
