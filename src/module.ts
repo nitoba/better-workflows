@@ -3,7 +3,7 @@ import type { DynamicModule, Provider, Type } from '@nestjs/common'
 import { DiscoveryModule } from '@nestjs/core'
 import { WorkflowsAdmin, WORKFLOWS_ADMIN_BACKEND } from './admin'
 import { WorkflowClient } from './client'
-import { getWorkflowToken } from './decorators'
+import { getWorkflowToken, workflowContractClass } from './decorators'
 import { WorkflowError } from './errors'
 import { queueToken } from './queues'
 import type {
@@ -195,7 +195,12 @@ function createFeature(
   const classes = handlers.map(handlerClass)
   if (new Set(classes).size !== classes.length)
     throw new WorkflowError('DUPLICATE_HANDLER', 'A feature must register each implementation once')
-  const clients = [...new Set([...workflows.map(handlerClass), ...(options.clients ?? [])])]
+  const clients = [
+    ...new Set([
+      ...workflows.map((entry) => workflowContractClass(handlerClass(entry))),
+      ...(options.clients ?? [])
+    ])
+  ]
   const structure: FeatureStructure = Object.freeze({
     ...options,
     workflows: Object.freeze(workflows),

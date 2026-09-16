@@ -74,10 +74,32 @@ export class ReportsModule {}
 
 `workflows` registers implementations and their typed clients. `activities` registers implementations. These classes **must not also be registered** in the outer module's `providers`. Their dependencies must be exported by modules in the feature's own `imports`, or declared in the feature's `providers` for local helper services. Nest does not automatically expose the importing parent's providers to its children.
 
+For a distributed workflow, keep the contract in a shared package and the handler
+in the orchestrator:
+
+```ts
+@WorkflowContract({ name: 'reports.generate', version: 1, input: Input, output: Output })
+export abstract class GenerateReportWorkflow {
+  abstract run(input: GenerateReportInput, ctx: WorkflowContext): Promise<GenerateReportOutput>
+}
+
+@Workflow(GenerateReportWorkflow)
+export class GenerateReportHandler implements GenerateReportWorkflow {
+  async run(input: GenerateReportInput, ctx: WorkflowContext) {
+    return generateReport(input, ctx)
+  }
+}
+```
+
+`@WorkflowContract` is metadata only and does not create a Nest provider. The
+handler decorator applies `Injectable`, and `workflows: [GenerateReportHandler]`
+normalizes to the contract for registration, identity and client tokens. A producer
+imports only the shared contract:
+
 `clients` registers only clients, without constructing workflow implementations:
 
 ```ts
-WorkflowsModule.forFeature({ clients: [GenerateReport] })
+WorkflowsModule.forFeature({ clients: [GenerateReportWorkflow] })
 ```
 
 Such a client-only import needs no name. A feature owning handlers, activity contracts, queues, defaults or execution settings requires a unique explicit `name`. The name is for ownership and diagnostics, not a durable routing prefix.

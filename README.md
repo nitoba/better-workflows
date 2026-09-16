@@ -77,7 +77,10 @@ export class GenerateReport {
 }
 ```
 
-Both class decorators include Nest's injectable metadata. Activities can inject the application's ordinary services using the Nest constructor. The activity context belongs to an invocation, not to mutable fields on a singleton.
+`@Activities` and `@Workflow` include Nest's injectable metadata. Activities and
+workflow handlers can inject the application's ordinary services using the Nest
+constructor. `@WorkflowContract` is intentionally metadata-only. Context objects
+belong to an invocation, not to mutable fields on a singleton.
 
 `ctx.activities()` returns a typed **durable client**, not the provider instance. Its calls schedule and await durable work. Calling an activity provider directly is an ordinary method call and does not create a durable step.
 
@@ -116,6 +119,71 @@ export class AppModule {}
 Register **one root** per Nest application. It configures infrastructure and optional application defaults/queue overrides; it does not need to know domain queues. `forFeature()` owns implementations, their typed clients and local configuration. Do not also register those handlers in the outer module's `providers`. Use feature `imports`/`providers` for dependencies or `{ provide, useExisting }` to reuse an exported instance.
 
 `forFeature({ clients: [GenerateReport] })` registers clients only, without constructing workflow services. `activityContracts` provides remote activity metadata without constructing workers. Private feature queues/activities are shared through explicit exports and actual Nest imports. `forRootAsync()` and `forFeatureAsync()` support configuration providers. Infrastructure is global by default; `isGlobal: false` requires explicit infrastructure imports.
+
+## Contract-first workflows (optional)
+
+The simple style above is recommended for monoliths and applications where the
+contract and implementation naturally live together. When an API producer must
+share a workflow with an orchestrator without importing its Nest dependencies,
+declare the durable contract separately:
+
+```ts
+import { InjectWorkflow, Workflow, WorkflowContract } from 'better-workflows'
+import type { WorkflowClient, WorkflowContext } from 'better-workflows'
+import { Injectable } from '@nestjs/common'
+import { z } from 'zod'
+
+const GenerateReportInputSchema = z.object({ reportId: z.string() })
+const GenerateReportOutputSchema = z.object({ reportId: z.string() })
+type GenerateReportInput = z.infer<typeof GenerateReportInputSchema>
+type GenerateReportOutput = z.infer<typeof GenerateReportOutputSchema>
+
+@WorkflowContract({
+  name: 'reports.generate',
+  version: 1,
+  input: GenerateReportInputSchema,
+  output: GenerateReportOutputSchema,
+  idempotencyKey: (input) => input.reportId
+})
+export abstract class GenerateReportWorkflow {
+  abstract run(input: GenerateReportInput, ctx: WorkflowContext): Promise<GenerateReportOutput>
+}
+
+@Workflow(GenerateReportWorkflow)
+export class GenerateReportHandler implements GenerateReportWorkflow {
+  constructor(private readonly reports: ReportsService) {}
+
+  run(input: GenerateReportInput, ctx: WorkflowContext): Promise<GenerateReportOutput> {
+    return this.reports.generate(input, ctx)
+  }
+}
+```
+
+The contract decorator writes metadata only; it does not make the abstract class a
+Nest provider. The `@Workflow(contract)` decorator makes the concrete handler
+injectable and validates its `run` shape. An orchestrator registers the handler:
+
+```ts
+WorkflowsModule.forFeature({ name: 'reports', workflows: [GenerateReportHandler] })
+```
+
+An API or other client-only process imports only the contract and registers:
+
+```ts
+WorkflowsModule.forFeature({ clients: [GenerateReportWorkflow] })
+
+@Injectable()
+class ReportsApiService {
+  constructor(
+    @InjectWorkflow(GenerateReportWorkflow)
+    private readonly generateReport: WorkflowClient<typeof GenerateReportWorkflow>
+  ) {}
+}
+```
+
+Clients and child workflows use the contract class as their token. Durable identity
+continues to come only from the contract's `name` and `version`; the handler class
+name does not affect persistence.
 
 See [modules and configuration](docs/modules.md) for precedence, queue ownership, cross-domain calls, asynchronous factories and separated worker processes. Run `bun run example:modular` for a multi-domain application with **no root queue catalog**.
 

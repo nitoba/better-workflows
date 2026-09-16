@@ -11,6 +11,7 @@ export {
   Activities,
   Activity,
   Workflow,
+  WorkflowContract,
   InjectWorkflow,
   defineSignal,
   getWorkflowToken
@@ -57,6 +58,8 @@ export type {
   WorkflowsFeatureOptions,
   WorkflowsFeatureAsyncOptions,
   WorkflowClass,
+  WorkflowContractClass,
+  WorkflowImplementationClass,
   WorkflowContext,
   WorkflowHandler,
   WorkflowInput,

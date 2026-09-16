@@ -69,7 +69,8 @@ export interface RetryOptions {
 }
 
 /**
- * Identity, Standard Schema contracts and accepted signals for {@link Workflow}.
+ * Identity, Standard Schema contracts and accepted signals for {@link Workflow} and
+ * {@link WorkflowContract}.
  * Keep a compatible handler registered for every version with unfinished executions.
  * Schemas validate durable data; do not transform values into Dates or class instances.
  * @typeParam I - Workflow input accepted by the schema and the handler.
@@ -600,10 +601,12 @@ export interface FeatureStructure extends Pick<ModuleMetadata, 'imports' | 'prov
    */
   readonly name?: string
   /**
-   * Implementations to instantiate (or reuse), and their typed workflow clients.
-   * Do not also register these classes in the outer module's providers.
+   * Concrete implementations to instantiate (or reuse), and their typed workflow
+   * clients. In advanced mode, the client is keyed by the contract passed to
+   * `@Workflow`, not by this implementation class. Do not also register handlers in
+   * the outer module's providers.
    */
-  readonly workflows?: readonly HandlerRegistration<WorkflowClass>[]
+  readonly workflows?: readonly HandlerRegistration<WorkflowImplementationClass>[]
   /**
    * Activity implementations to instantiate or reuse through Nest dependency injection.
    */
@@ -614,10 +617,10 @@ export interface FeatureStructure extends Pick<ModuleMetadata, 'imports' | 'prov
    */
   readonly activityContracts?: readonly Type[]
   /**
-   * Typed workflow clients only. No workflow implementation is instantiated.
-   * Also declares workflows that this feature may start as children.
+   * Typed workflow contracts only. No workflow implementation is instantiated.
+   * Also declares contracts that this feature may start as children.
    */
-  readonly clients?: readonly WorkflowClass[]
+  readonly clients?: readonly WorkflowContractClass[]
   /**
    * Explicit activity/queue exports; workflow clients are exported automatically.
    * An outer Nest module must reexport WorkflowsModule to forward these capabilities.
@@ -767,7 +770,7 @@ export interface WorkflowContext {
    * const analysis = await ctx.child('analyze', AnalyzeDocument, { documentId: 'doc-1' })
    * ```
    */
-  child<W extends WorkflowClass>(
+  child<W extends WorkflowContractClass>(
     stepId: string,
     workflow: W,
     input: WorkflowInput<W>,
@@ -793,7 +796,7 @@ export interface WorkflowContext {
    *   { parentClosePolicy: 'abandon' })
    * ```
    */
-  startChild<W extends WorkflowClass>(
+  startChild<W extends WorkflowContractClass>(
     stepId: string,
     workflow: W,
     input: WorkflowInput<W>,
@@ -885,20 +888,39 @@ export interface WorkflowHandler<I = never, O = unknown> {
 }
 
 /**
- * Constructor of a workflow handler, used as a contract and Nest client token.
- * Pass `typeof MyWorkflow` to WorkflowClient, not its instance type.
+ * Constructor of a workflow contract. Contracts may be abstract because they are
+ * metadata and type declarations, not Nest providers. Pass `typeof MyWorkflow` to
+ * WorkflowClient, not its instance type.
+ */
+export type WorkflowContractClass = abstract new (...args: any[]) => WorkflowHandler<any, any>
+
+/**
+ * Constructor of a concrete workflow implementation. Unlike a contract, an
+ * implementation is instantiated by Nest when registered in a feature.
+ * @typeParam C - Contract implemented by the handler.
+ */
+export type WorkflowImplementationClass<C extends WorkflowContractClass = WorkflowContractClass> =
+  new (...args: any[]) => {
+    run(input: WorkflowInput<C>, context: WorkflowContext): Promise<WorkflowOutput<C>>
+  }
+
+/**
+ * Backward-compatible concrete workflow-handler constructor alias.
+ * Use {@link WorkflowContractClass} for APIs that also accept abstract contracts.
  */
 export type WorkflowClass = Type<WorkflowHandler>
 /**
  * Input parameter inferred from a workflow class's run method.
  * @typeParam W - Workflow constructor, such as `typeof MyWorkflow`.
  */
-export type WorkflowInput<W extends WorkflowClass> = Parameters<InstanceType<W>['run']>[0]
+export type WorkflowInput<W extends WorkflowContractClass> = Parameters<InstanceType<W>['run']>[0]
 /**
  * Awaited return type inferred from a workflow class's run method.
  * @typeParam W - Workflow constructor, such as `typeof MyWorkflow`.
  */
-export type WorkflowOutput<W extends WorkflowClass> = Awaited<ReturnType<InstanceType<W>['run']>>
+export type WorkflowOutput<W extends WorkflowContractClass> = Awaited<
+  ReturnType<InstanceType<W>['run']>
+>
 
 /**
  * Immutable SQLite storage description returned by the sqlite adapter.

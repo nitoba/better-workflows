@@ -12,7 +12,7 @@ import type {
   ParallelTasks,
   SagaContext,
   StepOptions,
-  WorkflowClass,
+  WorkflowContractClass,
   WorkflowContext
 } from '../types'
 import { AdvancedJournal } from './advanced-journal'
@@ -116,7 +116,7 @@ export class WorkflowInterpreter {
         }
         const child = (
           step: string,
-          provider: WorkflowClass,
+          provider: WorkflowContractClass,
           input: any,
           options: ChildOptions | undefined,
           wait: boolean

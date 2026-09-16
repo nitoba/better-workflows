@@ -12,7 +12,7 @@ import { WorkflowsModule, getWorkflowToken } from 'better-workflows'
 import { createWorkflowsAdmin } from 'better-workflows/admin'
 import { sqlite } from 'better-workflows/sqlite'
 import { postgres } from 'better-workflows/postgres'
-import { Batch, Child, Even, Odd, queues, setAudit } from './advanced-contracts.mjs'
+import { Batch, BatchWorkflow, Child, Even, Odd, queues, setAudit } from './advanced-contracts.mjs'
 
 const distribution = new URL('../../dist/', import.meta.url)
 const declarations = (await readdir(distribution)).filter((name) => name.endsWith('.d.mts'))
@@ -104,7 +104,9 @@ try {
     ]
   })(App)
   app = await NestFactory.createApplicationContext(App, { logger: false, abortOnError: false })
-  const client = app.get(getWorkflowToken(Batch))
+  // The published package can load a contract independently from its handler.
+  assert.notEqual(BatchWorkflow, Batch)
+  const client = app.get(getWorkflowToken(BatchWorkflow))
   const handle = await client.start('one')
   assert.deepEqual(
     await handle.result({ timeout: '45s' }),

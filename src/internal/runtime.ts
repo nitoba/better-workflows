@@ -11,7 +11,7 @@ import type { Failure } from '../errors'
 import type {
   ExecutionSnapshot,
   SignalDefinition,
-  WorkflowClass,
+  WorkflowContractClass,
   WorkflowInput,
   WorkflowsOptions
 } from '../types'
@@ -70,7 +70,7 @@ export class WorkflowsRuntime
     this.registry = new Registry(options)
   }
 
-  registerContract(workflow: WorkflowClass): void {
+  registerContract(workflow: WorkflowContractClass): void {
     this.registry.contract(workflow)
   }
 
@@ -101,7 +101,7 @@ export class WorkflowsRuntime
       const featureSlots = new Map<symbol, Semaphore.Semaphore>()
       if (this.options.execution?.workflows?.enabled !== false) {
         for (const workflow of this.registry.workflows.values()) {
-          if (!workflow.handler || !workflow.enabled) continue
+          if (!workflow.invoke || !workflow.enabled) continue
           const feature = workflow.owner!.registration.id
           if (workflow.concurrency !== undefined && !featureSlots.has(feature))
             featureSlots.set(feature, Semaphore.makeUnsafe(workflow.concurrency))
@@ -210,7 +210,11 @@ export class WorkflowsRuntime
     return exit.value
   }
 
-  async start<W extends WorkflowClass>(workflow: W, input: WorkflowInput<W>, keyOverride?: string) {
+  async start<W extends WorkflowContractClass>(
+    workflow: W,
+    input: WorkflowInput<W>,
+    keyOverride?: string
+  ) {
     if (!this.ready)
       throw new WorkflowError(
         'RUNTIME_NOT_READY',
@@ -232,16 +236,16 @@ export class WorkflowsRuntime
     return { executionId: accepted.row.execution_id, created: accepted.created }
   }
 
-  async row(workflow: WorkflowClass, id: string): Promise<RunRow> {
+  async row(workflow: WorkflowContractClass, id: string): Promise<RunRow> {
     const entry = this.registry.contract(workflow)
     return this.run(this.store().get(id, entry.options.name))
   }
 
-  resultVersion(workflow: WorkflowClass): number {
+  resultVersion(workflow: WorkflowContractClass): number {
     return this.registry.contract(workflow).options.version
   }
 
-  async describe(workflow: WorkflowClass, id: string): Promise<ExecutionSnapshot> {
+  async describe(workflow: WorkflowContractClass, id: string): Promise<ExecutionSnapshot> {
     const row = await this.row(workflow, id)
     const snapshot: ExecutionSnapshot = {
       executionId: row.execution_id,
@@ -264,13 +268,13 @@ export class WorkflowsRuntime
     return row.failure_json ? { ...withWait, failure: decode<Failure>(row.failure_json) } : withWait
   }
 
-  async history(workflow: WorkflowClass, id: string, after?: number, limit?: number) {
+  async history(workflow: WorkflowContractClass, id: string, after?: number, limit?: number) {
     await this.row(workflow, id)
     return this.run(this.store().history(id, after, limit))
   }
 
   async control(
-    workflow: WorkflowClass,
+    workflow: WorkflowContractClass,
     id: string,
     action: 'run' | 'pause' | 'cancel',
     reason: string
@@ -282,7 +286,7 @@ export class WorkflowsRuntime
   }
 
   async signal<I, O>(
-    workflow: WorkflowClass,
+    workflow: WorkflowContractClass,
     id: string,
     signal: SignalDefinition<I, O>,
     input: I,
@@ -338,7 +342,7 @@ export class WorkflowsRuntime
         () => self.gate(executionId),
         (activity) => self.queue(activity.options.queue)
       )
-      const value = yield* interpreter.run((ctx) => workflow.handler!(input, ctx))
+      const value = yield* interpreter.run((ctx) => workflow.invoke!(input, ctx))
       return yield* promised(async () =>
         encode(await validate(workflow.options.output, value, `${workflow.options.name} output`))
       )

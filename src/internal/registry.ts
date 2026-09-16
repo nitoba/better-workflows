@@ -3,9 +3,11 @@ import type { DiscoveryService } from '@nestjs/core'
 import {
   ACTIVITY_METADATA,
   ACTIVITIES_METADATA,
-  WORKFLOW_METADATA,
+  WORKFLOW_CONTRACT_METADATA,
+  WORKFLOW_HANDLER_METADATA,
   getWorkflowToken,
-  validateActivityDefaults
+  validateActivityDefaults,
+  workflowContractClass
 } from '../decorators'
 import { WorkflowError } from '../errors'
 import { queueName, queueToken } from '../queues'
@@ -17,7 +19,8 @@ import type {
   QueueOptions,
   QueueRegistration,
   QueueSettings,
-  WorkflowClass,
+  WorkflowContractClass,
+  WorkflowImplementationClass,
   WorkflowContext,
   WorkflowOptions,
   WorkflowsOptions
@@ -55,13 +58,19 @@ interface Feature {
   readonly host: FeatureHost
 }
 export interface RegisteredWorkflow {
-  readonly provider: WorkflowClass
+  /** Contract that owns the durable identity and schemas. */
+  readonly contract: WorkflowContractClass
+  /** Backward-compatible alias for the normalized contract. */
+  readonly provider: WorkflowContractClass
   readonly options: WorkflowOptions<any, any>
   readonly definition: EngineWorkflow
   owner?: Feature
   enabled?: boolean
   concurrency?: number
-  handler?: (input: any, context: WorkflowContext) => Promise<any>
+  /** Concrete Nest implementation, when this runtime executes the workflow. */
+  handler?: WorkflowImplementationClass
+  /** Bound invocation of the concrete implementation, when execution is enabled. */
+  invoke?: (input: any, context: WorkflowContext) => Promise<any>
 }
 interface OwnedQueue {
   readonly reference: QueueReference
@@ -73,6 +82,8 @@ export class Registry {
   readonly workflows = new Map<string, RegisteredWorkflow>()
   readonly activities = new Map<string, RegisteredActivity>()
   readonly providers = new Map<Type, readonly ActivityContract[]>()
+  /** Normalized implementation-to-contract relationships for advanced handlers. */
+  readonly handlerContracts = new Map<WorkflowImplementationClass, WorkflowContractClass>()
   readonly queues = new Map<string, QueueOptions>()
   private readonly ownedQueues = new Map<string, OwnedQueue>()
   private readonly features = new Map<symbol, Feature>()
@@ -85,17 +96,29 @@ export class Registry {
     return JSON.stringify([name, version])
   }
 
-  contract(provider: WorkflowClass): RegisteredWorkflow {
-    // SAFETY: @Workflow validates and owns this metadata.
-    const options = Reflect.getOwnMetadata(WORKFLOW_METADATA, provider) as
+  contract(provider: WorkflowContractClass): RegisteredWorkflow {
+    // SAFETY: @Workflow is the only writer of this metadata and writes a contract reference.
+    const handler = Reflect.getOwnMetadata(WORKFLOW_HANDLER_METADATA, provider) as
+      | { readonly contract: WorkflowContractClass }
+      | undefined
+    if (handler && handler.contract !== provider)
+      throw new WorkflowError(
+        'INVALID_WORKFLOW_CONTRACT',
+        `${provider.name} is a workflow handler; register its contract instead`
+      )
+    // SAFETY: @WorkflowContract or the simple @Workflow form owns this metadata.
+    const options = Reflect.getOwnMetadata(WORKFLOW_CONTRACT_METADATA, provider) as
       | WorkflowOptions<any, any>
       | undefined
     if (!options)
-      throw new WorkflowError('MISSING_DECORATOR', `${provider.name} has no @Workflow decorator`)
+      throw new WorkflowError(
+        'MISSING_DECORATOR',
+        `${provider.name} has no @WorkflowContract decorator`
+      )
     const key = this.key(options.name, options.version)
     const existing = this.workflows.get(key)
     if (existing) {
-      if (existing.provider !== provider) throw new WorkflowError('DUPLICATE_WORKFLOW', key)
+      if (existing.contract !== provider) throw new WorkflowError('DUPLICATE_WORKFLOW', key)
       return existing
     }
     if (this.sealed)
@@ -104,6 +127,7 @@ export class Registry {
         `${provider.name} must be registered in workflows or clients`
       )
     const contract: RegisteredWorkflow = {
+      contract: provider,
       provider,
       options,
       definition: workflowDefinition(this.options.namespace, options.name, options.version)
@@ -144,23 +168,35 @@ export class Registry {
     return this.activityContracts(provider)
   }
 
-  childContract(parent: RegisteredWorkflow, provider: WorkflowClass): RegisteredWorkflow {
+  childContract(parent: RegisteredWorkflow, provider: WorkflowContractClass): RegisteredWorkflow {
+    // SAFETY: @Workflow is the only writer of this metadata and writes a contract reference.
+    const handler = Reflect.getOwnMetadata(WORKFLOW_HANDLER_METADATA, provider) as
+      | { readonly contract: WorkflowContractClass }
+      | undefined
+    if (handler && handler.contract !== provider)
+      throw new WorkflowError(
+        'INVALID_WORKFLOW_CONTRACT',
+        `${provider.name} is a workflow handler; use its contract class for children`
+      )
+    const contractProvider = workflowContractClass(provider)
     const feature = parent.owner
     const declared =
       feature &&
       [
         ...(feature.registration.structure.clients ?? []),
-        ...(feature.registration.structure.workflows ?? []).map(handlerClass)
-      ].includes(provider)
+        ...(feature.registration.structure.workflows ?? []).map((entry) =>
+          workflowContractClass(handlerClass(entry))
+        )
+      ].includes(contractProvider)
     if (
       !feature ||
-      (!declared && !visibleProviders(feature.host, getWorkflowToken(provider)).length)
+      (!declared && !visibleProviders(feature.host, getWorkflowToken(contractProvider)).length)
     )
       throw new WorkflowError(
         'WORKFLOW_NOT_VISIBLE',
-        `${provider.name} must be imported or registered as a client in the parent feature`
+        `${contractProvider.name} must be imported or registered as a client in the parent feature`
       )
-    return this.contract(provider)
+    return this.contract(contractProvider)
   }
 
   /** Resolve every feature before opening storage or starting workers. */
@@ -241,12 +277,17 @@ export class Registry {
         this.requireQueue(feature, configuration.defaults.activities.queue)
       for (const entry of structure.workflows ?? []) {
         requireSingleton(feature.host, handlerToken(entry))
-        const provider = handlerClass(entry)
-        const contract = this.contract(provider)
+        const provider: WorkflowImplementationClass = handlerClass(entry)
+        const contractProvider = workflowContractClass(provider)
+        const contract = this.contract(contractProvider)
         if (contract.handler)
           throw new WorkflowError(
-            'DUPLICATE_WORKFLOW_PROVIDER',
-            `${provider.name} already belongs to another feature`
+            contract.handler === provider
+              ? 'DUPLICATE_WORKFLOW_PROVIDER'
+              : 'DUPLICATE_WORKFLOW_HANDLER',
+            contract.handler === provider
+              ? `${provider.name} already belongs to another feature`
+              : `${provider.name} and ${contract.handler.name} implement ${contractProvider.name}`
           )
         const instance = feature.registration.instances.get(provider)
         const handler = instance?.run
@@ -259,7 +300,9 @@ export class Registry {
           execution?.workflows?.enabled !== false
         if (execution?.workflows?.concurrency !== undefined)
           contract.concurrency = execution.workflows.concurrency
-        contract.handler = (input, context) => handler.call(instance, input, context)
+        contract.handler = provider
+        this.handlerContracts.set(provider, contractProvider)
+        contract.invoke = (input, context) => handler.call(instance, input, context)
       }
       for (const provider of structure.clients ?? []) this.contract(provider)
       const implemented = new Set((structure.activities ?? []).map(handlerClass))

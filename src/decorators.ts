@@ -5,7 +5,8 @@ import type {
   ActivityDefaults,
   ActivityOptions,
   SignalDefinition,
-  WorkflowClass,
+  WorkflowContractClass,
+  WorkflowImplementationClass,
   WorkflowOptions
 } from './types'
 import { identifier, milliseconds, positiveInteger } from './internal/values'
@@ -13,9 +14,54 @@ import { WorkflowError } from './errors'
 import { queueName } from './queues'
 
 export const WORKFLOW_METADATA = Symbol.for('better-workflows/workflow')
+export const WORKFLOW_CONTRACT_METADATA = Symbol.for('better-workflows/workflow-contract')
+export const WORKFLOW_HANDLER_METADATA = Symbol.for('better-workflows/workflow-handler')
 export const ACTIVITIES_METADATA = Symbol.for('better-workflows/activities')
 export const ACTIVITY_METADATA = Symbol.for('better-workflows/activity')
-const CLIENT_TOKENS = new WeakMap<WorkflowClass, symbol>()
+const CLIENT_TOKENS = new WeakMap<WorkflowContractClass, symbol>()
+
+export interface WorkflowHandlerMetadata {
+  readonly contract: WorkflowContractClass
+}
+
+function validateWorkflowOptions(options: WorkflowOptions<any, any>): void {
+  identifier(options.name, 'Workflow name')
+  positiveInteger(options.version, 'Workflow version')
+  const names = new Set<string>()
+  for (const signal of options.signals ?? []) {
+    identifier(signal.name, 'Signal name')
+    if (names.has(signal.name)) throw new WorkflowError('DUPLICATE_SIGNAL', signal.name)
+    names.add(signal.name)
+  }
+}
+
+/**
+ * Declare a workflow contract without creating a Nest provider.
+ * The contract owns durable identity, schemas, signals and the TypeScript run signature.
+ * Use {@link Workflow} on a separate concrete class to provide the executable handler.
+ * @typeParam I - Schema-validated input type.
+ * @typeParam O - Schema-validated output type.
+ * @param options - Stable identity, schemas, optional key resolver and signals.
+ * @returns Class decorator for a contract, including an abstract contract class.
+ * @throws WorkflowError for invalid identity/version or duplicate signal names.
+ * @example
+ * ```ts
+ * import { WorkflowContract } from 'better-workflows'
+ * import type { WorkflowContext } from 'better-workflows'
+ * import { z } from 'zod'
+ * const Input = z.object({ reportId: z.string() })
+ * @WorkflowContract({ name: 'reports.generate', version: 1, input: Input, output: z.string() })
+ * abstract class GenerateReportWorkflow {
+ *   abstract run(input: { reportId: string }, ctx: WorkflowContext): Promise<string>
+ * }
+ * ```
+ */
+export function WorkflowContract<I, O>(options: WorkflowOptions<I, O>): ClassDecorator {
+  validateWorkflowOptions(options)
+  return (target) => {
+    Reflect.defineMetadata(WORKFLOW_CONTRACT_METADATA, Object.freeze({ ...options }), target)
+  }
+}
 
 /**
  * Declare a replayable workflow's name, version, schemas and accepted signals.
@@ -23,7 +69,10 @@ const CLIENT_TOKENS = new WeakMap<WorkflowClass, symbol>()
  * class to forFeature.workflows, or clients when only a producer contract is needed.
  * @typeParam I - Schema-validated input type.
  * @typeParam O - Schema-validated output type.
- * @param options - Stable identity, schemas, optional key resolver and signals.
+ * @param options - Stable identity, schemas, optional key resolver and signals; or a
+ * contract class declared with {@link WorkflowContract}.
+ * @param contract - Contract class declared with {@link WorkflowContract} when using
+ * the handler-association overload.
  * @returns Class decorator for a singleton with an async run(input, context) method.
  * @throws WorkflowError for invalid identity/version or duplicate signal names.
  * @example
@@ -40,19 +89,88 @@ const CLIENT_TOKENS = new WeakMap<WorkflowClass, symbol>()
  * }
  * ```
  */
-export function Workflow<I, O>(options: WorkflowOptions<I, O>): ClassDecorator {
-  identifier(options.name, 'Workflow name')
-  positiveInteger(options.version, 'Workflow version')
-  const names = new Set<string>()
-  for (const signal of options.signals ?? []) {
-    identifier(signal.name, 'Signal name')
-    if (names.has(signal.name)) throw new WorkflowError('DUPLICATE_SIGNAL', signal.name)
-    names.add(signal.name)
+export function Workflow<I, O>(options: WorkflowOptions<I, O>): ClassDecorator
+export function Workflow<C extends WorkflowContractClass>(
+  contract: C
+): <T extends WorkflowImplementationClass<C>>(target: T) => void
+export function Workflow(
+  optionsOrContract: WorkflowOptions<any, any> | WorkflowContractClass
+): ClassDecorator {
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- Decorator overloads distinguish options objects from class constructors here.
+  if (typeof optionsOrContract === 'function') {
+    const contract = optionsOrContract
+    // SAFETY: @WorkflowContract is the only writer of this metadata and writes WorkflowOptions.
+    const options = Reflect.getOwnMetadata(WORKFLOW_CONTRACT_METADATA, contract) as
+      | WorkflowOptions<any, any>
+      | undefined
+    // A simple workflow also owns contract metadata, but remains a handler and is
+    // intentionally not accepted as the contract argument of the advanced overload.
+    // SAFETY: @Workflow is the only writer of this metadata and writes a contract reference.
+    const handler = Reflect.getOwnMetadata(WORKFLOW_HANDLER_METADATA, contract) as
+      | WorkflowHandlerMetadata
+      | undefined
+    if (!options || handler)
+      throw new WorkflowError(
+        'INVALID_WORKFLOW_CONTRACT',
+        `${contract.name} must be declared with @WorkflowContract() before it can be used by @Workflow()`
+      )
+    return (target) => {
+      Injectable()(target)
+      Reflect.defineMetadata(
+        WORKFLOW_HANDLER_METADATA,
+        Object.freeze({ contract } satisfies WorkflowHandlerMetadata),
+        target
+      )
+    }
   }
+  validateWorkflowOptions(optionsOrContract)
   return (target) => {
     Injectable()(target)
-    Reflect.defineMetadata(WORKFLOW_METADATA, Object.freeze({ ...options }), target)
+    const options = Object.freeze({ ...optionsOrContract })
+    // Keep the old metadata available for consumers that inspected it directly.
+    Reflect.defineMetadata(WORKFLOW_METADATA, options, target)
+    Reflect.defineMetadata(WORKFLOW_CONTRACT_METADATA, options, target)
+    Reflect.defineMetadata(WORKFLOW_HANDLER_METADATA, Object.freeze({ contract: target }), target)
   }
+}
+
+/**
+ * Resolve the contract represented by a workflow registration class.
+ * This accepts a handler internally so feature registration can normalize simple and
+ * advanced modes to one contract; client tokens must use the returned contract itself.
+ * @param workflow - Contract or decorated handler constructor.
+ * @returns The class that owns the durable workflow metadata.
+ * @throws WorkflowError when the class is not decorated as a workflow contract/handler.
+ */
+export function workflowContractClass(workflow: WorkflowContractClass): WorkflowContractClass {
+  // SAFETY: @Workflow is the only writer of this metadata and writes a contract reference.
+  const handler = Reflect.getOwnMetadata(WORKFLOW_HANDLER_METADATA, workflow) as
+    | WorkflowHandlerMetadata
+    | undefined
+  if (handler && handler.contract !== workflow) return handler.contract
+  if (Reflect.hasOwnMetadata(WORKFLOW_CONTRACT_METADATA, workflow)) return workflow
+  throw new WorkflowError(
+    'MISSING_DECORATOR',
+    `${workflow.name} has no @WorkflowContract decorator`
+  )
+}
+
+function requireClientContract(workflow: WorkflowContractClass): WorkflowContractClass {
+  // SAFETY: @Workflow is the only writer of this metadata and writes a contract reference.
+  const handler = Reflect.getOwnMetadata(WORKFLOW_HANDLER_METADATA, workflow) as
+    | WorkflowHandlerMetadata
+    | undefined
+  if (handler && handler.contract !== workflow)
+    throw new WorkflowError(
+      'INVALID_WORKFLOW_CONTRACT',
+      `${workflow.name} is a workflow handler; use its contract class for client injection`
+    )
+  if (!Reflect.hasOwnMetadata(WORKFLOW_CONTRACT_METADATA, workflow))
+    throw new WorkflowError(
+      'INVALID_WORKFLOW_CONTRACT',
+      `${workflow.name} must be declared with @WorkflowContract() or @Workflow()`
+    )
+  return workflow
 }
 
 /**
@@ -173,7 +291,8 @@ export function defineSignal<I, O>(
  * const reports = app.get<WorkflowClient<typeof GenerateReport>>(getWorkflowToken(GenerateReport))
  * ```
  */
-export function getWorkflowToken(workflow: WorkflowClass): symbol {
+export function getWorkflowToken(workflow: WorkflowContractClass): symbol {
+  requireClientContract(workflow)
   let token = CLIENT_TOKENS.get(workflow)
   if (!token) {
     token = Symbol(`better-workflows/client/${workflow.name}`)
@@ -199,7 +318,9 @@ export function getWorkflowToken(workflow: WorkflowClass): symbol {
  * }
  * ```
  */
-export function InjectWorkflow(workflow: WorkflowClass): ParameterDecorator & PropertyDecorator {
+export function InjectWorkflow(
+  workflow: WorkflowContractClass
+): ParameterDecorator & PropertyDecorator {
   return Inject(getWorkflowToken(workflow))
 }
 

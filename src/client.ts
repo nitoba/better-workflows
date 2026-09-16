@@ -7,7 +7,7 @@ import type {
   CancelOptions,
   SignalDeliveryOptions,
   SignalDefinition,
-  WorkflowClass,
+  WorkflowContractClass,
   WorkflowInput,
   WorkflowOutput
 } from './types'
@@ -20,7 +20,7 @@ import { decode, milliseconds } from './internal/values'
  * Use `WorkflowClient<typeof MyWorkflow>`; no Effect types are needed in application code.
  * @typeParam W - Decorated workflow constructor.
  */
-export class WorkflowClient<W extends WorkflowClass> {
+export class WorkflowClient<W extends WorkflowContractClass> {
   /**
    * Constructed by WorkflowsModule.forFeature; application code should use Nest injection.
    * @param runtime - Library-owned client backend.
@@ -81,7 +81,7 @@ export class WorkflowClient<W extends WorkflowClass> {
  * and does not need to remain alive for the workflow to progress.
  * @typeParam W - Workflow constructor determining the successful result type.
  */
-export class WorkflowHandle<W extends WorkflowClass> {
+export class WorkflowHandle<W extends WorkflowContractClass> {
   /**
    * Constructed by WorkflowClient; prefer start/getHandle in application code.
    * @param runtime - Library-owned client backend.

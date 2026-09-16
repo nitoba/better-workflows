@@ -1,4 +1,4 @@
-import { defineQueue, Activities, Activity, Workflow } from 'better-workflows'
+import { defineQueue, Activities, Activity, Workflow, WorkflowContract } from 'better-workflows'
 import { z } from 'zod'
 
 const input = z.object({ index: z.number().int(), tenant: z.string() })
@@ -45,6 +45,14 @@ export class Child {
   }
 }
 Workflow({ name: 'advanced-child', version: 1, input, output: z.number() })(Child)
+export class BatchWorkflow {}
+WorkflowContract({
+  name: 'advanced-batch',
+  version: 1,
+  input: z.string(),
+  output: z.array(z.number()),
+  idempotencyKey: (id) => id
+})(BatchWorkflow)
 export class Batch {
   async run(id, ctx) {
     return ctx.map(
@@ -55,13 +63,7 @@ export class Batch {
     )
   }
 }
-Workflow({
-  name: 'advanced-batch',
-  version: 1,
-  input: z.string(),
-  output: z.array(z.number()),
-  idempotencyKey: (id) => id
-})(Batch)
+Workflow(BatchWorkflow)(Batch)
 export const queues = [
   { queue: defineQueue('shared'), concurrency: 4, globalConcurrency: 2, perKeyConcurrency: 1 }
 ]
