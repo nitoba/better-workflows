@@ -47,7 +47,7 @@ The checker discovers the five typed package entry points from `package.json`. I
 4. Extracts every TypeScript `@example` and compiles it as a strict NodeNext consumer
    of the package exports. Temporary files are removed even on failure.
 
-`bun run check` and the quality job run this verification after the build. No extra
+`bun run check` and a dedicated documentation CI job run this verification after the build. No extra
 production dependency or generated API website is introduced. The checker uses the
 locked TypeScript 7 development API; its synchronous pipe transport runs under Node
 (the `docs:check` script handles this). Updating TypeScript requires validating this

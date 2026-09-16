@@ -25,7 +25,7 @@ jobs:
       - run: bun run typecheck
       - run: bun run format:check
       - run: bun test
-      - run: bun run build && bun run docs:check && bun run publint
+      - run: bun run build && bun run publint
       - name: Run report example
         run: bun run example ci-report --approve
         env:
@@ -49,6 +49,23 @@ jobs:
             bun.lock
             manifest.txt
           retention-days: 1
+  documentation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.2'
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      - run: bun run docs:check
+      - run: bun run lint
   package:
     runs-on: ubuntu-latest
     timeout-minutes: 10
