@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.0-alpha.5
+
+- Optional contract-first workflow declarations with `@WorkflowContract` and `@Workflow(contract)` handlers.
+- Abstract contracts can be shared by client-only producers, orchestrators and child workflows without importing handler implementations.
+- Workflow client typing now infers input/output from abstract contract signatures while preserving the simple decorator API.
+
 ## 0.1.0-alpha.4
 
 - Added queue admission fast paths for queues without distributed limits and per-key-only admission without a global queue-row lock.
