@@ -33,7 +33,7 @@ test('standalone migration status/validate are read-only; run creates all schema
     const db = new Database(filename)
     expect(db.query("SELECT name FROM sqlite_master WHERE type='table'").all()).toEqual([])
     const migrated = await admin.migrations.run()
-    expect(migrated.journal.applied).toEqual([1, 2, 3])
+    expect(migrated.journal.applied).toEqual([1, 2, 3, 4])
     expect(migrated.cluster.applied).toEqual([1, 2, 3])
     expect(migrated.queue.applied).toEqual([1, 2])
     expect((await admin.migrations.validate()).valid).toBe(true)
@@ -84,7 +84,7 @@ test('version 1 migration preserves command identities and timer protocol, and r
     db.exec(`DROP TABLE better_workflows_commands;
       CREATE TABLE better_workflows_commands(execution_id TEXT NOT NULL,step_id TEXT NOT NULL,ordinal INTEGER NOT NULL,signature TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'scheduled',PRIMARY KEY(execution_id,step_id),UNIQUE(execution_id,ordinal));
       INSERT INTO better_workflows_commands VALUES('old-run','sleep',0,'old-signature','scheduled');
-      DELETE FROM better_workflows_schema WHERE version IN (2, 3);`)
+      DELETE FROM better_workflows_schema WHERE version IN (2, 3, 4);`)
     db.exec(`DROP TABLE better_workflows_waits;
       CREATE TABLE better_workflows_waits(execution_id TEXT NOT NULL,step_id TEXT NOT NULL,signal_name TEXT NOT NULL,deadline DOUBLE PRECISION,state TEXT NOT NULL DEFAULT 'pending',result_json TEXT,delivered INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(execution_id,step_id));`)
     for (const table of [
@@ -98,7 +98,7 @@ test('version 1 migration preserves command identities and timer protocol, and r
       'tombstones'
     ])
       db.exec(`DROP TABLE better_workflows_${table}`)
-    expect((await admin.migrations.status()).journal.pending).toEqual([2, 3])
+    expect((await admin.migrations.status()).journal.pending).toEqual([2, 3, 4])
     await expect(admin.migrations.validate()).rejects.toMatchObject({ code: 'MIGRATIONS_REQUIRED' })
     await admin.migrations.run()
     expect(
@@ -118,7 +118,7 @@ test('version 1 migration preserves command identities and timer protocol, and r
       }
     ])
     db.exec(
-      'DELETE FROM better_workflows_schema WHERE version IN (2, 3); DROP TABLE better_workflows_claims'
+      'DELETE FROM better_workflows_schema WHERE version IN (2, 3, 4); DROP TABLE better_workflows_claims'
     )
     await expect(admin.migrations.run()).rejects.toMatchObject({ code: 'SCHEMA_CORRUPT' })
     expect(

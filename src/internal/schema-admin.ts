@@ -31,6 +31,13 @@ const required = {
   better_workflows_events: ['execution_id', 'sequence', 'at'],
   better_workflows_signals: ['execution_id', 'event_key', 'consumed_by'],
   better_workflows_waits: ['execution_id', 'step_id', 'deadline', 'delivered', 'wake_requested'],
+  better_workflows_reconciliations: [
+    'execution_id',
+    'namespace',
+    'result_json',
+    'failure_json',
+    'delivered'
+  ],
   better_workflows_retries: ['execution_id', 'step_id', 'attempt', 'deadline'],
   better_workflows_claims: ['execution_id', 'step_id', 'owner_token', 'lease_until', 'state'],
   better_workflows_branches: ['execution_id', 'group_id', 'branch_key', 'ordinal', 'state'],
@@ -79,7 +86,7 @@ export function migrationStatus(sql: SqlClient.SqlClient) {
     const cluster = yield* applied('cluster_migrations', 'migration_id')
     const queue = yield* applied('better_workflows_queue_migrations', 'migration_id')
     for (const [name, versions, expected] of [
-      ['journal', journal, 3],
+      ['journal', journal, 4],
       ['cluster', cluster, 3],
       ['queue', queue, 2]
     ] as const) {
@@ -108,12 +115,12 @@ export function migrationStatus(sql: SqlClient.SqlClient) {
       Array.from({ length: count }, (_, i) => i + 1).filter((value) => !values.includes(value))
     const status: MigrationStatus = {
       engine: ENGINE_VERSION,
-      journal: { applied: journal, pending: pending(journal, 3) },
+      journal: { applied: journal, pending: pending(journal, 4) },
       cluster: { applied: cluster, pending: pending(cluster, 3) },
       queue: { applied: queue, pending: pending(queue, 2) },
       missing,
       valid:
-        journal.length === 3 && cluster.length === 3 && queue.length === 2 && missing.length === 0
+        journal.length === 4 && cluster.length === 3 && queue.length === 2 && missing.length === 0
     }
     return status
   })

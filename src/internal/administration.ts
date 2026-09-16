@@ -23,7 +23,8 @@ const tables = [
   'sagas',
   'compensations',
   'timers',
-  'permits'
+  'permits',
+  'reconciliations'
 ]
 
 /** Preview is read-only; apply revalidates and locks each candidate in one transaction. */
@@ -57,6 +58,9 @@ export class SqlAdministration {
       const queued =
         yield* sql`SELECT id FROM better_workflows_queue WHERE ${self.queuePayload()}=${run.execution_id} AND acquired_by IS NOT NULL LIMIT 1`
       if (queued.length) return 'unacknowledged-queue-delivery'
+      const reconciliation = yield* sql`SELECT execution_id FROM better_workflows_reconciliations
+          WHERE execution_id=${run.execution_id} AND namespace=${self.journal.namespace} AND delivered=0 LIMIT 1`
+      if (reconciliation.length) return 'pending-reconciliation'
       const entity = `Workflow/${workflowDefinition(self.journal.namespace, run.workflow_name, run.version)._tag}`
       const messages =
         yield* sql`SELECT id FROM cluster_messages WHERE entity_id=${run.execution_id}

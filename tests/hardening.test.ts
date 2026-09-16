@@ -41,6 +41,31 @@ test('an unawaited durable wait fails rather than leaving a falsely suspended ex
   }
 })
 
+test('dispatcher does not poll dormant executions on every flush', async () => {
+  // oxlint-disable-next-line typescript/unbound-method -- Restore the instrumented prototype method after this test.
+  const original = Journal.prototype.activeAfter
+  let sweeps = 0
+  Journal.prototype.activeAfter = function (cursor) {
+    sweeps++
+    return original.call(this, cursor)
+  }
+  const app = await testApp(Hold)
+  try {
+    const handle = await app.client.start({ id: 'dormant' })
+    await eventually(
+      () => handle.describe(),
+      (snapshot) => snapshot.status === 'waiting'
+    )
+    const runtime = app.module.get(WorkflowsRuntime)
+    await runtime.flush()
+    await runtime.flush()
+    expect(sweeps).toBe(0)
+  } finally {
+    Journal.prototype.activeAfter = original
+    await app.close()
+  }
+})
+
 @Workflow({ name: 'duplicate', version: 1, input: Input, output: z.string() })
 class Duplicate {
   catches = 0

@@ -42,6 +42,7 @@ type Services =
   | PersistedQueue.PersistedQueueFactory
   | SqlClient.SqlClient
 const terminal = (row: RunRow) => ['completed', 'failed', 'cancelled'].includes(row.state)
+const safetySweepInterval = 60_000
 
 @Injectable()
 export class WorkflowsRuntime
@@ -55,7 +56,8 @@ export class WorkflowsRuntime
   private ready = false
   private stopping = false
   private stopPromise?: Promise<void>
-  private dispatchCursor = ''
+  private safetySweepCursor = ''
+  private safetySweepAt = Date.now() + safetySweepInterval
   private readonly dispatchLock = Semaphore.makeUnsafe(1)
   private lastDispatchError: string | undefined
 
@@ -108,7 +110,7 @@ export class WorkflowsRuntime
           await infrastructure.runPromise(
             Scope.provide(
               engine.register(workflow.definition, (payload, id) =>
-                this.execute(workflow, payload.input, id).pipe(
+                this.executeAndEnqueue(workflow, payload.input, id).pipe(
                   workflowSlots.withPermits(1),
                   (effect) => (featureLimit ? featureLimit.withPermits(1)(effect) : effect)
                 )
@@ -240,11 +242,7 @@ export class WorkflowsRuntime
   }
 
   async describe(workflow: WorkflowClass, id: string): Promise<ExecutionSnapshot> {
-    let row = await this.row(workflow, id)
-    if (!terminal(row) && row.dispatched) {
-      await this.run(this.reconcile(row))
-      row = await this.row(workflow, id)
-    }
+    const row = await this.row(workflow, id)
     const snapshot: ExecutionSnapshot = {
       executionId: row.execution_id,
       workflow: row.workflow_name,
@@ -347,7 +345,25 @@ export class WorkflowsRuntime
     })
   }
 
-  private reconcile(row: RunRow) {
+  private executeAndEnqueue(workflow: RegisteredWorkflow, payload: string, executionId: string) {
+    const self = this
+    return self.execute(workflow, payload, executionId).pipe(
+      Effect.matchCauseEffect({
+        onSuccess: (result) =>
+          durable(self.store().enqueueReconciliation(executionId, result, null)).pipe(
+            Effect.as(result)
+          ),
+        onFailure: (cause) => {
+          if (Cause.hasInterruptsOnly(cause)) return Effect.failCause(cause)
+          return durable(
+            self.store().enqueueReconciliation(executionId, null, toFailure(Cause.squash(cause)))
+          ).pipe(Effect.andThen(Effect.failCause(cause)))
+        }
+      })
+    )
+  }
+
+  private reconcileSweep(row: RunRow) {
     const self = this
     return Effect.gen(function* () {
       const definition = workflowDefinition(self.options.namespace, row.workflow_name, row.version)
@@ -497,6 +513,14 @@ export class WorkflowsRuntime
           yield* definition.resume(row.execution_id)
         yield* journal.dispatched(row)
       }
+      for (const reconciliation of yield* journal.pendingReconciliations()) {
+        yield* journal.complete(
+          reconciliation.execution_id,
+          reconciliation.result_json,
+          reconciliation.failure_json ? decode<Failure>(reconciliation.failure_json) : null
+        )
+        yield* journal.reconciliationDelivered(reconciliation)
+      }
       for (const retry of yield* journal.pendingRetries()) {
         const run = yield* journal.get(retry.execution_id)
         const definition = workflowDefinition(
@@ -541,9 +565,12 @@ export class WorkflowsRuntime
         })
         yield* journal.delivered(wait)
       }
-      const active = yield* journal.activeAfter(self.dispatchCursor)
-      for (const row of active) yield* self.reconcile(row)
-      self.dispatchCursor = active.length === 100 ? active.at(-1)!.execution_id : ''
+      if (Date.now() >= self.safetySweepAt) {
+        const active = yield* journal.activeAfter(self.safetySweepCursor)
+        for (const row of active) yield* self.reconcileSweep(row)
+        self.safetySweepCursor = active.length === 100 ? active.at(-1)!.execution_id : ''
+        self.safetySweepAt = Date.now() + safetySweepInterval
+      }
       self.lastDispatchError = undefined
     }).pipe(this.dispatchLock.withPermits(1))
   }

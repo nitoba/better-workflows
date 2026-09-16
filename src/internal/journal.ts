@@ -54,6 +54,14 @@ export interface RetryRow {
   readonly deadline: number
 }
 
+export interface ReconciliationRow {
+  readonly execution_id: string
+  readonly namespace: string
+  readonly result_json: string | null
+  readonly failure_json: string | null
+  readonly delivered: number
+}
+
 export interface ClaimRow {
   readonly execution_id: string
   readonly step_id: string
@@ -106,7 +114,7 @@ export class Journal {
         const versions = yield* sql<{
           version: number
         }>`SELECT version FROM better_workflows_schema`
-        if (versions.some((row) => row.version > 3)) {
+        if (versions.some((row) => row.version > 4)) {
           return yield* fail(
             'SCHEMA_TOO_NEW',
             'This database was migrated by a newer better-workflows version'
@@ -440,6 +448,30 @@ export class Journal {
           )
       })
     )
+  }
+
+  enqueueReconciliation(executionId: string, result: string | null, failure: Failure | null) {
+    const self = this
+    return this.sql.withTransaction(
+      Effect.gen(function* () {
+        yield* self.lockRun(executionId)
+        yield* self.sql`INSERT INTO better_workflows_reconciliations
+          (execution_id, namespace, result_json, failure_json)
+          VALUES (${executionId}, ${self.namespace}, ${result}, ${failure ? encode(failure) : null})
+          ON CONFLICT(execution_id) DO NOTHING`
+      })
+    )
+  }
+
+  pendingReconciliations() {
+    return this.sql<ReconciliationRow>`SELECT * FROM better_workflows_reconciliations
+      WHERE namespace = ${this.namespace} AND delivered = 0
+      ORDER BY execution_id LIMIT 100`
+  }
+
+  reconciliationDelivered(reconciliation: ReconciliationRow) {
+    return this.sql`UPDATE better_workflows_reconciliations SET delivered = 1
+      WHERE execution_id = ${reconciliation.execution_id} AND namespace = ${this.namespace}`
   }
 
   wait(executionId: string, stepId: string, signalName: string, timeout: number | undefined) {
