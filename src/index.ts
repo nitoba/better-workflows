@@ -70,3 +70,10 @@ export type {
 } from './types'
 
 export { WorkflowsAdmin } from './admin'
+export type {
+  DeadLetter,
+  DeadLetterListOptions,
+  DeadLetterPage,
+  DeadLetterState,
+  DiscardDeadLetterOptions
+} from './admin-types'

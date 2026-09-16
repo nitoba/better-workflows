@@ -10,8 +10,10 @@ import { WORKFLOW_METADATA, ACTIVITIES_METADATA } from '../src/decorators'
 
 export interface TestAppOptions {
   readonly providers?: readonly Type[]
+  readonly activityContracts?: readonly Type[]
   readonly execution?: WorkflowsOptions['execution']
   readonly queues?: WorkflowsOptions['queues']
+  readonly deadLetter?: WorkflowsOptions['deadLetter']
   readonly filename?: string
 }
 
@@ -23,7 +25,9 @@ export async function testApp<W extends WorkflowClass>(workflow: W, options: Tes
     pollInterval: '20ms',
     lease: { duration: '1500ms', refreshInterval: '400ms' }
   }
-  const configured = options.execution ? { ...root, execution: options.execution } : root
+  let configured: WorkflowsOptions = root
+  if (options.execution) configured = { ...configured, execution: options.execution }
+  if (options.deadLetter) configured = { ...configured, deadLetter: options.deadLetter }
   const module = await Test.createTestingModule({
     imports: [
       WorkflowsModule.forRoot(configured),
@@ -40,6 +44,7 @@ export async function testApp<W extends WorkflowClass>(workflow: W, options: Tes
         activities: (options.providers ?? []).filter((provider) =>
           Reflect.hasOwnMetadata(ACTIVITIES_METADATA, provider)
         ),
+        activityContracts: options.activityContracts ?? [],
         providers: (options.providers ?? []).filter(
           (provider) =>
             !Reflect.hasOwnMetadata(WORKFLOW_METADATA, provider) &&

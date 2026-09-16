@@ -23,8 +23,7 @@ import { decode, encode, identifier, milliseconds, validate } from './values'
 import { makeInfrastructure, validateOptions } from './infrastructure'
 import type { Infrastructure } from './infrastructure'
 import { durable, promised } from './effects'
-import { activityQueue, retryDeferred, signalDeferred, workflowDefinition } from './wire'
-import type { EngineQueue } from './wire'
+import { retryDeferred, signalDeferred, workflowDefinition } from './wire'
 import type { AdminBackend } from '../admin-types'
 import { SqlAdministration } from './administration'
 import { migrationStatus, validateMigrations } from './schema-admin'
@@ -35,6 +34,7 @@ import { WORKFLOWS_TEST_CLOCK } from './clock'
 import type { BusinessClock } from './clock'
 import { childDeferred, timerDeferred } from './wire'
 import { activityWorker } from './worker'
+import { ActivityTransport } from './activity-transport'
 
 export const WORKFLOWS_OPTIONS = Symbol.for('better-workflows/options')
 type Services =
@@ -53,7 +53,7 @@ export class WorkflowsRuntime
   readonly registry: Registry
   private infrastructure: Infrastructure | undefined
   private journal: Journal | undefined
-  private readonly queues = new Map<string, EngineQueue>()
+  private activityTransport: ActivityTransport | undefined
   private ready = false
   private stopping = false
   private stopPromise?: Promise<void>
@@ -88,12 +88,12 @@ export class WorkflowsRuntime
         'Register WorkflowsModule.forRoot only once per Nest application'
       )
     this.registry.discover(this.discovery)
-    for (const queue of this.registry.queues.keys()) this.queue(queue)
     const infrastructure = await makeInfrastructure(this.options)
     this.infrastructure = infrastructure
     try {
       const sql = await infrastructure.runPromise(SqlClient.SqlClient)
       this.journal = new Journal(sql, this.options.namespace, this.clock)
+      this.activityTransport = new ActivityTransport(this.journal)
       for (const [name, options] of this.registry.queues.entries())
         await this.run(new Permits(this.journal).register(name, options))
       const workflowSlots = Semaphore.makeUnsafe(
@@ -135,12 +135,13 @@ export class WorkflowsRuntime
           if (activities.length === 0) continue
           infrastructure.runFork(
             activityWorker(
-              this.queue(name),
+              name,
               activities,
               this.journal,
               slots.get(name)!,
               this.options,
-              queue.concurrency
+              queue.concurrency,
+              this.activityTransport!
             )
           )
         }
@@ -167,6 +168,7 @@ export class WorkflowsRuntime
       await infrastructure.dispose()
       this.infrastructure = undefined
       this.journal = undefined
+      this.activityTransport = undefined
       throw error
     }
   }
@@ -293,7 +295,16 @@ export class WorkflowsRuntime
       row.wait_type && row.wait_step
         ? { ...withContinuation, waitingOn: { type: row.wait_type, stepId: row.wait_step } }
         : withContinuation
-    return row.failure_json ? { ...withWait, failure: decode<Failure>(row.failure_json) } : withWait
+    const blocked =
+      row.state === 'blocked'
+        ? await this.run(
+            new ActivityTransport(this.store()).deadLetters.blockedOn(row.execution_id)
+          )
+        : null
+    const withBlocked = blocked ? { ...withWait, blockedOn: blocked } : withWait
+    return row.failure_json
+      ? { ...withBlocked, failure: decode<Failure>(row.failure_json) }
+      : withBlocked
   }
 
   async history(workflow: WorkflowContractClass, id: string, after?: number, limit?: number) {
@@ -333,15 +344,10 @@ export class WorkflowsRuntime
     return this.run(this.store().signal(id, signal.name, key, encode(payload)))
   }
 
-  private queue(queue: string): EngineQueue {
+  private queue(queue: string): string {
     if (!this.registry.queues.get(queue))
       throw new WorkflowError('UNKNOWN_QUEUE', `Configure queue ${queue}`)
-    let definition = this.queues.get(queue)
-    if (!definition) {
-      definition = activityQueue(this.options.namespace, queue)
-      this.queues.set(queue, definition)
-    }
-    return definition
+    return queue
   }
 
   private gate(executionId: string) {
@@ -368,7 +374,7 @@ export class WorkflowsRuntime
         workflow,
         executionId,
         () => self.gate(executionId),
-        (activity) => self.queue(activity.options.queue)
+        self.activityTransport!
       )
       const value = yield* interpreter.run((ctx) => workflow.invoke!(input, ctx))
       return yield* promised(async () =>
@@ -431,7 +437,25 @@ export class WorkflowsRuntime
         this.run(new SqlAdministration(this.store()).prune(plan, confirm)),
       setQueueLimits: async (queue, options) => {
         await this.run(new SqlAdministration(this.store()).setQueueLimits(queue, options))
-      }
+      },
+      listDeadLetters: (options) =>
+        this.run(new ActivityTransport(this.store()).deadLetters.list(options)),
+      getDeadLetter: (id, options) =>
+        this.run(
+          new ActivityTransport(this.store()).deadLetters.get(id, options?.includePayload === true)
+        ),
+      requeueDeadLetter: (id) => {
+        const transport = new ActivityTransport(this.store())
+        return this.run(
+          transport.deadLetters.requeue(
+            id,
+            (queue, payload, deliveryId, initialAttempt, deadLetterId) =>
+              transport.offerInTransaction(queue, payload, deliveryId, initialAttempt, deadLetterId)
+          )
+        )
+      },
+      discardDeadLetter: (id, options) =>
+        this.run(new ActivityTransport(this.store()).deadLetters.discard(id, options))
     }
   }
 
@@ -523,6 +547,11 @@ export class WorkflowsRuntime
           row.workflow_name,
           row.version
         )
+        if (row.state === 'failed' && row.control === 'cancel') {
+          if (row.dispatched) yield* definition.interrupt(row.execution_id)
+          yield* journal.dispatched(row)
+          continue
+        }
         if (row.control === 'cancel') {
           if (row.dispatched) yield* definition.interrupt(row.execution_id)
           yield* journal.complete(

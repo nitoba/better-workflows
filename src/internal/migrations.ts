@@ -1,7 +1,7 @@
 import { Effect } from 'effect'
 import type { SqlClient } from 'effect/unstable/sql/SqlClient'
 
-export const JOURNAL_VERSION = 5
+export const JOURNAL_VERSION = 6
 export const ENGINE_VERSION = '4.0.0-rc.115'
 
 /** All DDL is transactional on the supported PostgreSQL and SQLite adapters. */
@@ -112,6 +112,74 @@ export function migrateAdvanced(sql: SqlClient) {
       yield* sql`CREATE INDEX IF NOT EXISTS better_workflows_chain
         ON better_workflows_runs(namespace, chain_id, generation)`
       yield* sql`INSERT INTO better_workflows_schema(version) VALUES (5)`
+    }
+    if (!versions.some((row) => row.version === 6)) {
+      yield* sql.onDialectOrElse({
+        pg: () => sql`CREATE TABLE IF NOT EXISTS better_workflows_activity_deliveries (
+          sequence BIGSERIAL PRIMARY KEY,
+          namespace TEXT NOT NULL,
+          queue_name TEXT NOT NULL,
+          delivery_id TEXT NOT NULL,
+          execution_id TEXT,
+          payload_json TEXT NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          state TEXT NOT NULL DEFAULT 'pending',
+          visible_at DOUBLE PRECISION NOT NULL,
+          acquired_at DOUBLE PRECISION,
+          acquired_by TEXT,
+          last_failure TEXT,
+          dead_letter_id TEXT,
+          created_at DOUBLE PRECISION NOT NULL,
+          updated_at DOUBLE PRECISION NOT NULL,
+          UNIQUE(namespace, queue_name, delivery_id)
+        )`,
+        orElse: () => sql`CREATE TABLE IF NOT EXISTS better_workflows_activity_deliveries (
+          sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+          namespace TEXT NOT NULL,
+          queue_name TEXT NOT NULL,
+          delivery_id TEXT NOT NULL,
+          execution_id TEXT,
+          payload_json TEXT NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          state TEXT NOT NULL DEFAULT 'pending',
+          visible_at DOUBLE PRECISION NOT NULL,
+          acquired_at DOUBLE PRECISION,
+          acquired_by TEXT,
+          last_failure TEXT,
+          dead_letter_id TEXT,
+          created_at DOUBLE PRECISION NOT NULL,
+          updated_at DOUBLE PRECISION NOT NULL,
+          UNIQUE(namespace, queue_name, delivery_id)
+        )`
+      })
+      yield* sql`CREATE INDEX IF NOT EXISTS better_workflows_activity_delivery_take
+        ON better_workflows_activity_deliveries(namespace, queue_name, state, visible_at, sequence)`
+      yield* sql`CREATE TABLE IF NOT EXISTS better_workflows_dead_letters (
+        id TEXT PRIMARY KEY,
+        namespace TEXT NOT NULL,
+        queue_name TEXT NOT NULL,
+        delivery_id TEXT NOT NULL,
+        execution_id TEXT,
+        step_id TEXT,
+        activity_name TEXT,
+        activity_version INTEGER,
+        business_attempt INTEGER,
+        delivery_attempt INTEGER NOT NULL,
+        reason_code TEXT NOT NULL,
+        reason_message TEXT NOT NULL,
+        first_failed_at DOUBLE PRECISION NOT NULL,
+        updated_at DOUBLE PRECISION NOT NULL,
+        requeue_count INTEGER NOT NULL DEFAULT 0,
+        state TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        discard_reason TEXT,
+        UNIQUE(namespace, delivery_id)
+      )`
+      yield* sql`CREATE INDEX IF NOT EXISTS better_workflows_dead_letter_list
+        ON better_workflows_dead_letters(namespace, state, id)`
+      yield* sql`CREATE INDEX IF NOT EXISTS better_workflows_dead_letter_execution
+        ON better_workflows_dead_letters(namespace, execution_id, state)`
+      yield* sql`INSERT INTO better_workflows_schema(version) VALUES (6)`
     }
   })
 }

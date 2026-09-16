@@ -1053,6 +1053,11 @@ export interface WorkflowsOptions {
     /** Positive renewal interval, no greater than duration / 3. @defaultValue "10s" */
     readonly refreshInterval: Duration
   }
+  /** Delivery failures that are not business failures are retained for administration. */
+  readonly deadLetter?: {
+    /** Maximum transport deliveries before an unhandled delivery is dead-lettered. @defaultValue 10 */
+    readonly maxDeliveryAttempts?: number
+  }
 }
 
 /**
@@ -1084,6 +1089,7 @@ export interface WorkflowsAsyncOptions extends Pick<ModuleMetadata, 'imports'> {
  * Observable lifecycle state, not a worker-delivery or progress-percentage value.
  * accepted: persisted, awaiting dispatch; running: interpreter advancing; waiting:
  * one or more durable commands pending; paused: cooperative pause requested;
+ * blocked: an operational activity dependency needs an administrator;
  * cancelling: cancellation being reconciled; continued: this execution was
  * replaced by a next generation; completed/failed/cancelled: terminal.
  */
@@ -1092,6 +1098,7 @@ export type ExecutionStatus =
   | 'running'
   | 'waiting'
   | 'paused'
+  | 'blocked'
   | 'cancelling'
   | 'continued'
   | 'completed'
@@ -1149,6 +1156,21 @@ export interface ExecutionSnapshot {
     readonly type: string
     /** Scoped ID of the observed command. */
     readonly stepId: string
+  }
+  /** Operational activity dependency preventing progress; not a terminal failure. */
+  readonly blockedOn?: {
+    /** Dependency category; currently always `activity`. */
+    readonly type: 'activity'
+    /** Dead-letter record requiring operator action. */
+    readonly deadLetterId: string
+    /** Durable activity command step waiting for recovery. */
+    readonly stepId: string
+    /** Registered activity contract name, when it could be decoded. */
+    readonly activity: string | null
+    /** Registered activity contract version, when it could be decoded. */
+    readonly version: number | null
+    /** Logical queue containing the blocked delivery. */
+    readonly queue: string
   }
   /**
    * Serializable failure when one has been recorded; absent on success.

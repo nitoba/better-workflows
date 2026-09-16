@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { Cause, Effect, Exit, Result, Schedule, Clock, Semaphore, Tracer } from 'effect'
+import { Cause, Clock, Effect, Exit, Result, Schema, Semaphore, Tracer } from 'effect'
 import { DurableDeferred } from 'effect/unstable/workflow'
-import { PersistedQueue } from 'effect/unstable/persistence'
 import { ActivityError, WorkflowError, toFailure } from '../errors'
 import { SqlError } from 'effect/unstable/sql/SqlError'
 import type { Failure } from '../errors'
@@ -12,8 +11,9 @@ import { effectClock } from './clock'
 import { durable, promised } from './effects'
 import type { Journal } from './journal'
 import type { RegisteredActivity } from './registry'
+import { ActivityTransport, activityMetadata, type ActivityDelivery } from './activity-transport'
 import { ActivityEnvelopeSchema, activityDeferred } from './wire'
-import type { ActivityEnvelope, EngineQueue } from './wire'
+import type { ActivityEnvelope } from './wire'
 
 class LeaseLost extends Error {
   constructor() {
@@ -29,23 +29,58 @@ class ActivityPermitBlocked extends Error {
   }
 }
 
+class ActivityDeliveryError extends Error {
+  constructor(
+    readonly reasonCode: string,
+    message: string,
+    readonly metadata: ReturnType<typeof activityMetadata>
+  ) {
+    super(message)
+    this.name = 'ActivityDeliveryError'
+  }
+}
+
 const cancelled: Failure = {
   code: 'WORKFLOW_CANCELLED',
   message: 'Workflow cancellation was requested',
   retryable: false
 }
 
+function decodeEnvelope(payload: string): ActivityEnvelope {
+  let value: unknown
+  try {
+    value = JSON.parse(payload)
+  } catch {
+    throw new ActivityDeliveryError(
+      'PAYLOAD_DECODE_FAILED',
+      'The persisted activity payload is not valid JSON',
+      activityMetadata(payload)
+    )
+  }
+  try {
+    return Schema.decodeUnknownSync(ActivityEnvelopeSchema)(value)
+  } catch {
+    throw new ActivityDeliveryError(
+      'INVALID_ACTIVITY_ENVELOPE',
+      'The persisted activity envelope does not match the supported protocol',
+      activityMetadata(payload)
+    )
+  }
+}
+
 export function activityWorker(
-  queueDefinition: EngineQueue,
+  queue: string,
   activities: readonly RegisteredActivity[],
   journal: Journal,
   semaphore: Semaphore.Semaphore,
   options: WorkflowsOptions,
-  concurrency: number
+  concurrency: number,
+  transport: ActivityTransport
 ) {
   const lease = milliseconds(options.lease?.duration ?? '30s')
   const refresh = milliseconds(options.lease?.refreshInterval ?? '10s')
   const poll = Math.min(milliseconds(options.pollInterval ?? '100ms'), refresh)
+  const maxDeliveryAttempts = options.deadLetter?.maxDeliveryAttempts ?? 10
   const permits = new Permits(journal)
   const activitiesByIdentity = new Map(
     activities.map((activity) => [
@@ -53,8 +88,13 @@ export function activityWorker(
       activity
     ])
   )
+  const activityNames = new Set(activities.map((activity) => activity.options.name))
 
-  const execute = (activity: RegisteredActivity, payload: ActivityEnvelope, delivery: number) =>
+  const execute = (
+    activity: RegisteredActivity,
+    payload: ActivityEnvelope,
+    delivery: ActivityDelivery
+  ) =>
     Effect.gen(function* () {
       const run = yield* durable(journal.get(payload.executionId))
       if (
@@ -64,11 +104,9 @@ export function activityWorker(
         return Exit.fail(cancelled)
       const owner = randomUUID()
       const claim = yield* durable(
-        permits.claim(activity.options.queue, payload, delivery, owner, lease)
+        permits.claim(activity.options.queue, payload, delivery.deliveryAttempt, owner, lease)
       )
-      // A blocked delivery must leave the queue callback so another item can
-      // be admitted. PersistedQueue retries this transport failure without
-      // turning it into the activity's business result.
+      // A blocked delivery is released without changing its transport attempt.
       if (claim === 'blocked') return yield* Effect.fail(new ActivityPermitBlocked())
       if (claim === 'closed') return Exit.fail(cancelled)
       if (claim === 'stale') return yield* Effect.fail(new LeaseLost())
@@ -101,7 +139,6 @@ export function activityWorker(
             const exit = await Effect.runPromiseExit(journal.heartbeat(owned, details))
             if (Exit.isFailure(exit)) {
               const error = Cause.squash(exit.cause)
-              // Preserve infrastructure identity: the worker must NACK this delivery.
               if (error instanceof SqlError) throw error
               throw new ActivityError(toFailure(error))
             }
@@ -155,7 +192,7 @@ export function activityWorker(
               owned,
               result,
               failure,
-              payload.attempt < payload.maxAttempts ? payload.retryDelayMs : undefined
+              failure && payload.attempt < payload.maxAttempts ? payload.retryDelayMs : undefined
             )
           ))
         )
@@ -164,60 +201,93 @@ export function activityWorker(
       }).pipe(semaphore.withPermits(1))
     }).pipe(Effect.scoped)
 
-  return Effect.gen(function* () {
-    const queue = yield* PersistedQueue.make({
-      name: queueDefinition.name,
-      schema: ActivityEnvelopeSchema,
-      // Business retries have their own durable attempt identity. Infrastructure
-      // redelivery is not silently dead-lettered after an arbitrary 10 crashes.
-      maxAttempts: 2_147_483_647,
-      // A process may own only part of a shared queue in distributed mode. An
-      // envelope for another owner must become visible to that owner promptly.
-      retrySchedule: Schedule.spaced(poll)
-    })
-    const worker = queue
-      .take((item, metadata) => {
-        const activity = activitiesByIdentity.get(
-          JSON.stringify([item.activityName, item.activityVersion])
-        )
-        if (!activity)
-          return Effect.fail(
-            new WorkflowError(
-              'ACTIVITY_NOT_AVAILABLE',
-              `${item.activityName}@${item.activityVersion} is not registered by this worker`
-            )
-          )
-        return execute(activity, item, metadata.attempts).pipe(
-          Effect.flatMap((exit) =>
-            DurableDeferred.done(activityDeferred(item.stepId, item.attempt), {
-              token: item.token,
-              exit
-            })
-          ),
-          Effect.withSpan(
-            `better-workflows/activity/${activity.options.name}@${activity.options.version}`,
-            {
-              parent: Tracer.externalSpan({
-                traceId: item.traceId,
-                spanId: item.spanId,
-                sampled: item.sampled
-              })
-            }
-          )
-        )
+  const process = Effect.gen(function* () {
+    const delivery = yield* durable(transport.take(queue, maxDeliveryAttempts, lease))
+    if (!delivery) {
+      yield* durable(transport.exhausted(queue, maxDeliveryAttempts, lease))
+      yield* Effect.sleep(poll)
+      return
+    }
+    const parsed = yield* Effect.result(
+      Effect.try({
+        try: () => decodeEnvelope(delivery.payload),
+        // SAFETY: the decoder intentionally returns its operational error object through Effect.
+        catch: (error) => error
       })
-      .pipe(
-        Effect.catchCause((cause) => {
-          if (Cause.hasInterruptsOnly(cause)) return Effect.failCause(cause)
-          const error = Cause.findError(cause)
-          if (Result.isSuccess(error) && error.success instanceof ActivityPermitBlocked)
-            return Effect.sleep(poll)
-          return Effect.logWarning('Activity delivery will be retried', Cause.pretty(cause)).pipe(
-            Effect.andThen(Effect.sleep(poll))
-          )
-        }),
-        Effect.forever
+    )
+    if (Result.isFailure(parsed)) {
+      const error = parsed.failure
+      if (error instanceof ActivityDeliveryError)
+        yield* durable(
+          transport.deadLetter(delivery, error.metadata, error.reasonCode, error.message)
+        )
+      else yield* durable(transport.retry(delivery, 'Envelope decode failed', poll))
+      return
+    }
+    const envelope = parsed.success
+    const activity = activitiesByIdentity.get(
+      JSON.stringify([envelope.activityName, envelope.activityVersion])
+    )
+    if (!activity) {
+      const reasonCode = activityNames.has(envelope.activityName)
+        ? 'UNKNOWN_ACTIVITY_VERSION'
+        : 'UNKNOWN_ACTIVITY'
+      yield* durable(
+        transport.deadLetter(
+          delivery,
+          activityMetadata(delivery.payload),
+          reasonCode,
+          `${envelope.activityName}@${envelope.activityVersion} is not registered by this worker`
+        )
       )
-    yield* Effect.replicateEffect(worker, concurrency, { concurrency, discard: true })
+      return
+    }
+    const outcome = yield* Effect.result(
+      execute(activity, envelope, delivery).pipe(
+        Effect.withSpan(
+          `better-workflows/activity/${activity.options.name}@${activity.options.version}`,
+          {
+            parent: Tracer.externalSpan({
+              traceId: envelope.traceId,
+              spanId: envelope.spanId,
+              sampled: envelope.sampled
+            })
+          }
+        )
+      )
+    )
+    if (Result.isFailure(outcome)) {
+      const error = outcome.failure
+      if (error instanceof ActivityPermitBlocked) yield* durable(transport.release(delivery, poll))
+      else
+        yield* durable(
+          transport.retry(
+            delivery,
+            error instanceof Error ? error.message : 'Activity delivery failed',
+            poll
+          )
+        )
+      return
+    }
+    yield* DurableDeferred.done(activityDeferred(envelope.stepId, envelope.attempt), {
+      token: envelope.token,
+      exit: outcome.success
+    })
+    if (!(yield* durable(transport.complete(delivery)))) yield* Effect.fail(new LeaseLost())
   })
+
+  const worker = Effect.gen(function* () {
+    while (true) {
+      yield* process.pipe(
+        Effect.catchCause((cause) =>
+          Cause.hasInterruptsOnly(cause)
+            ? Effect.failCause(cause)
+            : Effect.logWarning('Activity delivery will be retried', Cause.pretty(cause)).pipe(
+                Effect.andThen(Effect.sleep(poll))
+              )
+        )
+      )
+    }
+  })
+  return Effect.replicateEffect(worker, concurrency, { concurrency, discard: true })
 }

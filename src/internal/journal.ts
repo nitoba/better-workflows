@@ -20,6 +20,7 @@ export interface RunRow {
     | 'accepted'
     | 'running'
     | 'waiting'
+    | 'blocked'
     | 'continued'
     | 'completed'
     | 'failed'
@@ -125,7 +126,7 @@ export class Journal {
         const versions = yield* sql<{
           version: number
         }>`SELECT version FROM better_workflows_schema`
-        if (versions.some((row) => row.version > 5)) {
+        if (versions.some((row) => row.version > 6)) {
           return yield* fail(
             'SCHEMA_TOO_NEW',
             'This database was migrated by a newer better-workflows version'
@@ -466,7 +467,9 @@ export class Journal {
   pendingDispatch() {
     return this.sql<RunRow>`SELECT * FROM better_workflows_runs WHERE namespace = ${this.namespace}
       AND (dispatched = 0 OR control_revision > applied_revision) AND control <> 'pause'
-      AND state NOT IN ('continued', 'completed', 'failed', 'cancelled') ORDER BY created_at, execution_id LIMIT 100`
+      AND (state NOT IN ('continued', 'completed', 'failed', 'cancelled')
+        OR (state='failed' AND control='cancel' AND control_revision>applied_revision))
+      ORDER BY created_at, execution_id LIMIT 100`
   }
 
   activeAfter(cursor: string) {
@@ -516,10 +519,18 @@ export class Journal {
   }
 
   running(executionId: string) {
-    return this
-      .sql`UPDATE better_workflows_runs SET state = 'running', wait_type = NULL, wait_step = NULL
-      WHERE execution_id = ${executionId} AND namespace = ${this.namespace}
-      AND state NOT IN ('continued', 'completed', 'failed', 'cancelled')`
+    const self = this
+    return self.sql.withTransaction(
+      Effect.gen(function* () {
+        yield* self.lockRun(executionId)
+        const blocked = yield* self.sql`SELECT id FROM better_workflows_dead_letters
+          WHERE namespace=${self.namespace} AND execution_id=${executionId}
+          AND state IN ('open','requeued') LIMIT 1`
+        yield* self.sql`UPDATE better_workflows_runs SET state = ${blocked.length ? 'blocked' : 'running'}, wait_type = NULL, wait_step = NULL
+          WHERE execution_id = ${executionId} AND namespace = ${self.namespace}
+          AND state NOT IN ('continued', 'completed', 'failed', 'cancelled')`
+      })
+    )
   }
 
   beginCommand(
@@ -533,6 +544,7 @@ export class Journal {
     const self = this
     return self.sql.withTransaction(
       Effect.gen(function* () {
+        yield* self.lockRun(executionId)
         const inserted =
           yield* self.sql`INSERT INTO better_workflows_commands(execution_id, step_id, ordinal, signature, scope, protocol)
         VALUES (${executionId}, ${stepId}, ${ordinal}, ${signature}, ${scope}, 2) ON CONFLICT DO NOTHING RETURNING step_id`
@@ -546,7 +558,10 @@ export class Journal {
         }
         if (inserted.length)
           yield* self.event(executionId, 'command.scheduled', { kind, ordinal, scope }, stepId)
-        yield* self.sql`UPDATE better_workflows_runs SET state = 'waiting', wait_type = ${kind}, wait_step = ${stepId}
+        const blocked = yield* self.sql`SELECT id FROM better_workflows_dead_letters
+          WHERE namespace=${self.namespace} AND execution_id=${executionId}
+          AND state IN ('open','requeued') LIMIT 1`
+        yield* self.sql`UPDATE better_workflows_runs SET state = ${blocked.length ? 'blocked' : 'waiting'}, wait_type = ${kind}, wait_step = ${stepId}
         WHERE execution_id = ${executionId} AND namespace = ${self.namespace}
         AND state NOT IN ('continued', 'completed', 'failed', 'cancelled')`
       })
@@ -557,6 +572,7 @@ export class Journal {
     const self = this
     return self.sql.withTransaction(
       Effect.gen(function* () {
+        yield* self.lockRun(executionId)
         const rows =
           yield* self.sql`UPDATE better_workflows_commands SET state = ${success ? 'completed' : 'failed'}
         WHERE execution_id = ${executionId} AND step_id = ${stepId} AND state = 'scheduled' RETURNING step_id`
@@ -567,7 +583,10 @@ export class Journal {
             null,
             stepId
           )
-        yield* self.sql`UPDATE better_workflows_runs SET state = 'running', wait_type = NULL, wait_step = NULL
+        const blocked = yield* self.sql`SELECT id FROM better_workflows_dead_letters
+          WHERE namespace=${self.namespace} AND execution_id=${executionId}
+          AND state IN ('open','requeued') LIMIT 1`
+        yield* self.sql`UPDATE better_workflows_runs SET state = ${blocked.length ? 'blocked' : 'running'}, wait_type = NULL, wait_step = NULL
         WHERE execution_id = ${executionId} AND namespace = ${self.namespace} AND wait_step = ${stepId}
         AND state NOT IN ('continued', 'completed', 'failed', 'cancelled')`
       })
@@ -592,6 +611,7 @@ export class Journal {
     return self.sql.withTransaction(
       Effect.gen(function* () {
         const state = cancelled ? 'cancelled' : failure ? 'failed' : 'completed'
+        const now = yield* self.now()
         const rows = yield* self.sql`UPDATE better_workflows_runs
         SET state = ${state}, result_json = ${result}, failure_json = ${failure ? encode(failure) : null}, wait_type = NULL, wait_step = NULL
         WHERE execution_id = ${executionId} AND namespace = ${self.namespace}
@@ -602,6 +622,16 @@ export class Journal {
             `workflow.${state}`,
             failure ? { code: failure.code, message: failure.message } : null
           )
+        if (cancelled)
+          yield* self.sql`UPDATE better_workflows_dead_letters
+            SET state='discarded', discard_reason='Owner execution was cancelled', updated_at=${now}
+            WHERE namespace=${self.namespace} AND execution_id=${executionId}
+            AND state IN ('open','requeued')`
+        if (cancelled)
+          yield* self.sql`UPDATE better_workflows_activity_deliveries
+            SET state='failed', acquired_at=NULL, acquired_by=NULL, updated_at=${now}
+            WHERE namespace=${self.namespace} AND execution_id=${executionId}
+            AND state IN ('pending','processing')`
       })
     )
   }

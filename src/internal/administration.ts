@@ -3,9 +3,11 @@ import { Effect } from 'effect'
 import type { Failure } from '../errors'
 import type { QueueOptions } from '../types'
 import type { RetentionOptions, RetentionPlan, RetentionResult } from '../admin-types'
+import type { DeadLetterListOptions, DiscardDeadLetterOptions } from '../admin-types'
 import type { Journal, RunRow } from './journal'
 import { encode, identifier, positiveInteger } from './values'
 import { workflowDefinition } from './wire'
+import { ActivityTransport } from './activity-transport'
 
 const terminal = (run: RunRow) =>
   ['continued', 'completed', 'failed', 'cancelled'].includes(run.state)
@@ -25,20 +27,13 @@ const tables = [
   'compensations',
   'timers',
   'permits',
-  'reconciliations'
+  'reconciliations',
+  'activity_deliveries'
 ]
 
 /** Preview is read-only; apply revalidates and locks each candidate in one transaction. */
 export class SqlAdministration {
   constructor(readonly journal: Journal) {}
-
-  private queuePayload() {
-    const sql = this.journal.sql
-    return sql.onDialectOrElse({
-      pg: () => sql.literal("element::jsonb #>> '{payload,executionId}'"),
-      orElse: () => sql.literal("json_extract(element, '$.payload.executionId')")
-    })
-  }
 
   private reason(run: RunRow) {
     const self = this
@@ -60,12 +55,19 @@ export class SqlAdministration {
       const permits =
         yield* sql`SELECT owner_token FROM better_workflows_permits WHERE execution_id=${run.execution_id} AND lease_until>${now} LIMIT 1`
       if (permits.length) return 'live-concurrency-permit'
-      const queued =
-        yield* sql`SELECT id FROM better_workflows_queue WHERE ${self.queuePayload()}=${run.execution_id} AND acquired_by IS NOT NULL LIMIT 1`
+      const queued = yield* sql`SELECT delivery_id FROM better_workflows_activity_deliveries
+          WHERE namespace=${self.journal.namespace}
+          AND execution_id=${run.execution_id}
+          AND state IN ('pending','processing')
+          LIMIT 1`
       if (queued.length) return 'unacknowledged-queue-delivery'
       const reconciliation = yield* sql`SELECT execution_id FROM better_workflows_reconciliations
           WHERE execution_id=${run.execution_id} AND namespace=${self.journal.namespace} AND delivered=0 LIMIT 1`
       if (reconciliation.length) return 'pending-reconciliation'
+      const deadLetters = yield* sql`SELECT id FROM better_workflows_dead_letters
+        WHERE namespace=${self.journal.namespace} AND execution_id=${run.execution_id}
+        AND state IN ('open','requeued') LIMIT 1`
+      if (deadLetters.length) return 'open-dead-letter'
       const entity = `Workflow/${workflowDefinition(self.journal.namespace, run.workflow_name, run.version)._tag}`
       if (run.state !== 'continued') {
         const messages =
@@ -246,11 +248,12 @@ export class SqlAdministration {
           const entity = `Workflow/${workflowDefinition(self.journal.namespace, run.workflow_name, run.version)._tag}`
           yield* sql`INSERT INTO better_workflows_tombstones(execution_id,namespace,workflow_name,version,dedupe_key,input_hash,state,pruned_at)
           VALUES (${run.execution_id},${run.namespace},${run.workflow_name},${run.version},${run.dedupe_key},${hash(run.input_json)},${run.state},${now})`
-          yield* sql`DELETE FROM better_workflows_queue WHERE ${self.queuePayload()}=${run.execution_id}`
           yield* sql`DELETE FROM cluster_replies WHERE request_id IN (SELECT id FROM cluster_messages WHERE entity_id=${run.execution_id} AND entity_type IN (${entity}, 'Workflow/-/DurableClock'))`
           yield* sql`DELETE FROM cluster_messages WHERE entity_id=${run.execution_id} AND entity_type IN (${entity}, 'Workflow/-/DurableClock')`
           for (const table of tables)
             yield* sql`DELETE FROM ${sql(`better_workflows_${table}`)} WHERE execution_id=${run.execution_id}`
+          yield* sql`DELETE FROM better_workflows_dead_letters
+            WHERE namespace=${self.journal.namespace} AND execution_id=${run.execution_id}`
           yield* sql`DELETE FROM better_workflows_children WHERE parent_id=${run.execution_id} OR child_id=${run.execution_id}`
           yield* sql`DELETE FROM better_workflows_runs WHERE execution_id=${run.execution_id} AND namespace=${self.journal.namespace}`
         }
@@ -298,5 +301,26 @@ export class SqlAdministration {
         ON CONFLICT(namespace,queue_name) DO UPDATE SET global_limit=${options.globalConcurrency ?? null},key_limit=${options.perKeyConcurrency ?? null}`
       })
     )
+  }
+
+  listDeadLetters(options: DeadLetterListOptions = {}) {
+    return new ActivityTransport(this.journal).deadLetters.list(options)
+  }
+
+  getDeadLetter(id: string, includePayload = false) {
+    return new ActivityTransport(this.journal).deadLetters.get(id, includePayload)
+  }
+
+  requeueDeadLetter(id: string) {
+    const transport = new ActivityTransport(this.journal)
+    return transport.deadLetters.requeue(
+      id,
+      (queue, payload, deliveryId, initialAttempt, deadLetterId) =>
+        transport.offerInTransaction(queue, payload, deliveryId, initialAttempt, deadLetterId)
+    )
+  }
+
+  discardDeadLetter(id: string, options: DiscardDeadLetterOptions) {
+    return new ActivityTransport(this.journal).deadLetters.discard(id, options)
   }
 }

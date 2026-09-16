@@ -2,7 +2,6 @@ import { createHash } from 'node:crypto'
 import type { Type } from '@nestjs/common'
 import { Cause, Effect, Exit, Result, Fiber } from 'effect'
 import { SqlClient } from 'effect/unstable/sql'
-import { PersistedQueue } from 'effect/unstable/persistence'
 import { DurableClock, DurableDeferred, Workflow, WorkflowEngine } from 'effect/unstable/workflow'
 import { WorkflowError } from '../errors'
 import type { Failure } from '../errors'
@@ -17,25 +16,23 @@ import type {
 } from '../types'
 import { AdvancedJournal } from './advanced-journal'
 import type { Journal } from './journal'
-import type { Registry, RegisteredWorkflow, ActivityContract } from './registry'
+import type { Registry, RegisteredWorkflow } from './registry'
+import type { ActivityTransport } from './activity-transport'
 import { durable, promised } from './effects'
 import { interpretAsync } from './bridge'
 import type { Dispatcher } from './bridge'
 import { decode, encode, identifier, milliseconds, positiveInteger, validate } from './values'
 import {
-  ActivityEnvelopeSchema,
   activityDeferred,
   childDeferred,
   retryDeferred,
   signalDeferred,
   timerDeferred
 } from './wire'
-import type { EngineQueue } from './wire'
 
 export type WorkflowServices =
   | WorkflowEngine.WorkflowEngine
   | WorkflowEngine.WorkflowInstance
-  | PersistedQueue.PersistedQueueFactory
   | SqlClient.SqlClient
 const failure = (code: string, message: string): Failure => ({ code, message, retryable: false })
 type WorkflowPath = readonly (readonly string[])[]
@@ -51,7 +48,7 @@ export class WorkflowInterpreter {
     readonly workflow: RegisteredWorkflow,
     readonly executionId: string,
     readonly gate: () => Effect.Effect<void, Failure, WorkflowServices>,
-    readonly queue: (activity: ActivityContract) => EngineQueue
+    readonly transport: ActivityTransport
   ) {
     this.advanced = new AdvancedJournal(journal)
   }
@@ -263,12 +260,6 @@ export class WorkflowInterpreter {
                         yield* self.gate()
                         const deferred = activityDeferred(id, attempt)
                         const token = yield* DurableDeferred.token(deferred)
-                        const queue = yield* PersistedQueue.make({
-                          name: self.queue(activity).name,
-                          schema: ActivityEnvelopeSchema,
-                          // Business retries have their own attempt identity.
-                          maxAttempts: 2_147_483_647
-                        })
                         const result = yield* Effect.result(
                           Effect.gen(function* () {
                             yield* Effect.useSpan(
@@ -280,9 +271,10 @@ export class WorkflowInterpreter {
                                 }
                               },
                               (span) =>
-                                queue
+                                self.transport
                                   .offer(
-                                    {
+                                    activity.options.queue,
+                                    JSON.stringify({
                                       token,
                                       activityName: activity.options.name,
                                       activityVersion: activity.options.version,
@@ -301,8 +293,8 @@ export class WorkflowInterpreter {
                                       traceId: span.traceId,
                                       spanId: span.spanId,
                                       sampled: span.sampled
-                                    },
-                                    { id: token }
+                                    }),
+                                    token
                                   )
                                   .pipe(Effect.tapCause(Effect.logWarning), Effect.orDie)
                             )

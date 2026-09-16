@@ -10,7 +10,14 @@ import { SqlAdministration } from './internal/administration'
 import { migrateAll, migrationStatus, validateMigrations } from './internal/schema-admin'
 import { identifier } from './internal/values'
 import { WorkflowError, toFailure } from './errors'
-import type { AdminBackend, AdminOptions, RetentionPlan, RetentionOptions } from './admin-types'
+import type {
+  AdminBackend,
+  AdminOptions,
+  RetentionPlan,
+  RetentionOptions,
+  DeadLetterListOptions,
+  DiscardDeadLetterOptions
+} from './admin-types'
 
 /**
  * Nest backend token used internally to construct WorkflowsAdmin.
@@ -127,6 +134,74 @@ export class WorkflowsAdmin {
     setLimits: (queue: QueueReference, options: Parameters<AdminBackend['setQueueLimits']>[1]) =>
       this.backend.setQueueLimits(queueName(queue), options)
   }
+
+  /** Discover and operate on infrastructure dead letters without exposing payloads by default. */
+  readonly deadLetters = {
+    /**
+     * List bounded dead-letter metadata without returning payloads.
+     * @param options - Optional queue, execution, activity, state and cursor filters.
+     * @returns One page of dead-letter metadata and an optional next cursor.
+     */
+    list: (options?: DeadLetterListOptions) => this.backend.listDeadLetters(options),
+    /**
+     * Read one dead-letter record.
+     * @param id - Stable dead-letter identifier.
+     * @param options - Set `includePayload` deliberately to expose the raw persisted payload.
+     * @returns The requested dead-letter metadata, optionally including its payload.
+     */
+    get: (id: string, options?: { readonly includePayload?: boolean }) =>
+      this.backend.getDeadLetter(id, options),
+    /**
+     * Requeue one dead-letter record transactionally and idempotently.
+     * @param id - Stable dead-letter identifier.
+     * @returns The dead-letter record after the requeue decision.
+     */
+    requeue: (id: string) => this.backend.requeueDeadLetter(id),
+    /**
+     * Discard one dead-letter record and terminate its owner administratively.
+     * @param id - Stable dead-letter identifier.
+     * @param options - Required operator reason for the discard.
+     * @returns The discarded dead-letter metadata.
+     */
+    discard: (id: string, options: DiscardDeadLetterOptions) =>
+      this.backend.discardDeadLetter(id, options)
+  }
+
+  /** Flat aliases for callers that prefer the operation names from the CLI. */
+  /**
+   * List bounded dead-letter metadata without returning payloads.
+   * @param options - Optional queue, execution, activity, state and cursor filters.
+   * @returns One page of dead-letter metadata and an optional next cursor.
+   */
+  listDeadLetters(options?: DeadLetterListOptions) {
+    return this.deadLetters.list(options)
+  }
+  /**
+   * Read one dead-letter record.
+   * @param id - Stable dead-letter identifier.
+   * @param options - Set `includePayload` deliberately to expose the raw persisted payload.
+   * @returns The requested dead-letter metadata, optionally including its payload.
+   */
+  getDeadLetter(id: string, options?: { readonly includePayload?: boolean }) {
+    return this.deadLetters.get(id, options)
+  }
+  /**
+   * Requeue one dead-letter record transactionally and idempotently.
+   * @param id - Stable dead-letter identifier.
+   * @returns The dead-letter record after the requeue decision.
+   */
+  requeueDeadLetter(id: string) {
+    return this.deadLetters.requeue(id)
+  }
+  /**
+   * Discard one dead-letter record and terminate its owner administratively.
+   * @param id - Stable dead-letter identifier.
+   * @param options - Required operator reason for the discard.
+   * @returns The discarded dead-letter metadata.
+   */
+  discardDeadLetter(id: string, options: DiscardDeadLetterOptions) {
+    return this.deadLetters.discard(id, options)
+  }
 }
 /**
  * Administrative service owning a separate connection scope and a close operation.
@@ -206,6 +281,22 @@ export async function createWorkflowsAdmin(
       setQueueLimits: async (queue, settings) => {
         await run(validateMigrations(sql))
         await run(admin.setQueueLimits(queue, settings))
+      },
+      listDeadLetters: async (settings) => {
+        await run(validateMigrations(sql))
+        return run(admin.listDeadLetters(settings))
+      },
+      getDeadLetter: async (id, settings) => {
+        await run(validateMigrations(sql))
+        return run(admin.getDeadLetter(id, settings?.includePayload === true))
+      },
+      requeueDeadLetter: async (id) => {
+        await run(validateMigrations(sql))
+        return run(admin.requeueDeadLetter(id))
+      },
+      discardDeadLetter: async (id, settings) => {
+        await run(validateMigrations(sql))
+        return run(admin.discardDeadLetter(id, settings))
       }
     }
     return new StandaloneWorkflowsAdmin(backend, () => runtime.dispose())
@@ -217,6 +308,11 @@ export async function createWorkflowsAdmin(
 
 export type {
   AdminOptions,
+  DeadLetter,
+  DeadLetterListOptions,
+  DeadLetterPage,
+  DeadLetterState,
+  DiscardDeadLetterOptions,
   MigrationStatus,
   RetentionOptions,
   RetentionPlan,

@@ -49,6 +49,43 @@ const required = {
   better_workflows_sagas: ['execution_id', 'saga_id', 'state'],
   better_workflows_compensations: ['execution_id', 'saga_id', 'step_id', 'ordinal', 'state'],
   better_workflows_timers: ['execution_id', 'step_id', 'deadline', 'delivered'],
+  better_workflows_activity_deliveries: [
+    'sequence',
+    'namespace',
+    'queue_name',
+    'delivery_id',
+    'execution_id',
+    'payload_json',
+    'attempts',
+    'state',
+    'visible_at',
+    'acquired_at',
+    'acquired_by',
+    'last_failure',
+    'dead_letter_id',
+    'created_at',
+    'updated_at'
+  ],
+  better_workflows_dead_letters: [
+    'id',
+    'namespace',
+    'queue_name',
+    'delivery_id',
+    'execution_id',
+    'step_id',
+    'activity_name',
+    'activity_version',
+    'business_attempt',
+    'delivery_attempt',
+    'reason_code',
+    'reason_message',
+    'first_failed_at',
+    'updated_at',
+    'requeue_count',
+    'state',
+    'payload_json',
+    'discard_reason'
+  ],
   better_workflows_limits: ['namespace', 'queue_name', 'global_limit', 'key_limit'],
   better_workflows_permits: ['namespace', 'queue_name', 'key_name', 'owner_token', 'lease_until'],
   better_workflows_tombstones: [
@@ -90,7 +127,7 @@ export function migrationStatus(sql: SqlClient.SqlClient) {
     const cluster = yield* applied('cluster_migrations', 'migration_id')
     const queue = yield* applied('better_workflows_queue_migrations', 'migration_id')
     for (const [name, versions, expected] of [
-      ['journal', journal, 5],
+      ['journal', journal, 6],
       ['cluster', cluster, 3],
       ['queue', queue, 2]
     ] as const) {
@@ -119,12 +156,12 @@ export function migrationStatus(sql: SqlClient.SqlClient) {
       Array.from({ length: count }, (_, i) => i + 1).filter((value) => !values.includes(value))
     const status: MigrationStatus = {
       engine: ENGINE_VERSION,
-      journal: { applied: journal, pending: pending(journal, 5) },
+      journal: { applied: journal, pending: pending(journal, 6) },
       cluster: { applied: cluster, pending: pending(cluster, 3) },
       queue: { applied: queue, pending: pending(queue, 2) },
       missing,
       valid:
-        journal.length === 5 && cluster.length === 3 && queue.length === 2 && missing.length === 0
+        journal.length === 6 && cluster.length === 3 && queue.length === 2 && missing.length === 0
     }
     return status
   })
@@ -191,6 +228,11 @@ export function migrateAll(namespace: string) {
                   'better_workflows_runs.continued_from',
                   'better_workflows_runs.continued_to'
                 ].includes(entry)
+              ) &&
+              !(
+                before.journal.applied.length === 5 &&
+                (entry.startsWith('better_workflows_activity_deliveries') ||
+                  entry.startsWith('better_workflows_dead_letters'))
               )
           )
         )

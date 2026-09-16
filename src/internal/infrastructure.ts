@@ -24,6 +24,7 @@ export function validateOptions(options: WorkflowsOptions): void {
   positiveInteger(options.execution?.workflows?.concurrency ?? 20, 'Workflow concurrency')
   const lease = milliseconds(options.lease?.duration ?? '30s')
   const refresh = milliseconds(options.lease?.refreshInterval ?? '10s')
+  positiveInteger(options.deadLetter?.maxDeliveryAttempts ?? 10, 'maxDeliveryAttempts')
   if (refresh < 1 || lease < refresh * 3) {
     throw new WorkflowError(
       'INVALID_CONFIGURATION',

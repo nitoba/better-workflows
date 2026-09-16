@@ -199,6 +199,34 @@ better-workflows migrations validate
 
 When using the repository rather than an installed package, build it and replace `better-workflows` with `node dist/cli.mjs`. `--help` does not open a database. Namespace is mandatory; the CLI does not guess which application's state to delete.
 
+## Dead-letter administration
+
+Operational activity-delivery failures are separate from business failures. Invalid
+payloads/envelopes, unavailable activity contracts or versions, and exhausted transport
+deliveries are persisted in the application-owned dead-letter store. The owning execution
+appears as `blocked` until an operator restores the deployment and requeues the record, or
+explicitly discards it:
+
+```ts
+const page = await admin.listDeadLetters({ state: 'open', limit: 100 })
+const deadLetter = page.deadLetters[0]
+if (deadLetter) await admin.requeueDeadLetter(deadLetter.id)
+// await admin.discardDeadLetter(deadLetter.id, { reason: 'Retired contract' })
+```
+
+Requeue is transactionally idempotent and preserves the execution, step, business attempt
+and activity idempotency identity. Discard records `WORKFLOW_DEAD_LETTER_DISCARDED` as an
+administrative terminal failure; it does not enter user `catch` blocks or saga compensation.
+List and ordinary get responses omit raw payloads. Use `getDeadLetter(id, { includePayload: true })`
+only for deliberate debugging because payloads may contain sensitive data.
+
+```bash
+better-workflows dead-letters list --state open
+better-workflows dead-letters show <dead-letter-id>
+better-workflows dead-letters requeue <dead-letter-id>
+better-workflows dead-letters discard <dead-letter-id> --reason "Retired contract"
+```
+
 ## Safe retention
 
 ```ts
@@ -215,11 +243,11 @@ better-workflows retention preview --before 2026-01-01T00:00:00.000Z --limit 100
 better-workflows retention prune --plan ./retention-plan.json --confirm
 ```
 
-Preview is read-only, bounded to at most 1000 terminal executions and scoped to the namespace. It does not select active workflows. Active parent/child links, live claims/permits, unacknowledged queue deliveries or unprocessed engine messages block deletion. Cutoffs in the future are rejected. A plan file is created exclusively with restrictive permissions, never overwritten silently.
+Preview is read-only, bounded to at most 1000 terminal executions and scoped to the namespace. It does not select active workflows. Active parent/child links, live claims/permits, unacknowledged activity deliveries, open/requeued dead letters or unprocessed engine messages block deletion. Cutoffs in the future are rejected. A plan file is created exclusively with restrictive permissions, never overwritten silently.
 
 Apply requires an intact plan and rechecks candidate revisions and safety conditions while holding locks. A stale candidate fails the transaction; it is not silently deleted. A plan hash detects accidental edits, **not authorization**: keep admin credentials and application authorization outside untrusted callers.
 
-Successful pruning removes the execution's journal details, queue records and native message/reply records, retaining a compact tombstone with its key and input hash. Restarting a pruned key returns `EXECUTION_PRUNED`; a conflicting payload returns `IDEMPOTENCY_CONFLICT`. Use a new application idempotency key for an intentional new execution. Tombstones are not automatically expired. Retention is not archival/export and does not VACUUM SQLite, shrink PostgreSQL files or delete another application's tables. There is no deletion daemon by default.
+Successful pruning removes the execution's journal details, activity deliveries, dead letters and native message/reply records, retaining a compact tombstone with its key and input hash. Restarting a pruned key returns `EXECUTION_PRUNED`; a conflicting payload returns `IDEMPOTENCY_CONFLICT`. Use a new application idempotency key for an intentional new execution. Tombstones are not automatically expired. Retention is not archival/export and does not VACUUM SQLite, shrink PostgreSQL files or delete another application's tables. There is no deletion daemon by default.
 
 ## Shared queue limits
 

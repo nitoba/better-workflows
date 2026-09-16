@@ -136,6 +136,76 @@ export interface RetentionResult {
    */
   readonly tombstonesRetained: number
 }
+
+/** Operational state of one persisted activity delivery dead letter. */
+export type DeadLetterState = 'open' | 'requeued' | 'resolved' | 'discarded'
+
+/** Metadata retained for an operationally blocked activity delivery. */
+export interface DeadLetter {
+  /** Stable dead-letter identifier. */
+  readonly id: string
+  /** Namespace that owns the delivery. */
+  readonly namespace: string
+  /** Logical activity queue. */
+  readonly queue: string
+  /** Owning workflow execution, when the delivery belongs to one. */
+  readonly executionId: string | null
+  /** Owning workflow step, when the delivery belongs to one. */
+  readonly stepId: string | null
+  /** Activity contract name, when the envelope metadata was available. */
+  readonly activityName: string | null
+  /** Activity contract version, when the envelope metadata was available. */
+  readonly activityVersion: number | null
+  /** Business retry attempt from the persisted envelope. */
+  readonly businessAttempt: number | null
+  /** Transport delivery attempt that failed operationally. */
+  readonly deliveryAttempt: number
+  /** Stable classification of the operational failure. */
+  readonly reasonCode: string
+  /** Bounded operator-facing explanation of the failure. */
+  readonly reasonMessage: string
+  /** Time of the first failure as a UTC ISO 8601 string. */
+  readonly firstFailedAt: string
+  /** Time of the latest administrative state change as a UTC ISO 8601 string. */
+  readonly updatedAt: string
+  /** Number of operator requeues already issued. */
+  readonly requeueCount: number
+  /** Current operational lifecycle state. */
+  readonly state: DeadLetterState
+  /** Returned only when getDeadLetter is called with includePayload: true. */
+  readonly payload?: string
+}
+
+/** Filters and cursor for dead-letter administration. */
+export interface DeadLetterListOptions {
+  /** Restrict results to one logical queue. */
+  readonly queue?: string
+  /** Restrict results to one owning execution. */
+  readonly executionId?: string
+  /** Restrict results to one activity contract name. */
+  readonly activity?: string
+  /** Restrict results to one dead-letter state. */
+  readonly state?: DeadLetterState
+  /** Return records after this stable identifier. */
+  readonly cursor?: string
+  /** Maximum records to return, from 1 through 1000. */
+  readonly limit?: number
+}
+
+/** One bounded page of dead-letter metadata. */
+export interface DeadLetterPage {
+  /** Metadata-only dead-letter records in stable identifier order. */
+  readonly deadLetters: readonly DeadLetter[]
+  /** Cursor for the next bounded page, when more records exist. */
+  readonly nextCursor?: string
+}
+
+/** Explicit operator decision used to terminate a dead-letter owner. */
+export interface DiscardDeadLetterOptions {
+  /** Required operator explanation for terminating the owner. */
+  readonly reason: string
+}
+
 export interface AdminBackend {
   migrationStatus(): Promise<MigrationStatus>
   migrate(): Promise<MigrationStatus>
@@ -146,4 +216,8 @@ export interface AdminBackend {
     queue: string,
     options: Pick<QueueOptions, 'globalConcurrency' | 'perKeyConcurrency'>
   ): Promise<void>
+  listDeadLetters(options?: DeadLetterListOptions): Promise<DeadLetterPage>
+  getDeadLetter(id: string, options?: { readonly includePayload?: boolean }): Promise<DeadLetter>
+  requeueDeadLetter(id: string): Promise<DeadLetter>
+  discardDeadLetter(id: string, options: DiscardDeadLetterOptions): Promise<DeadLetter>
 }

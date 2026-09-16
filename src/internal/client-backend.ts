@@ -25,6 +25,7 @@ export interface ClientBackend {
       | 'accepted'
       | 'running'
       | 'waiting'
+      | 'blocked'
       | 'continued'
       | 'completed'
       | 'failed'

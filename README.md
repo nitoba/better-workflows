@@ -234,6 +234,18 @@ Long-lived workflows can bound their history with `await ctx.continueAsNew(nextI
 
 `maxAttempts` counts total **business attempts**, including the first one. Throw `new ActivityError({ code, message, retryable: true })` to opt into retries. Unexpected exceptions are not assumed transient. A timeout is retryable, subject to the same policy. Attempts and retry deadlines are persisted; failure and the next deadline are committed together. Infrastructure redeliveries do not reset the business attempt counter.
 
+Operational delivery failures are separate from business failures. Invalid or undecodable envelopes, unavailable activity contracts/versions and exhausted transport deliveries are persisted as dead letters instead of retrying forever. The owner is observable as `blocked` and can be recovered after a deployment fix:
+
+```ts
+const page = await admin.listDeadLetters({ state: 'open', limit: 100 })
+const deadLetter = page.deadLetters[0]
+if (deadLetter) await admin.requeueDeadLetter(deadLetter.id)
+// Or explicitly terminate the owner:
+// await admin.discardDeadLetter(deadLetter.id, { reason: 'Contract retired' })
+```
+
+`requeueDeadLetter()` does not create a business attempt: the original `executionId`, `stepId`, idempotency identity and business attempt remain unchanged. Requeue is transactionally idempotent; `discardDeadLetter()` records `WORKFLOW_DEAD_LETTER_DISCARDED` as an administrative terminal failure, outside user `catch`/saga compensation. `listDeadLetters()` returns metadata only. Use `getDeadLetter(id, { includePayload: true })` deliberately when debugging because persisted payloads may contain sensitive data. The equivalent CLI commands are `better-workflows dead-letters list|show|requeue|discard`.
+
 Use `ctx.idempotencyKey` with external providers or your own database uniqueness constraints. It is stable across retries and infrastructure redeliveries of the same step. `ctx.attempt` identifies the business attempt; `ctx.signal` supports cooperative abort and `await ctx.heartbeat(details)` records progress.
 
 **Delivery is at least once.** A crash after an external side effect but before its durable result is stored can repeat that side effect. Fencing protects journal result commits, not remote providers. Never charge, email or mutate external state assuming exactly-once execution.
@@ -276,7 +288,7 @@ For API-only or activity-only processes, set `execution.workflows.enabled: false
 
 ## Structured workflows and operations
 
-The public API also includes durable `ctx.map`, named `ctx.parallel` branches, `ctx.child` / `ctx.startChild`, scoped `ctx.saga` compensation, `WorkflowsTestingModule` with a manual business clock, and `WorkflowsAdmin` / CLI for migrations and retention.
+The public API also includes durable `ctx.map`, named `ctx.parallel` branches, `ctx.child` / `ctx.startChild`, scoped `ctx.saga` compensation, `WorkflowsTestingModule` with a manual business clock, and `WorkflowsAdmin` / CLI for migrations, dead-letter recovery and retention.
 
 ```ts
 const results = await ctx.map(
@@ -301,7 +313,7 @@ See the **[advanced API and operations guide](docs/advanced.md)** for complete e
 
 This remains an alpha. External effects are at least once and must be idempotent. Business failures inside a saga scope trigger its registered compensations; suspension, infrastructure loss and forced cancellation do not masquerade as business failures. Completed saga scopes are committed, not an automatic rollback of any later workflow failure.
 
-Schema migrations can run automatically at bootstrap (`migrations: 'run'`, the default), or be applied separately before starting the application with `migrations: 'validate'`. Retention requires an explicit preview and confirmation, preserves active dependencies and keeps compact idempotency tombstones. There is no background deletion policy by default.
+Schema migrations can run automatically at bootstrap (`migrations: 'run'`, the default), or be applied separately before starting the application with `migrations: 'validate'`. Retention requires an explicit preview and confirmation, preserves active dependencies and keeps compact idempotency tombstones. Open/requeued dead letters protect their owner from retention; resolved, discarded or cancelled-owner records can become eligible. There is no background deletion policy by default.
 
 Scheduling decorators, a visual dashboard and publication automation are outside this release. No npm publication is performed by the development scripts.
 
