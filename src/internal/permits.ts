@@ -4,6 +4,11 @@ import type { QueueOptions } from '../types'
 import type { Journal, ClaimRow } from './journal'
 import type { ActivityEnvelope } from './wire'
 
+type ActivityPermitPayload = Pick<
+  ActivityEnvelope,
+  'executionId' | 'stepId' | 'attempt' | 'concurrencyKey'
+>
+
 interface LimitRow {
   readonly global_limit: number | null
   readonly key_limit: number | null
@@ -37,7 +42,13 @@ export class Permits {
     )
   }
 
-  claim(queue: string, payload: ActivityEnvelope, delivery: number, owner: string, lease: number) {
+  claim(
+    queue: string,
+    payload: ActivityPermitPayload,
+    delivery: number,
+    owner: string,
+    lease: number
+  ) {
     const { sql, namespace } = this.journal
     const self = this
     return sql.withTransaction(

@@ -1,5 +1,5 @@
 import { Schema } from 'effect'
-import { DurableDeferred, DurableQueue, Workflow } from 'effect/unstable/workflow'
+import { DurableDeferred, Workflow } from 'effect/unstable/workflow'
 
 export const FailureSchema = Schema.Struct({
   code: Schema.String,
@@ -21,29 +21,45 @@ export function workflowDefinition(namespace: string, name: string, version: num
 
 export type EngineWorkflow = ReturnType<typeof workflowDefinition>
 
-export function activityQueue(namespace: string, queue: string, name: string, version: number) {
-  return DurableQueue.make({
-    name: `better-workflows/${encodeURIComponent(namespace)}/${encodeURIComponent(queue)}/${encodeURIComponent(name)}/${version}`,
-    payload: {
-      executionId: Schema.String,
-      stepId: Schema.String,
-      name: Schema.String,
-      version: Schema.Number,
-      input: Schema.String,
-      attempt: Schema.Number,
-      timeoutMs: Schema.Number,
-      maxAttempts: Schema.Number,
-      retryDelayMs: Schema.Number,
-      concurrencyKey: Schema.optional(Schema.String)
-    },
-    success: Schema.String,
-    error: FailureSchema,
-    idempotencyKey: (payload) => JSON.stringify([payload.stepId, payload.attempt])
+/** A physical transport queue is owned by better-workflows. */
+export function activityQueue(namespace: string, queue: string) {
+  return Object.freeze({
+    name: `better-workflows/${encodeURIComponent(namespace)}/activities/${encodeURIComponent(queue)}`
   })
 }
 
 export type EngineQueue = ReturnType<typeof activityQueue>
-export type ActivityEnvelope = EngineQueue['payloadSchema']['Type']
+
+/**
+ * Application-owned activity transport. The input remains canonically encoded
+ * because a physical queue may contain different activity schemas.
+ */
+export const ActivityEnvelopeSchema = Schema.Struct({
+  token: DurableDeferred.Token,
+  activityName: Schema.String,
+  activityVersion: Schema.Number,
+  executionId: Schema.String,
+  stepId: Schema.String,
+  input: Schema.String,
+  attempt: Schema.Number,
+  timeoutMs: Schema.Number,
+  maxAttempts: Schema.Number,
+  retryDelayMs: Schema.Number,
+  concurrencyKey: Schema.optional(Schema.String),
+  traceId: Schema.String,
+  spanId: Schema.String,
+  sampled: Schema.Boolean
+})
+
+export type ActivityEnvelope = typeof ActivityEnvelopeSchema.Type
+
+/** The deferred is unique per workflow step and business retry attempt. */
+export function activityDeferred(stepId: string, attempt: number) {
+  return DurableDeferred.make(
+    `better-workflows/activity/${encodeURIComponent(stepId)}/${attempt}`,
+    { success: Schema.String, error: FailureSchema }
+  )
+}
 
 export function signalDeferred(stepId: string) {
   return DurableDeferred.make(`better-workflows/signal/${encodeURIComponent(stepId)}`, {

@@ -16,7 +16,7 @@ import type {
   WorkflowsOptions
 } from '../types'
 import { Registry } from './registry'
-import type { ActivityContract, RegisteredWorkflow } from './registry'
+import type { RegisteredWorkflow } from './registry'
 import { Journal } from './journal'
 import type { RunRow } from './journal'
 import { decode, encode, identifier, milliseconds, validate } from './values'
@@ -86,7 +86,7 @@ export class WorkflowsRuntime
         'Register WorkflowsModule.forRoot only once per Nest application'
       )
     this.registry.discover(this.discovery)
-    for (const activity of this.registry.activities.values()) this.queue(activity)
+    for (const queue of this.registry.queues.keys()) this.queue(queue)
     const infrastructure = await makeInfrastructure(this.options)
     this.infrastructure = infrastructure
     try {
@@ -126,16 +126,19 @@ export class WorkflowsRuntime
             Semaphore.makeUnsafe(queue.concurrency)
           ])
         )
-        for (const activity of this.registry.activities.values()) {
-          if (!activity.enabled) continue
+        for (const [name, queue] of this.registry.queues) {
+          const activities = [...this.registry.activities.values()].filter(
+            (activity) => activity.enabled && activity.options.queue === name
+          )
+          if (activities.length === 0) continue
           infrastructure.runFork(
             activityWorker(
-              this.queue(activity),
-              activity,
+              this.queue(name),
+              activities,
               this.journal,
-              slots.get(activity.options.queue)!,
+              slots.get(name)!,
               this.options,
-              this.registry.queues.get(activity.options.queue)!.concurrency
+              queue.concurrency
             )
           )
         }
@@ -301,20 +304,13 @@ export class WorkflowsRuntime
     return this.run(this.store().signal(id, signal.name, key, encode(payload)))
   }
 
-  private queue(activity: ActivityContract): EngineQueue {
-    const { name, version, queue } = activity.options
+  private queue(queue: string): EngineQueue {
     if (!this.registry.queues.get(queue))
-      throw new WorkflowError('UNKNOWN_QUEUE', `Configure queue ${queue} used by ${name}`)
-    if (this.registry.queues.get(queue)?.perKeyConcurrency !== undefined && !activity.options.key)
-      throw new WorkflowError(
-        'ACTIVITY_KEY_REQUIRED',
-        `${name} must declare key for queue ${queue}`
-      )
-    const key = JSON.stringify([name, version, queue])
-    let definition = this.queues.get(key)
+      throw new WorkflowError('UNKNOWN_QUEUE', `Configure queue ${queue}`)
+    let definition = this.queues.get(queue)
     if (!definition) {
-      definition = activityQueue(this.options.namespace, queue, name, version)
-      this.queues.set(key, definition)
+      definition = activityQueue(this.options.namespace, queue)
+      this.queues.set(queue, definition)
     }
     return definition
   }
@@ -343,7 +339,7 @@ export class WorkflowsRuntime
         workflow,
         executionId,
         () => self.gate(executionId),
-        (activity) => self.queue(activity)
+        (activity) => self.queue(activity.options.queue)
       )
       const value = yield* interpreter.run((ctx) => workflow.handler!(input, ctx))
       return yield* promised(async () =>

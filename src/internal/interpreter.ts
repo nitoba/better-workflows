@@ -3,13 +3,7 @@ import type { Type } from '@nestjs/common'
 import { Cause, Effect, Exit, Result, Fiber } from 'effect'
 import { SqlClient } from 'effect/unstable/sql'
 import { PersistedQueue } from 'effect/unstable/persistence'
-import {
-  DurableClock,
-  DurableDeferred,
-  DurableQueue,
-  Workflow,
-  WorkflowEngine
-} from 'effect/unstable/workflow'
+import { DurableClock, DurableDeferred, Workflow, WorkflowEngine } from 'effect/unstable/workflow'
 import { WorkflowError } from '../errors'
 import type { Failure } from '../errors'
 import type {
@@ -28,7 +22,14 @@ import { durable, promised } from './effects'
 import { interpretAsync } from './bridge'
 import type { Dispatcher } from './bridge'
 import { decode, encode, identifier, milliseconds, positiveInteger, validate } from './values'
-import { childDeferred, retryDeferred, signalDeferred, timerDeferred } from './wire'
+import {
+  ActivityEnvelopeSchema,
+  activityDeferred,
+  childDeferred,
+  retryDeferred,
+  signalDeferred,
+  timerDeferred
+} from './wire'
 import type { EngineQueue } from './wire'
 
 export type WorkflowServices =
@@ -221,25 +222,55 @@ export class WorkflowInterpreter {
                         )
                       for (let attempt = 1; attempt <= retry.maxAttempts; attempt++) {
                         yield* self.gate()
+                        const deferred = activityDeferred(id, attempt)
+                        const token = yield* DurableDeferred.token(deferred)
+                        const queue = yield* PersistedQueue.make({
+                          name: self.queue(activity).name,
+                          schema: ActivityEnvelopeSchema,
+                          // Business retries have their own attempt identity.
+                          maxAttempts: 2_147_483_647
+                        })
                         const result = yield* Effect.result(
-                          DurableQueue.process(self.queue(activity), {
-                            executionId: self.executionId,
-                            stepId: id,
-                            name: activity.options.name,
-                            version: activity.options.version,
-                            input: encoded,
-                            attempt,
-                            timeoutMs,
-                            maxAttempts: retry.maxAttempts,
-                            retryDelayMs: Math.min(
-                              retry.maxDelay,
-                              retry.initialDelay *
-                                (retry.backoff === 'exponential' ? 2 ** (attempt - 1) : 1)
-                            ),
-                            concurrencyKey
+                          Effect.gen(function* () {
+                            yield* Effect.useSpan(
+                              `better-workflows/activity/${activity.options.name}/offer`,
+                              {
+                                attributes: {
+                                  activityName: activity.options.name,
+                                  activityVersion: activity.options.version
+                                }
+                              },
+                              (span) =>
+                                queue
+                                  .offer(
+                                    {
+                                      token,
+                                      activityName: activity.options.name,
+                                      activityVersion: activity.options.version,
+                                      executionId: self.executionId,
+                                      stepId: id,
+                                      input: encoded,
+                                      attempt,
+                                      timeoutMs,
+                                      maxAttempts: retry.maxAttempts,
+                                      retryDelayMs: Math.min(
+                                        retry.maxDelay,
+                                        retry.initialDelay *
+                                          (retry.backoff === 'exponential' ? 2 ** (attempt - 1) : 1)
+                                      ),
+                                      concurrencyKey,
+                                      traceId: span.traceId,
+                                      spanId: span.spanId,
+                                      sampled: span.sampled
+                                    },
+                                    { id: token }
+                                  )
+                                  .pipe(Effect.tapCause(Effect.logWarning), Effect.orDie)
+                            )
+                            return decode(yield* DurableDeferred.await(deferred))
                           })
                         )
-                        if (Result.isSuccess(result)) return decode(result.success)
+                        if (Result.isSuccess(result)) return result.success
                         if (!result.failure.retryable || attempt === retry.maxAttempts)
                           return yield* Effect.fail(result.failure)
                         yield* DurableDeferred.await(retryDeferred(id, attempt))

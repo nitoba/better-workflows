@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { Cause, Effect, Exit, Result, Schema, Clock, Semaphore, Tracer } from 'effect'
+import { Cause, Effect, Exit, Result, Schedule, Clock, Semaphore, Tracer } from 'effect'
 import { DurableDeferred } from 'effect/unstable/workflow'
 import { PersistedQueue } from 'effect/unstable/persistence'
 import { ActivityError, WorkflowError, toFailure } from '../errors'
@@ -12,6 +12,7 @@ import { effectClock } from './clock'
 import { durable, promised } from './effects'
 import type { Journal } from './journal'
 import type { RegisteredActivity } from './registry'
+import { ActivityEnvelopeSchema, activityDeferred } from './wire'
 import type { ActivityEnvelope, EngineQueue } from './wire'
 
 class LeaseLost extends Error {
@@ -27,14 +28,9 @@ const cancelled: Failure = {
   retryable: false
 }
 
-/**
- * Pinned DurableQueue wire protocol, consumed through Effect's PersistedQueue.
- * Unlike the stock worker, capture typed business failures only: interruption
- * and infrastructure defects must NACK, not complete the workflow's deferred.
- */
 export function activityWorker(
   queueDefinition: EngineQueue,
-  activity: RegisteredActivity,
+  activities: readonly RegisteredActivity[],
   journal: Journal,
   semaphore: Semaphore.Semaphore,
   options: WorkflowsOptions,
@@ -44,8 +40,14 @@ export function activityWorker(
   const refresh = milliseconds(options.lease?.refreshInterval ?? '10s')
   const poll = Math.min(milliseconds(options.pollInterval ?? '100ms'), refresh)
   const permits = new Permits(journal)
+  const activitiesByIdentity = new Map(
+    activities.map((activity) => [
+      JSON.stringify([activity.options.name, activity.options.version]),
+      activity
+    ])
+  )
 
-  const execute = (payload: ActivityEnvelope, delivery: number) =>
+  const execute = (activity: RegisteredActivity, payload: ActivityEnvelope, delivery: number) =>
     Effect.gen(function* () {
       const run = yield* durable(journal.get(payload.executionId))
       if (run.control === 'cancel' || ['completed', 'failed', 'cancelled'].includes(run.state))
@@ -154,33 +156,46 @@ export function activityWorker(
 
   return Effect.gen(function* () {
     const queue = yield* PersistedQueue.make({
-      name: `DurableQueue/${queueDefinition.name}`,
-      schema: Schema.Struct({
-        token: DurableDeferred.Token,
-        payload: queueDefinition.payloadSchema,
-        traceId: Schema.String,
-        spanId: Schema.String,
-        sampled: Schema.Boolean
-      }),
+      name: queueDefinition.name,
+      schema: ActivityEnvelopeSchema,
       // Business retries have their own durable attempt identity. Infrastructure
       // redelivery is not silently dead-lettered after an arbitrary 10 crashes.
-      maxAttempts: 2_147_483_647
+      maxAttempts: 2_147_483_647,
+      // A process may own only part of a shared queue in distributed mode. An
+      // envelope for another owner must become visible to that owner promptly.
+      retrySchedule: Schedule.spaced(poll)
     })
     const worker = queue
-      .take((item, metadata) =>
-        execute(item.payload, metadata.attempts).pipe(
-          Effect.flatMap((exit) =>
-            DurableDeferred.done(queueDefinition.deferred, { token: item.token, exit })
-          ),
-          Effect.withSpan(`better-workflows/activity/${activity.options.name}`, {
-            parent: Tracer.externalSpan({
-              traceId: item.traceId,
-              spanId: item.spanId,
-              sampled: item.sampled
-            })
-          })
+      .take((item, metadata) => {
+        const activity = activitiesByIdentity.get(
+          JSON.stringify([item.activityName, item.activityVersion])
         )
-      )
+        if (!activity)
+          return Effect.fail(
+            new WorkflowError(
+              'ACTIVITY_NOT_AVAILABLE',
+              `${item.activityName}@${item.activityVersion} is not registered by this worker`
+            )
+          )
+        return execute(activity, item, metadata.attempts).pipe(
+          Effect.flatMap((exit) =>
+            DurableDeferred.done(activityDeferred(item.stepId, item.attempt), {
+              token: item.token,
+              exit
+            })
+          ),
+          Effect.withSpan(
+            `better-workflows/activity/${activity.options.name}@${activity.options.version}`,
+            {
+              parent: Tracer.externalSpan({
+                traceId: item.traceId,
+                spanId: item.spanId,
+                sampled: item.sampled
+              })
+            }
+          )
+        )
+      })
       .pipe(
         Effect.catchCause((cause) => {
           if (Cause.hasInterruptsOnly(cause)) return Effect.failCause(cause)
