@@ -37,6 +37,7 @@ import type { BusinessClock } from './clock'
 import { childDeferred, timerDeferred } from './wire'
 import { activityWorker } from './worker'
 import { ActivityTransport } from './activity-transport'
+import { TelemetryService } from './telemetry'
 import {
   executionNotificationChannel,
   executionNotificationPayload,
@@ -50,6 +51,7 @@ type Services =
   | PersistedQueue.PersistedQueueFactory
   | SqlClient.SqlClient
   | PgClient.PgClient
+  | TelemetryService
 const terminal = (row: RunRow) =>
   ['continued', 'completed', 'failed', 'cancelled'].includes(row.state)
 const safetySweepInterval = 60_000
