@@ -2,6 +2,7 @@ import { createServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { mkdtemp, rm } from 'node:fs/promises'
+import { createServer as createTcpServer } from 'node:net'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { expect, test } from 'bun:test'
@@ -199,19 +200,36 @@ function spawnTraceFixture(
   role: 'orchestrator' | 'worker',
   endpoint: string,
   namespace: string,
-  secret: string
+  secret: string,
+  clusterPort: number
 ): ChildProcess {
-  return spawn(process.execPath, ['tests/fixtures/observability-postgres-worker.ts'], {
+  const child = spawn(process.execPath, ['tests/fixtures/observability-postgres-worker.ts'], {
     cwd: process.cwd(),
     env: {
       ...process.env,
       WORKFLOWS_TRACE_ENDPOINT: endpoint,
       WORKFLOWS_TRACE_NAMESPACE: namespace,
       WORKFLOWS_TRACE_ROLE: role,
+      WORKFLOWS_TRACE_CLUSTER_PORT: String(clusterPort),
       WORKFLOWS_TRACE_SECRET: secret
     },
     stdio: ['ignore', 'pipe', 'pipe', 'ipc']
   })
+  child.stdout?.on('data', (chunk) => process.stdout.write(chunk))
+  child.stderr?.on('data', (chunk) => process.stderr.write(chunk))
+  return child
+}
+
+async function freeTcpPort(): Promise<number> {
+  const server = createTcpServer()
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', resolve)
+  })
+  // SAFETY: the server was successfully bound to an ephemeral TCP address above.
+  const port = (server.address() as AddressInfo).port
+  await new Promise<void>((resolve) => server.close(() => resolve()))
+  return port
 }
 
 async function waitForFixtureExit(child: ChildProcess): Promise<void> {
@@ -575,15 +593,22 @@ test.skipIf(!postgresConnectionString)(
     if (!postgresConnectionString) return
     const namespace = `observability-pg-${process.pid}-${Date.now()}`
     const secret = 'SUPER_SECRET_TEST_VALUE'
+    const [orchestratorPort, workerPort] = await Promise.all([freeTcpPort(), freeTcpPort()])
     const requests = await collectOtlpRequests(async (endpoint) => {
-      const orchestrator = spawnTraceFixture('orchestrator', endpoint, namespace, secret)
+      const orchestrator = spawnTraceFixture(
+        'orchestrator',
+        endpoint,
+        namespace,
+        secret,
+        orchestratorPort
+      )
       let worker: ChildProcess | undefined
       try {
         const started = await nextFixtureMessage(orchestrator)
         expect(started.type).toBe('started')
         expect(started.executionId).toEqual(expect.any(String))
 
-        worker = spawnTraceFixture('worker', endpoint, namespace, secret)
+        worker = spawnTraceFixture('worker', endpoint, namespace, secret, workerPort)
         expect((await nextFixtureMessage(worker)).type).toBe('ready')
 
         const completed = await nextFixtureMessage(orchestrator)
@@ -607,5 +632,6 @@ test.skipIf(!postgresConnectionString)(
     expect(execute!.traceId).toBe(dispatch!.traceId)
     expect(execute!.parentSpanId).toBe(dispatch!.spanId)
     expect(requests.map((request) => request.body).join('\n')).not.toContain(secret)
-  }
+  },
+  30_000
 )

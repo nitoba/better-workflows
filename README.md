@@ -8,6 +8,8 @@ Durable workflows for **NestJS 12**, using decorators, modules, dependency injec
 
 Development uses Bun **1.4.2**. Compiled ESM consumers require Node **22.16+** or Bun.
 
+PostgreSQL integration tests use [Testcontainers](https://testcontainers.com/) and require a Docker-compatible runtime. Run them with `bun run test:postgres`; the command starts a disposable PostgreSQL 16 container, runs the multi-process tests, and removes the container afterward. Rootless Podman is supported when its user socket is available.
+
 ```sh
 git clone https://github.com/nitoba/better-workflows.git
 cd better-workflows

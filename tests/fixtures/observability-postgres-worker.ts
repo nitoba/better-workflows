@@ -18,6 +18,7 @@ const connectionString = process.env['WORKFLOWS_TEST_POSTGRES_URL']
 const namespace = process.env['WORKFLOWS_TRACE_NAMESPACE']
 const endpoint = process.env['WORKFLOWS_TRACE_ENDPOINT']
 const role = process.env['WORKFLOWS_TRACE_ROLE']
+const clusterPort = Number(process.env['WORKFLOWS_TRACE_CLUSTER_PORT'])
 const secret = process.env['WORKFLOWS_TRACE_SECRET']
 const TraceQueue = defineQueue('observability-postgres-traces')
 
@@ -48,12 +49,19 @@ class PostgresTraceWorkflow {
   }
 }
 
-if (!connectionString || !namespace || !endpoint || !role)
-  throw new Error('PostgreSQL tracing fixture requires connection, namespace, endpoint and role')
+if (!connectionString || !namespace || !endpoint || !role || !Number.isInteger(clusterPort))
+  throw new Error(
+    'PostgreSQL tracing fixture requires connection, namespace, endpoint, role and cluster port'
+  )
 
 const root = WorkflowsModule.forRoot({
   namespace,
   storage: postgres({ connectionString, maxConnections: 4 }),
+  topology: 'distributed',
+  cluster: {
+    address: { host: '127.0.0.1', port: clusterPort },
+    listenAddress: { host: '127.0.0.1', port: clusterPort }
+  },
   queues: [{ queue: TraceQueue, concurrency: 1 }],
   execution:
     role === 'orchestrator'
