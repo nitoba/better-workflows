@@ -3,10 +3,122 @@ import type { AddressInfo } from 'node:net'
 import { expect, test } from 'bun:test'
 import { Effect, ManagedRuntime } from 'effect'
 import { otlp } from '../src/observability'
-import type { WorkflowsOptions } from '../src'
+import { Activity, Activities, Workflow, defineQueue } from '../src'
+import type { WorkflowContext, WorkflowsOptions } from '../src'
 import { WorkflowError } from '../src/errors'
 import { otlpLayer, otlpResource } from '../src/internal/otlp'
 import { TelemetryService } from '../src/internal/telemetry'
+import { testApp } from './helpers'
+import { z } from 'zod'
+
+const TraceQueue = defineQueue('observability-traces')
+
+@Activities()
+class OtlpTraceActivity {
+  @Activity({
+    name: 'observability.echo',
+    version: 1,
+    queue: TraceQueue,
+    input: z.string(),
+    output: z.string()
+  })
+  async echo(value: string): Promise<string> {
+    return value
+  }
+}
+
+@Workflow({ name: 'observability.workflow', version: 1, input: z.string(), output: z.string() })
+class OtlpTraceWorkflow {
+  async run(input: string, context: WorkflowContext): Promise<string> {
+    return context.activities(OtlpTraceActivity).echo(input, { stepId: 'echo' })
+  }
+}
+
+@Workflow({ name: 'observability.continued', version: 1, input: z.number(), output: z.number() })
+class OtlpContinuationWorkflow {
+  async run(input: number, context: WorkflowContext): Promise<number> {
+    if (input === 0) return context.continueAsNew(1)
+    return input
+  }
+}
+
+interface OtlpTraceSpan {
+  readonly name: string
+  readonly traceId: string
+  readonly spanId: string
+  readonly parentSpanId?: string
+  readonly attributes?: ReadonlyArray<{
+    readonly key: string
+    readonly value?: {
+      readonly stringValue?: string
+      readonly intValue?: string | number
+      readonly doubleValue?: number
+      readonly boolValue?: boolean
+    }
+  }>
+}
+
+interface OtlpTracePayload {
+  readonly resourceSpans?: ReadonlyArray<{
+    readonly scopeSpans?: ReadonlyArray<{ readonly spans?: ReadonlyArray<OtlpTraceSpan> }>
+  }>
+}
+
+async function collectOtlpRequests(
+  run: (endpoint: string) => Promise<void>
+): Promise<ReadonlyArray<{ readonly url: string; readonly body: string }>> {
+  const requests: Array<{ readonly url: string; readonly body: string }> = []
+  const server = createServer((request, response) => {
+    let body = ''
+    request.setEncoding('utf8')
+    request.on('data', (chunk: string) => {
+      body += chunk
+    })
+    request.on('end', () => {
+      requests.push({ url: request.url ?? '', body })
+      response.statusCode = 200
+      response.end()
+    })
+  })
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', resolve)
+  })
+
+  // SAFETY: the server was successfully bound to an ephemeral TCP address above.
+  const port = (server.address() as AddressInfo).port
+  try {
+    await run(`http://127.0.0.1:${port}`)
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
+  return requests
+}
+
+function exportedOtlpSpans(
+  requests: ReadonlyArray<{ readonly url: string; readonly body: string }>
+): ReadonlyArray<OtlpTraceSpan> {
+  return requests
+    .filter((request) => request.url === '/v1/traces')
+    .flatMap((request) => {
+      // SAFETY: this test server only records JSON OTLP trace responses from the exporter.
+      const payload = JSON.parse(request.body) as OtlpTracePayload
+      return (
+        payload.resourceSpans?.flatMap(
+          (resource) => resource.scopeSpans?.flatMap((scope) => scope.spans ?? []) ?? []
+        ) ?? []
+      )
+    })
+}
+
+function spanAttribute(span: OtlpTraceSpan, key: string): string | number | boolean | undefined {
+  const value = span.attributes?.find((attribute) => attribute.key === key)?.value
+  if (!value) return undefined
+  if (value.stringValue !== undefined) return value.stringValue
+  if (value.intValue !== undefined) return Number(value.intValue)
+  if (value.doubleValue !== undefined) return value.doubleValue
+  return value.boolValue
+}
 
 function invalidConfiguration(action: () => void): void {
   try {
@@ -166,4 +278,102 @@ test('otlp metrics export the runtime registry', async () => {
   expect(resourceAttributes).toContain('better_workflows.namespace')
   expect(resourceAttributes).toContain('better_workflows.version')
   expect(metricNames).toContain('better_workflows.workflow.started')
+})
+
+test('activity spans use the persisted dispatch context without exporting payloads', async () => {
+  const requests: Array<{ readonly url: string; readonly body: string }> = []
+  const server = createServer((request, response) => {
+    let body = ''
+    request.setEncoding('utf8')
+    request.on('data', (chunk: string) => {
+      body += chunk
+    })
+    request.on('end', () => {
+      requests.push({ url: request.url ?? '', body })
+      response.statusCode = 200
+      response.end()
+    })
+  })
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', resolve)
+  })
+
+  // SAFETY: the server was successfully bound to an ephemeral TCP address above.
+  const port = (server.address() as AddressInfo).port
+  const secret = 'SUPER_SECRET_TEST_VALUE'
+  const app = await testApp(OtlpTraceWorkflow, {
+    providers: [OtlpTraceActivity],
+    queues: [{ queue: TraceQueue, concurrency: 1 }],
+    observability: otlp({
+      serviceName: 'trace-propagation-test',
+      endpoint: `http://127.0.0.1:${port}`,
+      traces: { exportInterval: '5ms' },
+      metrics: false,
+      logs: false,
+      shutdownTimeout: '1s'
+    })
+  })
+  try {
+    const handle = await app.client.start(secret)
+    expect(await handle.result({ timeout: '5s' })).toBe(secret)
+  } finally {
+    await app.close()
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
+
+  const spans = requests
+    .filter((request) => request.url === '/v1/traces')
+    .flatMap((request) => {
+      // SAFETY: this test server only records JSON OTLP trace responses sent by the exporter.
+      const payload = JSON.parse(request.body) as OtlpTracePayload
+      return (
+        payload.resourceSpans?.flatMap(
+          (resource) => resource.scopeSpans?.flatMap((scope) => scope.spans ?? []) ?? []
+        ) ?? []
+      )
+    })
+  const dispatch = spans.find((span) => span.name === 'better-workflows.activity.dispatch')
+  const execute = spans.find((span) => span.name === 'better-workflows.activity.execute')
+  expect(dispatch).toBeDefined()
+  expect(execute).toBeDefined()
+  // SAFETY: both preceding assertions verify that the expected spans were exported.
+  expect(execute!.traceId).toBe(dispatch!.traceId)
+  expect(execute!.parentSpanId).toBe(dispatch!.spanId)
+  expect(requests.map((request) => request.body).join('\n')).not.toContain(secret)
+})
+
+test('continue-as-new spans retain chain and generation correlation', async () => {
+  const requests = await collectOtlpRequests(async (endpoint) => {
+    const app = await testApp(OtlpContinuationWorkflow, {
+      observability: otlp({
+        serviceName: 'continuation-tracing-test',
+        endpoint,
+        traces: { exportInterval: '5ms' },
+        metrics: false,
+        logs: false,
+        shutdownTimeout: '1s'
+      })
+    })
+    try {
+      const handle = await app.client.start(0)
+      expect(await handle.result({ timeout: '5s' })).toBe(1)
+    } finally {
+      await app.close()
+    }
+  })
+
+  const rounds = exportedOtlpSpans(requests).filter(
+    (span) => span.name === 'better-workflows.workflow.round'
+  )
+  expect(rounds).toHaveLength(2)
+  const chainIds = rounds.map((span) => spanAttribute(span, 'better_workflows.execution.chain_id'))
+  const generations = rounds.map((span) =>
+    spanAttribute(span, 'better_workflows.execution.generation')
+  )
+  const executionIds = rounds.map((span) => spanAttribute(span, 'better_workflows.execution.id'))
+  expect(new Set(chainIds).size).toBe(1)
+  expect(new Set(generations)).toEqual(new Set([0, 1]))
+  for (const executionId of executionIds) expect(executionId).toEqual(expect.any(String))
+  expect(new Set(executionIds).size).toBe(2)
 })

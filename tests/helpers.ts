@@ -12,6 +12,7 @@ export interface TestAppOptions {
   readonly providers?: readonly Type[]
   readonly activityContracts?: readonly Type[]
   readonly execution?: WorkflowsOptions['execution']
+  readonly observability?: WorkflowsOptions['observability']
   readonly queues?: WorkflowsOptions['queues']
   readonly deadLetter?: WorkflowsOptions['deadLetter']
   readonly filename?: string
@@ -27,6 +28,7 @@ export async function testApp<W extends WorkflowClass>(workflow: W, options: Tes
   }
   let configured: WorkflowsOptions = root
   if (options.execution) configured = { ...configured, execution: options.execution }
+  if (options.observability) configured = { ...configured, observability: options.observability }
   if (options.deadLetter) configured = { ...configured, deadLetter: options.deadLetter }
   const module = await Test.createTestingModule({
     imports: [
