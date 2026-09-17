@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { Inject, Injectable, Logger, Optional } from '@nestjs/common'
+import { Inject, Injectable, Optional } from '@nestjs/common'
 import type { OnApplicationBootstrap, OnModuleDestroy, OnApplicationShutdown } from '@nestjs/common'
 import { DiscoveryService } from '@nestjs/core'
 import { Cause, Effect, Exit, Option, Queue, Scope, Semaphore } from 'effect'
@@ -37,8 +37,14 @@ import type { BusinessClock } from './clock'
 import { childDeferred, timerDeferred } from './wire'
 import { activityWorker } from './worker'
 import { ActivityTransport } from './activity-transport'
-import { TelemetryAttributeKey, TelemetryService } from './telemetry'
-import type { TelemetryApi } from './telemetry'
+import {
+  logAnnotations,
+  TelemetryAttributeKey,
+  TelemetryLogComponent,
+  TelemetryService,
+  TelemetrySpanName
+} from './telemetry'
+import type { TelemetryApi, TelemetryAttributes } from './telemetry'
 import {
   executionNotificationChannel,
   executionNotificationPayload,
@@ -61,7 +67,6 @@ const safetySweepInterval = 60_000
 export class WorkflowsRuntime
   implements OnApplicationBootstrap, OnModuleDestroy, OnApplicationShutdown
 {
-  private readonly logger = new Logger('better-workflows')
   readonly registry: Registry
   private infrastructure: Infrastructure | undefined
   private journal: Journal | undefined
@@ -181,6 +186,12 @@ export class WorkflowsRuntime
       const self = this
       infrastructure.runFork(
         Effect.gen(function* () {
+          yield* Effect.annotateLogs(
+            Effect.logInfo('Runtime started'),
+            logAnnotations(TelemetryLogComponent.runtime, {
+              [TelemetryAttributeKey.namespace]: self.options.namespace
+            })
+          )
           while (true) {
             yield* self.dispatch().pipe(
               Effect.catchCause((cause) => {
@@ -188,8 +199,17 @@ export class WorkflowsRuntime
                 return Effect.sync(() => {
                   self.lastDispatchError = Cause.pretty(cause)
                   self.lastDispatchFailureAt = Date.now()
-                  self.logger.error(self.lastDispatchError)
-                })
+                }).pipe(
+                  Effect.andThen(
+                    Effect.annotateLogs(
+                      Effect.logError('Dispatcher iteration failed'),
+                      logAnnotations(TelemetryLogComponent.dispatcher, {
+                        [TelemetryAttributeKey.namespace]: self.options.namespace,
+                        [TelemetryAttributeKey.failureCode]: toFailure(Cause.squash(cause)).code
+                      })
+                    )
+                  )
+                )
               })
             )
             yield* Effect.sleep(milliseconds(self.options.pollInterval ?? '100ms'))
@@ -197,6 +217,17 @@ export class WorkflowsRuntime
         })
       )
     } catch (error) {
+      await infrastructure
+        .runPromise(
+          Effect.annotateLogs(
+            Effect.logError('Runtime bootstrap failed'),
+            logAnnotations(TelemetryLogComponent.runtime, {
+              [TelemetryAttributeKey.namespace]: this.options.namespace,
+              [TelemetryAttributeKey.failureCode]: toFailure(error).code
+            })
+          )
+        )
+        .catch(() => undefined)
       await infrastructure.dispose()
       this.infrastructure = undefined
       this.journal = undefined
@@ -213,7 +244,20 @@ export class WorkflowsRuntime
       this.stopping = true
       this.ready = false
       this.notifier?.shutdown()
-      this.stopPromise = this.infrastructure?.dispose() ?? Promise.resolve()
+      const infrastructure = this.infrastructure
+      this.stopPromise = infrastructure
+        ? infrastructure
+            .runPromise(
+              Effect.annotateLogs(
+                Effect.logInfo('Runtime stopped'),
+                logAnnotations(TelemetryLogComponent.runtime, {
+                  [TelemetryAttributeKey.namespace]: this.options.namespace
+                })
+              )
+            )
+            .catch(() => undefined)
+            .then(() => infrastructure.dispose())
+        : Promise.resolve()
     }
     await this.stopPromise
   }
@@ -242,6 +286,7 @@ export class WorkflowsRuntime
     config: PgClient.PgClientConfig,
     notifier: ExecutionNotifier
   ): void {
+    const self = this
     const channel = executionNotificationChannel(this.options.namespace)
     const telemetry = this.journal?.telemetry
     this.infrastructure!.runFork(
@@ -254,13 +299,36 @@ export class WorkflowsRuntime
                 Effect.gen(function* () {
                   const client = yield* PgClient.makeClient(config)
                   const queue = yield* client.listen(channel)
-                  if (everConnected) telemetry?.count('notifierReconnect')
+                  if (everConnected) {
+                    telemetry?.count('notifierReconnect')
+                    yield* Effect.annotateLogs(
+                      Effect.logWarning('Notifier reconnected'),
+                      logAnnotations(TelemetryLogComponent.notifier, {
+                        [TelemetryAttributeKey.namespace]: self.options.namespace
+                      })
+                    )
+                  } else
+                    yield* Effect.annotateLogs(
+                      Effect.logInfo('Notifier connected'),
+                      logAnnotations(TelemetryLogComponent.notifier, {
+                        [TelemetryAttributeKey.namespace]: self.options.namespace
+                      })
+                    )
                   everConnected = true
                   notifier.reconnected()
                   while (true) {
                     const notification = yield* Queue.take(queue)
                     const payload = executionNotificationPayload(notification.payload)
-                    if (payload) notifier.publish(payload.executionId, payload.revision)
+                    if (payload) {
+                      yield* Effect.annotateLogs(
+                        Effect.logDebug('Notification received'),
+                        logAnnotations(TelemetryLogComponent.notifier, {
+                          [TelemetryAttributeKey.namespace]: self.options.namespace,
+                          [TelemetryAttributeKey.executionId]: payload.executionId
+                        })
+                      )
+                      notifier.publish(payload.executionId, payload.revision)
+                    }
                   }
                 })
               ),
@@ -270,6 +338,14 @@ export class WorkflowsRuntime
           if (Exit.isFailure(listening) && Cause.hasInterruptsOnly(listening.cause))
             return yield* Effect.failCause(listening.cause)
           notifier.reconnected()
+          if (Exit.isFailure(listening))
+            yield* Effect.annotateLogs(
+              Effect.logWarning('Notifier connection lost'),
+              logAnnotations(TelemetryLogComponent.notifier, {
+                [TelemetryAttributeKey.namespace]: self.options.namespace,
+                [TelemetryAttributeKey.failureCode]: toFailure(Cause.squash(listening.cause)).code
+              })
+            )
           yield* Effect.sleep(1_000)
         }
       })
@@ -299,16 +375,49 @@ export class WorkflowsRuntime
       )
     const entry = this.registry.contract(workflow)
     const encoded = encode(input)
-    const parsed = await validate(
-      entry.options.input,
-      decode(encoded),
-      `${entry.options.name} input`
-    )
-    const key = keyOverride ?? entry.options.idempotencyKey?.(parsed) ?? randomUUID()
-    identifier(key, 'Idempotency key')
-    const executionId = await this.run(entry.definition.executionId({ key, input: encoded }))
+    const self = this
     const accepted = await this.run(
-      this.store().accept(executionId, entry.options.name, entry.options.version, key, encoded)
+      Effect.useSpan(
+        TelemetrySpanName.workflowStart,
+        {
+          attributes: {
+            [TelemetryAttributeKey.workflowName]: entry.options.name,
+            [TelemetryAttributeKey.workflowVersion]: entry.options.version
+          },
+          kind: 'producer'
+        },
+        (span) =>
+          Effect.gen(function* () {
+            const parsed = yield* promised(() =>
+              validate(entry.options.input, decode(encoded), `${entry.options.name} input`)
+            )
+            const key = yield* Effect.try({
+              try: () => {
+                const value = keyOverride ?? entry.options.idempotencyKey?.(parsed) ?? randomUUID()
+                identifier(value, 'Idempotency key')
+                return value
+              },
+              catch: toFailure
+            })
+            const executionId = yield* entry.definition.executionId({ key, input: encoded })
+            const accepted = yield* self
+              .store()
+              .accept(executionId, entry.options.name, entry.options.version, key, encoded)
+            span.attribute(TelemetryAttributeKey.executionId, executionId)
+            span.attribute(TelemetryAttributeKey.workflowCreated, accepted.created)
+            yield* Effect.annotateLogs(
+              Effect.logDebug('Workflow accepted'),
+              logAnnotations(TelemetryLogComponent.workflow, {
+                [TelemetryAttributeKey.namespace]: self.options.namespace,
+                [TelemetryAttributeKey.workflowName]: entry.options.name,
+                [TelemetryAttributeKey.workflowVersion]: entry.options.version,
+                [TelemetryAttributeKey.executionId]: executionId,
+                [TelemetryAttributeKey.workflowCreated]: accepted.created
+              })
+            )
+            return accepted
+          })
+      )
     )
     if (accepted.created)
       this.telemetry?.count('workflowStarted', {
@@ -431,7 +540,21 @@ export class WorkflowsRuntime
         `${signal.name} is not declared by ${run.workflow_name}@${run.version}`
       )
     const payload = await validate(allowed.schema, input, `${signal.name} signal`)
-    return this.run(this.store().signal(id, signal.name, key, encode(payload)))
+    return this.run(
+      Effect.useSpan(
+        TelemetrySpanName.signalAccept,
+        {
+          attributes: {
+            [TelemetryAttributeKey.executionId]: id,
+            [TelemetryAttributeKey.workflowName]: contract.options.name,
+            [TelemetryAttributeKey.workflowVersion]: contract.options.version,
+            [TelemetryAttributeKey.signalName]: signal.name
+          },
+          kind: 'producer'
+        },
+        () => this.store().signal(id, signal.name, key, encode(payload))
+      )
+    )
   }
 
   private queue(queue: string): string {
@@ -594,26 +717,51 @@ export class WorkflowsRuntime
           run.version
         )
         const deferred = timerDeferred(timer.step_id)
-        yield* DurableDeferred.done(deferred, {
-          token: DurableDeferred.tokenFromExecutionId(deferred, {
-            workflow: definition,
-            executionId: timer.execution_id
-          }),
-          exit: Exit.void
-        })
-        const deliveredAt = yield* journal.now()
-        if (yield* advanced.timerDelivered(timer)) {
-          const attributes = {
-            [TelemetryAttributeKey.workflowName]: run.workflow_name,
-            [TelemetryAttributeKey.workflowVersion]: run.version
-          }
-          self.telemetry?.count('timerDelivered', attributes)
-          self.telemetry?.observe(
-            'timerLag',
-            Math.max(0, Number(deliveredAt) - Number(timer.deadline)),
-            attributes
-          )
-        }
+        yield* Effect.useSpan(
+          TelemetrySpanName.timerDeliver,
+          {
+            attributes: {
+              [TelemetryAttributeKey.workflowName]: run.workflow_name,
+              [TelemetryAttributeKey.workflowVersion]: run.version,
+              [TelemetryAttributeKey.executionId]: timer.execution_id,
+              [TelemetryAttributeKey.stepId]: timer.step_id
+            },
+            kind: 'consumer'
+          },
+          () =>
+            Effect.gen(function* () {
+              yield* DurableDeferred.done(deferred, {
+                token: DurableDeferred.tokenFromExecutionId(deferred, {
+                  workflow: definition,
+                  executionId: timer.execution_id
+                }),
+                exit: Exit.void
+              })
+              const deliveredAt = yield* journal.now()
+              yield* Effect.annotateLogs(
+                Effect.logDebug('Timer wakeup'),
+                logAnnotations(TelemetryLogComponent.runtime, {
+                  [TelemetryAttributeKey.namespace]: self.options.namespace,
+                  [TelemetryAttributeKey.workflowName]: run.workflow_name,
+                  [TelemetryAttributeKey.workflowVersion]: run.version,
+                  [TelemetryAttributeKey.executionId]: timer.execution_id,
+                  [TelemetryAttributeKey.stepId]: timer.step_id
+                })
+              )
+              if (yield* advanced.timerDelivered(timer)) {
+                const attributes = {
+                  [TelemetryAttributeKey.workflowName]: run.workflow_name,
+                  [TelemetryAttributeKey.workflowVersion]: run.version
+                }
+                self.telemetry?.count('timerDelivered', attributes)
+                self.telemetry?.observe(
+                  'timerLag',
+                  Math.max(0, Number(deliveredAt) - Number(timer.deadline)),
+                  attributes
+                )
+              }
+            })
+        )
       }
       for (const child of yield* advanced.readyChildren()) {
         const parent = yield* journal.get(child.parent_id)
@@ -694,29 +842,44 @@ export class WorkflowsRuntime
           run.version
         )
         const deferred = retryDeferred(retry.step_id, retry.attempt)
-        yield* DurableDeferred.done(deferred, {
-          token: DurableDeferred.tokenFromExecutionId(deferred, {
-            workflow: definition,
-            executionId: retry.execution_id
-          }),
-          exit: Exit.void
-        })
-        const deliveredAt = yield* journal.now()
-        if (yield* journal.retryDelivered(retry)) {
-          const identity = yield* journal.activityMetricIdentity(retry.execution_id, retry.step_id)
-          const attributes = identity
-            ? {
-                [TelemetryAttributeKey.activityName]: identity.activityName,
-                [TelemetryAttributeKey.activityVersion]: identity.activityVersion,
-                [TelemetryAttributeKey.queueName]: identity.queueName
-              }
-            : {}
-          self.telemetry?.observe(
-            'activityRetryLag',
-            Math.max(0, Number(deliveredAt) - Number(retry.deadline)),
-            attributes
-          )
+        const identity = yield* journal.activityMetricIdentity(retry.execution_id, retry.step_id)
+        const retryAttributes: TelemetryAttributes = {
+          [TelemetryAttributeKey.executionId]: retry.execution_id,
+          [TelemetryAttributeKey.stepId]: retry.step_id,
+          [TelemetryAttributeKey.activityBusinessAttempt]: retry.attempt
         }
+        if (identity) {
+          retryAttributes[TelemetryAttributeKey.activityName] = identity.activityName
+          retryAttributes[TelemetryAttributeKey.activityVersion] = identity.activityVersion
+          retryAttributes[TelemetryAttributeKey.queueName] = identity.queueName
+        }
+        yield* Effect.useSpan(
+          TelemetrySpanName.retryDeliver,
+          { attributes: retryAttributes, kind: 'consumer' },
+          () =>
+            Effect.gen(function* () {
+              yield* DurableDeferred.done(deferred, {
+                token: DurableDeferred.tokenFromExecutionId(deferred, {
+                  workflow: definition,
+                  executionId: retry.execution_id
+                }),
+                exit: Exit.void
+              })
+              const deliveredAt = yield* journal.now()
+              if (yield* journal.retryDelivered(retry))
+                self.telemetry?.observe(
+                  'activityRetryLag',
+                  Math.max(0, Number(deliveredAt) - Number(retry.deadline)),
+                  identity
+                    ? {
+                        [TelemetryAttributeKey.activityName]: identity.activityName,
+                        [TelemetryAttributeKey.activityVersion]: identity.activityVersion,
+                        [TelemetryAttributeKey.queueName]: identity.queueName
+                      }
+                    : {}
+                )
+            })
+        )
       }
       const waits = yield* journal.pendingWaits()
       for (const candidate of waits) {
@@ -729,21 +892,50 @@ export class WorkflowsRuntime
           run.version
         )
         const deferred = signalDeferred(wait.step_id)
-        yield* DurableDeferred.done(deferred, {
-          token: DurableDeferred.tokenFromExecutionId(deferred, {
-            workflow: definition,
-            executionId: wait.execution_id
-          }),
-          exit:
-            wait.state === 'success'
-              ? Exit.succeed(wait.result_json!)
-              : Exit.fail({
-                  code: 'SIGNAL_TIMEOUT',
-                  message: `Signal ${wait.signal_name} did not arrive before its deadline`,
-                  retryable: false
-                })
+        const deliver = Effect.gen(function* () {
+          yield* DurableDeferred.done(deferred, {
+            token: DurableDeferred.tokenFromExecutionId(deferred, {
+              workflow: definition,
+              executionId: wait.execution_id
+            }),
+            exit:
+              wait.state === 'success'
+                ? Exit.succeed(wait.result_json!)
+                : Exit.fail({
+                    code: 'SIGNAL_TIMEOUT',
+                    message: `Signal ${wait.signal_name} did not arrive before its deadline`,
+                    retryable: false
+                  })
+          })
+          yield* journal.delivered(wait)
+          yield* Effect.annotateLogs(
+            Effect.logDebug('Signal wakeup'),
+            logAnnotations(TelemetryLogComponent.runtime, {
+              [TelemetryAttributeKey.namespace]: self.options.namespace,
+              [TelemetryAttributeKey.workflowName]: run.workflow_name,
+              [TelemetryAttributeKey.workflowVersion]: run.version,
+              [TelemetryAttributeKey.executionId]: wait.execution_id,
+              [TelemetryAttributeKey.stepId]: wait.step_id,
+              [TelemetryAttributeKey.signalName]: wait.signal_name
+            })
+          )
         })
-        yield* journal.delivered(wait)
+        if (wait.state === 'success')
+          yield* Effect.useSpan(
+            TelemetrySpanName.signalConsume,
+            {
+              attributes: {
+                [TelemetryAttributeKey.executionId]: wait.execution_id,
+                [TelemetryAttributeKey.workflowName]: run.workflow_name,
+                [TelemetryAttributeKey.workflowVersion]: run.version,
+                [TelemetryAttributeKey.stepId]: wait.step_id,
+                [TelemetryAttributeKey.signalName]: wait.signal_name
+              },
+              kind: 'consumer'
+            },
+            () => deliver
+          )
+        else yield* deliver
       }
       if (Date.now() >= self.safetySweepAt) {
         const active = yield* journal.activeAfter(self.safetySweepCursor)
@@ -764,8 +956,16 @@ export class WorkflowsRuntime
     )
     return measured.pipe(
       Effect.tap(() =>
-        Effect.sync(() => {
-          if (self.dispatcherFailed) self.telemetry?.count('dispatcherRecovery')
+        Effect.gen(function* () {
+          if (self.dispatcherFailed) {
+            self.telemetry?.count('dispatcherRecovery')
+            yield* Effect.annotateLogs(
+              Effect.logWarning('Dispatcher recovered after error'),
+              logAnnotations(TelemetryLogComponent.dispatcher, {
+                [TelemetryAttributeKey.namespace]: self.options.namespace
+              })
+            )
+          }
           self.dispatcherFailed = false
           self.lastDispatchError = undefined
           self.lastSuccessfulDispatchAt = Date.now()

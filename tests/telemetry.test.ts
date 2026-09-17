@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { ManagedRuntime } from 'effect'
+import { Effect, ManagedRuntime, Tracer } from 'effect'
 import { Activity, ActivityError, Activities, Workflow, defineQueue } from '../src'
 import type { ActivityContext, WorkflowContext } from '../src'
 import { z } from 'zod'
@@ -17,6 +17,11 @@ import {
 } from '../src/internal/telemetry'
 import { WorkflowsRuntime } from '../src/internal/runtime'
 import { ExecutionNotifier } from '../src/internal/notifier'
+import { WorkflowInterpreter } from '../src/internal/interpreter'
+import type { Journal, RunRow } from '../src/internal/journal'
+import type { Registry, RegisteredWorkflow } from '../src/internal/registry'
+import type { ActivityTransport } from '../src/internal/activity-transport'
+import type { Failure } from '../src/errors'
 import { testApp } from './helpers'
 
 const MetricsQueue = defineQueue('metrics')
@@ -112,6 +117,78 @@ test('central telemetry vocabulary uses stable package prefixes', () => {
   expect(Telemetry.package).toBe(TelemetryPackage)
   expect(Telemetry.metric.workflowStarted).toBe('better_workflows.workflow.started')
   expect(Telemetry.span.workflowRound).toBe('better-workflows.workflow.round')
+})
+
+test('workflow round spans end with correlation attributes', async () => {
+  const row: RunRow = {
+    execution_id: 'execution-1',
+    namespace: 'trace-test',
+    workflow_name: 'trace.workflow',
+    version: 3,
+    dedupe_key: 'dedupe-key',
+    input_json: 'input',
+    created_at: 0,
+    updated_at: 0,
+    state: 'running',
+    control: 'run',
+    control_revision: 0,
+    applied_revision: 0,
+    dispatched: 1,
+    event_sequence: 0,
+    wait_type: null,
+    wait_step: null,
+    result_json: null,
+    failure_json: null,
+    chain_id: 'chain-1',
+    generation: 2,
+    continued_from: null,
+    continued_to: null
+  }
+  // SAFETY: this focused round has no durable commands, so only these Journal methods are evaluated.
+  const journal = Object.assign(Object.create(null), {
+    namespace: row.namespace,
+    get: () => Effect.succeed(row),
+    assertEnd: () => Effect.succeed(undefined)
+  }) as Journal
+  // SAFETY: the immediate workflow does not resolve activities, children or sagas.
+  const registry = Object.create(null) as Registry
+  // SAFETY: the round only reads the contract identity from this registered workflow.
+  const workflow = {
+    options: { name: row.workflow_name, version: row.version }
+  } as RegisteredWorkflow
+  // SAFETY: the immediate workflow never uses the activity transport.
+  const transport = Object.create(null) as ActivityTransport
+  const interpreter = new WorkflowInterpreter(
+    journal,
+    registry,
+    workflow,
+    row.execution_id,
+    () => Effect.succeed(undefined),
+    transport
+  )
+  const spans: Array<Tracer.NativeSpan> = []
+  const tracer = Tracer.make({
+    span(options) {
+      const span = new Tracer.NativeSpan(options)
+      spans.push(span)
+      return span
+    }
+  })
+
+  const tracedRound = interpreter
+    .run(async () => 'done')
+    .pipe(Effect.provideService(Tracer.Tracer, tracer))
+  // SAFETY: the immediate round does not evaluate any WorkflowServices dependency.
+  await Effect.runPromise(tracedRound as Effect.Effect<string, Failure, never>)
+
+  const round = spans.find((span) => span.name === TelemetrySpanName.workflowRound)
+  expect(round?.status._tag).toBe('Ended')
+  expect(round?.attributes.get(TelemetryAttributeKey.workflowName)).toBe(row.workflow_name)
+  expect(round?.attributes.get(TelemetryAttributeKey.workflowVersion)).toBe(row.version)
+  expect(round?.attributes.get(TelemetryAttributeKey.executionId)).toBe(row.execution_id)
+  expect(round?.attributes.get(TelemetryAttributeKey.executionChainId)).toBe(row.chain_id)
+  expect(round?.attributes.get(TelemetryAttributeKey.executionGeneration)).toBe(row.generation)
+  expect([...spans].every((span) => span.status._tag === 'Ended')).toBe(true)
 })
 
 test('metric attributes exclude high-cardinality diagnostic identity', () => {

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { Effect, Predicate } from 'effect'
+import { Effect, Predicate, Tracer } from 'effect'
 import { SqlError } from 'effect/unstable/sql/SqlError'
 import type { Failure } from '../errors'
 import type {
@@ -9,10 +9,15 @@ import type {
   DeadLetterState,
   DiscardDeadLetterOptions
 } from '../admin-types'
-import { WorkflowError } from '../errors'
+import { toFailure, WorkflowError } from '../errors'
 import { encode, identifier, positiveInteger } from './values'
 import type { Journal, RunRow } from './journal'
-import { TelemetryAttributeKey } from './telemetry'
+import {
+  logAnnotations,
+  TelemetryAttributeKey,
+  TelemetryLogComponent,
+  TelemetrySpanName
+} from './telemetry'
 import type { TelemetryAttributes } from './telemetry'
 
 export interface ActivityDelivery {
@@ -86,6 +91,52 @@ const activityMetricAttributes = (
   if (reason !== undefined) attributes[TelemetryAttributeKey.deadLetterReason] = reason
   return attributes
 }
+
+const activitySpanAttributes = (
+  queue: string,
+  metadata: ActivityMetadata,
+  options: {
+    readonly deliveryAttempt?: number
+    readonly deadLetterId?: string
+    readonly reason?: string
+  } = {}
+): TelemetryAttributes => {
+  const attributes: TelemetryAttributes = { [TelemetryAttributeKey.queueName]: queue }
+  if (metadata.activityName !== null)
+    attributes[TelemetryAttributeKey.activityName] = metadata.activityName
+  if (metadata.activityVersion !== null)
+    attributes[TelemetryAttributeKey.activityVersion] = metadata.activityVersion
+  if (metadata.executionId !== null)
+    attributes[TelemetryAttributeKey.executionId] = metadata.executionId
+  if (metadata.stepId !== null) attributes[TelemetryAttributeKey.stepId] = metadata.stepId
+  if (metadata.businessAttempt !== null)
+    attributes[TelemetryAttributeKey.activityBusinessAttempt] = metadata.businessAttempt
+  if (options.deliveryAttempt !== undefined)
+    attributes[TelemetryAttributeKey.activityDeliveryAttempt] = options.deliveryAttempt
+  if (options.deadLetterId !== undefined)
+    attributes[TelemetryAttributeKey.deadLetterId] = options.deadLetterId
+  if (options.reason !== undefined)
+    attributes[TelemetryAttributeKey.deadLetterReason] = options.reason
+  return attributes
+}
+
+const activityMetadataFromDeadLetter = (row: DeadLetterRow): ActivityMetadata => ({
+  executionId: row.execution_id,
+  stepId: row.step_id,
+  activityName: row.activity_name,
+  activityVersion: row.activity_version,
+  businessAttempt: row.business_attempt
+})
+
+const annotateSpan = (span: Tracer.Span, attributes: TelemetryAttributes): void => {
+  for (const [key, value] of Object.entries(attributes)) span.attribute(key, value)
+}
+
+const deadLetterLogAnnotations = (journal: Journal, attributes: TelemetryAttributes) =>
+  logAnnotations(TelemetryLogComponent.deadLetter, {
+    [TelemetryAttributeKey.namespace]: journal.namespace,
+    ...attributes
+  })
 
 // oxlint-disable-next-line anti-slop/no-unknown-parameters -- JSON.parse produces an untrusted value at the transport boundary.
 const metadataFromParsed = (value: unknown): ActivityMetadata => {
@@ -353,9 +404,25 @@ export class DeadLetterStore {
         return toDeadLetter(existing, false)
       })
     )
-    return operation.pipe(
+    const tracedOperation = Effect.useSpan(
+      TelemetrySpanName.deadLetterCreate,
+      {
+        attributes: activitySpanAttributes(delivery.queue, metadata, {
+          deliveryAttempt: delivery.deliveryAttempt,
+          deadLetterId: id,
+          reason: reasonCode
+        }),
+        kind: 'producer'
+      },
+      () => operation
+    ).pipe(
+      Effect.tapError((error) =>
+        Effect.annotateCurrentSpan(TelemetryAttributeKey.failureCode, toFailure(error).code)
+      )
+    )
+    return tracedOperation.pipe(
       Effect.tap(() =>
-        Effect.sync(() => {
+        Effect.gen(function* () {
           const attributes = activityMetricAttributes(
             delivery.queue,
             metadata.activityName,
@@ -365,6 +432,17 @@ export class DeadLetterStore {
           if (inserted) {
             self.journal.telemetry?.count('deadLetterCreated', attributes)
             self.journal.telemetry?.count('activityDeadLettered', attributes)
+            yield* Effect.annotateLogs(
+              Effect.logWarning('Dead letter created'),
+              deadLetterLogAnnotations(
+                self.journal,
+                activitySpanAttributes(delivery.queue, metadata, {
+                  deliveryAttempt: delivery.deliveryAttempt,
+                  deadLetterId: id,
+                  reason: reasonCode
+                })
+              )
+            )
           }
           if (resolved) self.journal.telemetry?.count('deadLetterResolved', attributes)
           if (discarded) self.journal.telemetry?.count('deadLetterDiscarded', attributes)
@@ -450,7 +528,37 @@ export class DeadLetterStore {
         return toDeadLetter(updatedRow!, false)
       })
     )
-    return operation.pipe(
+    const tracedOperation = Effect.useSpan(
+      TelemetrySpanName.deadLetterRequeue,
+      {
+        attributes: { [TelemetryAttributeKey.deadLetterId]: id },
+        kind: 'producer'
+      },
+      (span) =>
+        operation.pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              if (metricCurrent)
+                annotateSpan(
+                  span,
+                  activitySpanAttributes(
+                    metricCurrent.queue_name,
+                    activityMetadataFromDeadLetter(metricCurrent),
+                    {
+                      deadLetterId: id,
+                      reason: metricCurrent.reason_code
+                    }
+                  )
+                )
+            })
+          )
+        )
+    ).pipe(
+      Effect.tapError((error) =>
+        Effect.annotateCurrentSpan(TelemetryAttributeKey.failureCode, toFailure(error).code)
+      )
+    )
+    return tracedOperation.pipe(
       Effect.tap(() =>
         Effect.sync(() => {
           if (!requeued || !metricCurrent) return
@@ -480,6 +588,7 @@ export class DeadLetterStore {
       activity_version: number | null
       reason_code: string
     }> = []
+    let metricCurrent: DeadLetterRow | undefined
     let failedRun: RunRow | undefined
     let failedAt: number | undefined
     let failedChainCreatedAt: number | undefined
@@ -488,6 +597,7 @@ export class DeadLetterStore {
         const [current] = yield* self.row(id)
         if (!current)
           return yield* failure('DEAD_LETTER_NOT_FOUND', `Dead letter ${id} was not found`)
+        metricCurrent = current
         if (current.state === 'discarded') return toDeadLetter(current, false)
         if (current.state !== 'open' && current.state !== 'requeued')
           return yield* failure(
@@ -555,7 +665,37 @@ export class DeadLetterStore {
         return toDeadLetter(updated!, false)
       })
     )
-    return operation.pipe(
+    const tracedOperation = Effect.useSpan(
+      TelemetrySpanName.deadLetterDiscard,
+      {
+        attributes: { [TelemetryAttributeKey.deadLetterId]: id },
+        kind: 'producer'
+      },
+      (span) =>
+        operation.pipe(
+          Effect.tap(() =>
+            Effect.sync(() => {
+              if (metricCurrent)
+                annotateSpan(
+                  span,
+                  activitySpanAttributes(
+                    metricCurrent.queue_name,
+                    activityMetadataFromDeadLetter(metricCurrent),
+                    {
+                      deadLetterId: id,
+                      reason: metricCurrent.reason_code
+                    }
+                  )
+                )
+            })
+          )
+        )
+    ).pipe(
+      Effect.tapError((error) =>
+        Effect.annotateCurrentSpan(TelemetryAttributeKey.failureCode, toFailure(error).code)
+      )
+    )
+    return tracedOperation.pipe(
       Effect.tap(() =>
         Effect.sync(() => {
           for (const row of discarded)

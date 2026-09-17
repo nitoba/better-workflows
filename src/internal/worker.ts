@@ -14,7 +14,13 @@ import type { RegisteredActivity } from './registry'
 import { ActivityTransport, activityMetadata, type ActivityDelivery } from './activity-transport'
 import { ActivityEnvelopeSchema, activityDeferred } from './wire'
 import type { ActivityEnvelope } from './wire'
-import { TelemetryAttributeKey } from './telemetry'
+import {
+  logAnnotations,
+  TelemetryAttributeKey,
+  TelemetryLogComponent,
+  TelemetrySpanName
+} from './telemetry'
+import type { TelemetryAttributes } from './telemetry'
 
 class LeaseLost extends Error {
   constructor() {
@@ -75,6 +81,52 @@ const activityMetricAttributes = (activity: RegisteredActivity) => ({
   [TelemetryAttributeKey.queueName]: activity.options.queue
 })
 
+const activitySpanAttributes = (
+  activity: RegisteredActivity,
+  payload: Pick<ActivityEnvelope, 'executionId' | 'stepId' | 'attempt'>,
+  deliveryAttempt: number
+) => ({
+  ...activityMetricAttributes(activity),
+  [TelemetryAttributeKey.executionId]: payload.executionId,
+  [TelemetryAttributeKey.stepId]: payload.stepId,
+  [TelemetryAttributeKey.activityBusinessAttempt]: payload.attempt,
+  [TelemetryAttributeKey.activityDeliveryAttempt]: deliveryAttempt
+})
+
+const workerLogAnnotations = (
+  journal: Journal,
+  queue: string,
+  attributes: TelemetryAttributes = {}
+) =>
+  logAnnotations(TelemetryLogComponent.activityWorker, {
+    [TelemetryAttributeKey.namespace]: journal.namespace,
+    [TelemetryAttributeKey.queueName]: queue,
+    ...attributes
+  })
+
+const leaseLostLog = (journal: Journal, queue: string, attributes: TelemetryAttributes) =>
+  Effect.annotateLogs(
+    Effect.logWarning('Activity lease lost'),
+    workerLogAnnotations(journal, queue, {
+      ...attributes,
+      [TelemetryAttributeKey.failureCode]: 'LEASE_LOST'
+    })
+  )
+
+const activityMetadataLogAttributes = (
+  metadata: ReturnType<typeof activityMetadata>
+): TelemetryAttributes => {
+  const attributes: TelemetryAttributes = {}
+  if (metadata.executionId !== null)
+    attributes[TelemetryAttributeKey.executionId] = metadata.executionId
+  if (metadata.stepId !== null) attributes[TelemetryAttributeKey.stepId] = metadata.stepId
+  if (metadata.activityName !== null)
+    attributes[TelemetryAttributeKey.activityName] = metadata.activityName
+  if (metadata.activityVersion !== null)
+    attributes[TelemetryAttributeKey.activityVersion] = metadata.activityVersion
+  return attributes
+}
+
 export function activityWorker(
   queue: string,
   activities: readonly RegisteredActivity[],
@@ -119,6 +171,11 @@ export function activityWorker(
       if (claim === 'closed') return Exit.fail(cancelled)
       if (claim === 'stale') {
         journal.telemetry?.count('activityLeaseLost', attributes)
+        yield* leaseLostLog(
+          journal,
+          queue,
+          activitySpanAttributes(activity, payload, delivery.deliveryAttempt)
+        )
         return yield* Effect.fail(new LeaseLost())
       }
       const owned = claim
@@ -129,10 +186,23 @@ export function activityWorker(
       }
       if (owned.owner_token !== owner) {
         journal.telemetry?.count('activityLeaseLost', attributes)
+        yield* leaseLostLog(
+          journal,
+          queue,
+          activitySpanAttributes(activity, payload, delivery.deliveryAttempt)
+        )
         return yield* Effect.fail(new LeaseLost())
       }
 
       journal.telemetry?.count('activityStarted', attributes)
+      yield* Effect.annotateLogs(
+        Effect.logDebug('Activity claimed'),
+        workerLogAnnotations(
+          journal,
+          queue,
+          activitySpanAttributes(activity, payload, delivery.deliveryAttempt)
+        )
+      )
       if (permits.usesPermits(owned) && delivery.acquiredAt !== null) {
         const permitAt = yield* durable(journal.databaseNow())
         journal.telemetry?.observe(
@@ -143,7 +213,7 @@ export function activityWorker(
       }
 
       yield* Effect.addFinalizer(() => permits.release(owned).pipe(Effect.orDie))
-      const work = promised(async (signal) => {
+      const rawWork = promised(async (signal) => {
         const input = await validate(
           activity.options.input,
           decode(payload.input),
@@ -183,12 +253,29 @@ export function activityWorker(
               retryable: true
             })
         }),
-        Effect.result,
         (effect) =>
           journal.clock
             ? Effect.provideService(effect, Clock.Clock, effectClock(journal.clock))
             : effect
       )
+      const work = Effect.useSpan(
+        TelemetrySpanName.activityExecute,
+        {
+          attributes: activitySpanAttributes(activity, payload, delivery.deliveryAttempt),
+          parent: Tracer.externalSpan({
+            traceId: payload.traceId,
+            spanId: payload.spanId,
+            sampled: payload.sampled
+          }),
+          kind: 'consumer'
+        },
+        (span) =>
+          rawWork.pipe(
+            Effect.tapError((error) =>
+              Effect.sync(() => span.attribute(TelemetryAttributeKey.failureCode, error.code))
+            )
+          )
+      ).pipe(Effect.result)
 
       const monitor = Effect.gen(function* () {
         let elapsed = 0
@@ -202,6 +289,11 @@ export function activityWorker(
             elapsed = 0
             if (!(yield* durable(permits.renew(owned, lease)))) {
               journal.telemetry?.count('activityLeaseLost', attributes)
+              yield* leaseLostLog(
+                journal,
+                queue,
+                activitySpanAttributes(activity, payload, delivery.deliveryAttempt)
+              )
               return yield* Effect.fail(new LeaseLost())
             }
           }
@@ -225,6 +317,11 @@ export function activityWorker(
           failure && payload.attempt < payload.maxAttempts ? payload.retryDelayMs : undefined
         if (!(yield* durable(permits.finish(owned, result, failure, retryDelay)))) {
           journal.telemetry?.count('activityLeaseLost', attributes)
+          yield* leaseLostLog(
+            journal,
+            queue,
+            activitySpanAttributes(activity, payload, delivery.deliveryAttempt)
+          )
           return yield* Effect.fail(new LeaseLost())
         }
         if (handlerFinished)
@@ -239,6 +336,16 @@ export function activityWorker(
           journal.telemetry?.count('activityRetryScheduled', attributes)
           journal.telemetry?.observe('activityRetryDelay', retryDelay, attributes)
         }
+        const logAttributes: TelemetryAttributes = activitySpanAttributes(
+          activity,
+          payload,
+          delivery.deliveryAttempt
+        )
+        if (failure) logAttributes[TelemetryAttributeKey.failureCode] = failure.code
+        yield* Effect.annotateLogs(
+          Effect.logDebug(failure ? 'Activity failed' : 'Activity completed'),
+          workerLogAnnotations(journal, queue, logAttributes)
+        )
         return failure ? Exit.fail(failure) : Exit.succeed(result!)
       }).pipe(semaphore.withPermits(1))
     }).pipe(Effect.scoped)
@@ -263,7 +370,16 @@ export function activityWorker(
         yield* durable(
           transport.deadLetter(delivery, error.metadata, error.reasonCode, error.message)
         )
-      else yield* durable(transport.retry(delivery, 'Envelope decode failed', poll))
+      else {
+        yield* durable(transport.retry(delivery, 'Envelope decode failed', poll))
+        const metadata = activityMetadata(delivery.payload)
+        const attributes = activityMetadataLogAttributes(metadata)
+        attributes[TelemetryAttributeKey.failureCode] = toFailure(error).code
+        yield* Effect.annotateLogs(
+          Effect.logWarning('Activity delivery will be retried'),
+          workerLogAnnotations(journal, queue, attributes)
+        )
+      }
       return
     }
     const envelope = parsed.success
@@ -284,24 +400,28 @@ export function activityWorker(
       )
       return
     }
-    const outcome = yield* Effect.result(
-      execute(activity, envelope, delivery).pipe(
-        Effect.withSpan(
-          `better-workflows/activity/${activity.options.name}@${activity.options.version}`,
-          {
-            parent: Tracer.externalSpan({
-              traceId: envelope.traceId,
-              spanId: envelope.spanId,
-              sampled: envelope.sampled
+    const tracedExecution =
+      delivery.deliveryAttempt > 1
+        ? execute(activity, envelope, delivery).pipe(
+            Effect.tapError((error) =>
+              Effect.annotateCurrentSpan(TelemetryAttributeKey.failureCode, toFailure(error).code)
+            ),
+            Effect.withSpan(TelemetrySpanName.activityRedelivery, {
+              attributes: activitySpanAttributes(activity, envelope, delivery.deliveryAttempt),
+              parent: Tracer.externalSpan({
+                traceId: envelope.traceId,
+                spanId: envelope.spanId,
+                sampled: envelope.sampled
+              }),
+              kind: 'consumer'
             })
-          }
-        )
-      )
-    )
+          )
+        : execute(activity, envelope, delivery)
+    const outcome = yield* Effect.result(tracedExecution)
     if (Result.isFailure(outcome)) {
       const error = outcome.failure
       if (error instanceof ActivityPermitBlocked) yield* durable(transport.release(delivery, poll))
-      else
+      else {
         yield* durable(
           transport.retry(
             delivery,
@@ -309,6 +429,14 @@ export function activityWorker(
             poll
           )
         )
+        yield* Effect.annotateLogs(
+          Effect.logWarning('Activity delivery will be retried'),
+          workerLogAnnotations(journal, queue, {
+            ...activitySpanAttributes(activity, envelope, delivery.deliveryAttempt),
+            [TelemetryAttributeKey.failureCode]: toFailure(error).code
+          })
+        )
+      }
       return
     }
     yield* DurableDeferred.done(activityDeferred(envelope.stepId, envelope.attempt), {
@@ -327,9 +455,12 @@ export function activityWorker(
         Effect.catchCause((cause) =>
           Cause.hasInterruptsOnly(cause)
             ? Effect.failCause(cause)
-            : Effect.logWarning('Activity delivery will be retried', Cause.pretty(cause)).pipe(
-                Effect.andThen(Effect.sleep(poll))
-              )
+            : Effect.annotateLogs(
+                Effect.logWarning('Activity delivery will be retried'),
+                workerLogAnnotations(journal, queue, {
+                  [TelemetryAttributeKey.failureCode]: toFailure(Cause.squash(cause)).code
+                })
+              ).pipe(Effect.andThen(Effect.sleep(poll)))
         )
       )
     }
