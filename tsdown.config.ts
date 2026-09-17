@@ -7,7 +7,8 @@ export default defineConfig({
     postgres: 'src/postgres.ts',
     admin: 'src/admin.ts',
     testing: 'src/testing.ts',
-    cli: 'src/cli.ts'
+    cli: 'src/cli.ts',
+    observability: 'src/observability.ts'
   },
   format: ['esm'],
   platform: 'node',

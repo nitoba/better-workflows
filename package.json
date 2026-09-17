@@ -52,6 +52,10 @@
     "./testing": {
       "types": "./dist/testing.d.mts",
       "import": "./dist/testing.mjs"
+    },
+    "./observability": {
+      "types": "./dist/observability.d.mts",
+      "import": "./dist/observability.mjs"
     }
   },
   "scripts": {

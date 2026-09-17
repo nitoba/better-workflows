@@ -463,19 +463,26 @@ function makeTelemetry(context: Context.Context<never>): TelemetryApi {
   }
 }
 
-const metricRegistryLayer = Layer.effect(
+export const metricRegistryLayer = Layer.effect(
   Metric.MetricRegistry,
   Effect.sync(() => new Map())
 )
 
-/** Supply a fresh metric registry and telemetry service for one managed runtime. */
-export const telemetryLayer = Layer.effect(
+const telemetryServiceLayer = Layer.effect(
   TelemetryService,
   Effect.gen(function* () {
     const registry = yield* Metric.MetricRegistry
     return TelemetryService.of(makeTelemetry(Context.make(Metric.MetricRegistry, registry)))
   })
-).pipe(Layer.provide(metricRegistryLayer))
+)
+
+/** Supply a fresh metric registry and telemetry service for one managed runtime. */
+export const telemetryLayer = telemetryServiceLayer.pipe(Layer.provide(metricRegistryLayer))
+
+/** Internal composition that exposes the registry to a metrics exporter. */
+export const telemetryLayerWithRegistry = telemetryServiceLayer.pipe(
+  Layer.provideMerge(metricRegistryLayer)
+)
 
 /** Central vocabulary consumed by later metrics, tracing and logging adapters. */
 export const Telemetry = {

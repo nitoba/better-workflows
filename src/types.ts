@@ -538,6 +538,66 @@ export interface ExecutionOptions {
   }
 }
 
+/** Log severities accepted by the OTLP logging exporter configuration. */
+export type OtlpLogLevel = 'trace' | 'debug' | 'info' | 'warn' | 'error' | 'fatal' | 'none'
+
+/** Common enablement and batching settings for one OTLP signal. */
+export interface OtlpSignalOptions {
+  /** Whether this signal should be exported. @defaultValue true when configured */
+  readonly enabled?: boolean
+  /** Positive interval between export attempts. */
+  readonly exportInterval?: Duration
+}
+
+/** OTLP metrics signal settings. */
+export interface OtlpMetricsOptions extends OtlpSignalOptions {
+  /** Aggregation mode used by the metrics exporter. @defaultValue "cumulative" */
+  readonly temporality?: 'cumulative' | 'delta'
+}
+
+/** OTLP logs signal settings. */
+export interface OtlpLogsOptions extends OtlpSignalOptions {
+  /** Minimum log severity exported by the runtime. @defaultValue "info" */
+  readonly level?: OtlpLogLevel
+}
+
+/** Input used by {@link otlp} to configure OTLP/HTTP export. */
+export interface OtlpOptions {
+  /** Service identity sent as the standard `service.name` resource attribute. */
+  readonly serviceName: string
+  /** Optional application release sent as `service.version`. */
+  readonly serviceVersion?: string
+  /** OTLP/HTTP collector base URL; `/v1/*` paths are added by the exporter. */
+  readonly endpoint: string
+  /** Trace export settings; `true` enables traces with Effect's default interval. */
+  readonly traces?: boolean | OtlpSignalOptions
+  /** Metrics export settings; omitted metrics are disabled. */
+  readonly metrics?: boolean | OtlpMetricsOptions
+  /** Logs export settings; omitted logs are disabled. */
+  readonly logs?: boolean | OtlpLogsOptions
+  /** Fallback interval for configured signals without their own interval. */
+  readonly exportInterval?: Duration
+  /** Maximum records in one OTLP request. @defaultValue 1000 */
+  readonly maxBatchSize?: number
+  /** Maximum time allowed for exporter final flush. @defaultValue "3s" */
+  readonly shutdownTimeout?: Duration
+  /** Metrics aggregation mode when not specified on `metrics`. */
+  readonly metricsTemporality?: 'cumulative' | 'delta'
+  /** Additional low-cardinality resource attributes. */
+  readonly attributes?: Readonly<Record<string, string | number | boolean>>
+  /** Headers sent to the collector; values are never included in library logs. */
+  readonly headers?: Readonly<Record<string, string>>
+}
+
+/** Validated OTLP configuration returned by {@link otlp}. */
+export interface OtlpObservabilityOptions extends OtlpOptions {
+  /** Identifies the built-in OTLP exporter configuration. */
+  readonly kind: 'otlp'
+}
+
+/** Public observability configuration accepted by the workflow root module. */
+export type ObservabilityOptions = OtlpObservabilityOptions
+
 /**
  * Register a Nest implementation class or reuse an already-exported instance.
  * A class is instantiated in the feature; `{ provide, useExisting }` identifies the
@@ -986,6 +1046,8 @@ export interface WorkflowsOptions {
    * Storage description from the sqlite or postgres subpath; connections open at bootstrap.
    */
   readonly storage: SqliteStorage | PostgresStorage
+  /** Optional best-effort OTLP/HTTP tracing, metrics and logging export. */
+  readonly observability?: ObservabilityOptions
   /**
    * Whether infrastructure providers are global; domain handlers/clients are never made global.
    * With false, explicitly import/reexport the same root module into features.

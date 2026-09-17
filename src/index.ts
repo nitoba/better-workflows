@@ -66,7 +66,14 @@ export type {
   WorkflowOptions,
   WorkflowOutput,
   WorkflowsAsyncOptions,
-  WorkflowsOptions
+  WorkflowsOptions,
+  OtlpLogLevel,
+  OtlpLogsOptions,
+  OtlpMetricsOptions,
+  OtlpObservabilityOptions,
+  OtlpOptions,
+  OtlpSignalOptions,
+  ObservabilityOptions
 } from './types'
 
 export { WorkflowsAdmin } from './admin'

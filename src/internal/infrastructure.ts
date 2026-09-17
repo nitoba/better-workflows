@@ -10,10 +10,11 @@ import { WorkflowError } from '../errors'
 import type { WorkflowsOptions } from '../types'
 import { identifier, milliseconds, positiveInteger } from './values'
 import { sharedSqlite } from './shared-sqlite'
-import { telemetryLayer } from './telemetry'
+import { otlpLayer, validateOtlpOptions } from './otlp'
 
 export function validateOptions(options: WorkflowsOptions): void {
   identifier(options.namespace, 'Namespace')
+  if (options.observability) validateOtlpOptions(options.observability)
   if (
     options.migrations !== undefined &&
     options.migrations !== 'run' &&
@@ -92,7 +93,7 @@ export async function makeInfrastructure(options: WorkflowsOptions) {
   const layer = Layer.mergeAll(
     ClusterWorkflowEngine.layer.pipe(Layer.provide(cluster)),
     PersistedQueue.layer.pipe(Layer.provide(queueStorage)),
-    telemetryLayer
+    otlpLayer(options)
   ).pipe(Layer.provideMerge(preparedDatabase))
   return ManagedRuntime.make(layer)
 }
