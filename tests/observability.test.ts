@@ -1,5 +1,6 @@
 import { createServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
+import { spawn, type ChildProcess } from 'node:child_process'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -165,6 +166,57 @@ function spanAttribute(span: OtlpTraceSpan, key: string): string | number | bool
   if (value.intValue !== undefined) return Number(value.intValue)
   if (value.doubleValue !== undefined) return value.doubleValue
   return value.boolValue
+}
+
+interface FixtureMessage {
+  readonly type: string
+  readonly executionId?: string
+  readonly result?: string
+}
+
+function nextFixtureMessage(child: ChildProcess, timeoutMs = 20_000): Promise<FixtureMessage> {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      reject(new Error('PostgreSQL tracing fixture did not respond in time'))
+    }, timeoutMs)
+    child.once('message', (message) => {
+      clearTimeout(timeout)
+      // SAFETY: the fixture and this test use the bounded FixtureMessage IPC protocol.
+      resolve(message as FixtureMessage)
+    })
+    child.once('error', (error) => {
+      clearTimeout(timeout)
+      reject(error)
+    })
+    child.once('exit', (code, signal) => {
+      clearTimeout(timeout)
+      reject(new Error(`PostgreSQL tracing fixture exited ${code ?? 'null'} ${signal ?? ''}`))
+    })
+  })
+}
+
+function spawnTraceFixture(
+  role: 'orchestrator' | 'worker',
+  endpoint: string,
+  namespace: string,
+  secret: string
+): ChildProcess {
+  return spawn(process.execPath, ['tests/fixtures/observability-postgres-worker.ts'], {
+    cwd: process.cwd(),
+    env: {
+      ...process.env,
+      WORKFLOWS_TRACE_ENDPOINT: endpoint,
+      WORKFLOWS_TRACE_NAMESPACE: namespace,
+      WORKFLOWS_TRACE_ROLE: role,
+      WORKFLOWS_TRACE_SECRET: secret
+    },
+    stdio: ['ignore', 'pipe', 'pipe', 'ipc']
+  })
+}
+
+async function waitForFixtureExit(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return
+  await new Promise<void>((resolve) => child.once('exit', () => resolve()))
 }
 
 function invalidConfiguration(action: () => void): void {
@@ -514,3 +566,46 @@ test('dead-letter tracing correlates create, requeue and restored execution with
   )
   expect(requests.map((request) => request.body).join('\n')).not.toContain(secret)
 })
+
+const postgresConnectionString = process.env['WORKFLOWS_TEST_POSTGRES_URL']
+
+test.skipIf(!postgresConnectionString)(
+  'PostgreSQL tracing propagates activity context across worker processes',
+  async () => {
+    if (!postgresConnectionString) return
+    const namespace = `observability-pg-${process.pid}-${Date.now()}`
+    const secret = 'SUPER_SECRET_TEST_VALUE'
+    const requests = await collectOtlpRequests(async (endpoint) => {
+      const orchestrator = spawnTraceFixture('orchestrator', endpoint, namespace, secret)
+      let worker: ChildProcess | undefined
+      try {
+        const started = await nextFixtureMessage(orchestrator)
+        expect(started.type).toBe('started')
+        expect(started.executionId).toEqual(expect.any(String))
+
+        worker = spawnTraceFixture('worker', endpoint, namespace, secret)
+        expect((await nextFixtureMessage(worker)).type).toBe('ready')
+
+        const completed = await nextFixtureMessage(orchestrator)
+        expect(completed).toMatchObject({ type: 'complete', result: `processed:${secret}` })
+        worker.send?.({ type: 'stop' })
+        expect((await nextFixtureMessage(worker)).type).toBe('stopped')
+        await Promise.all([waitForFixtureExit(orchestrator), waitForFixtureExit(worker)])
+      } finally {
+        if (orchestrator.exitCode === null && orchestrator.signalCode === null)
+          orchestrator.kill('SIGKILL')
+        if (worker && worker.exitCode === null && worker.signalCode === null) worker.kill('SIGKILL')
+      }
+    })
+
+    const spans = exportedOtlpSpans(requests)
+    const dispatch = spans.find((span) => span.name === 'better-workflows.activity.dispatch')
+    const execute = spans.find((span) => span.name === 'better-workflows.activity.execute')
+    expect(dispatch).toBeDefined()
+    expect(execute).toBeDefined()
+    // SAFETY: these assertions verify that the producer and worker spans were exported.
+    expect(execute!.traceId).toBe(dispatch!.traceId)
+    expect(execute!.parentSpanId).toBe(dispatch!.spanId)
+    expect(requests.map((request) => request.body).join('\n')).not.toContain(secret)
+  }
+)
