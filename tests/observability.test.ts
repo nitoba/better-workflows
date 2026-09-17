@@ -1,14 +1,17 @@
 import { createServer } from 'node:http'
 import type { AddressInfo } from 'node:net'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import { expect, test } from 'bun:test'
 import { Effect, ManagedRuntime } from 'effect'
 import { otlp } from '../src/observability'
-import { Activity, Activities, Workflow, defineQueue } from '../src'
+import { Activity, Activities, Workflow, WorkflowsAdmin, defineQueue } from '../src'
 import type { WorkflowContext, WorkflowsOptions } from '../src'
 import { WorkflowError } from '../src/errors'
 import { otlpLayer, otlpResource } from '../src/internal/otlp'
 import { TelemetryService } from '../src/internal/telemetry'
-import { testApp } from './helpers'
+import { eventually, testApp } from './helpers'
 import { z } from 'zod'
 
 const TraceQueue = defineQueue('observability-traces')
@@ -41,6 +44,50 @@ class OtlpContinuationWorkflow {
     return input
   }
 }
+
+const DeadLetterTraceQueue = defineQueue('observability-dead-letters')
+
+@Activities()
+class RecoverableActivities {
+  @Activity({
+    name: 'observability.recoverable',
+    version: 1,
+    queue: DeadLetterTraceQueue,
+    input: z.string(),
+    output: z.string()
+  })
+  async recover(value: string): Promise<string> {
+    return `recovered:${value}`
+  }
+}
+
+@Activities()
+class IncompatibleActivities {
+  @Activity({
+    name: 'observability.incompatible',
+    version: 1,
+    queue: DeadLetterTraceQueue,
+    input: z.string(),
+    output: z.string()
+  })
+  async run(value: string): Promise<string> {
+    return value
+  }
+}
+
+@Workflow({
+  name: 'observability.dead-letter-owner',
+  version: 1,
+  input: z.string(),
+  output: z.string()
+})
+class OtlpDeadLetterWorkflow {
+  async run(input: string, context: WorkflowContext): Promise<string> {
+    return context.activities(RecoverableActivities).recover(input, { stepId: 'recover' })
+  }
+}
+
+type DeadLetterTestApp = Awaited<ReturnType<typeof testApp<typeof OtlpDeadLetterWorkflow>>>
 
 interface OtlpTraceSpan {
   readonly name: string
@@ -376,4 +423,94 @@ test('continue-as-new spans retain chain and generation correlation', async () =
   expect(new Set(generations)).toEqual(new Set([0, 1]))
   for (const executionId of executionIds) expect(executionId).toEqual(expect.any(String))
   expect(new Set(executionIds).size).toBe(2)
+})
+
+test('dead-letter tracing correlates create, requeue and restored execution without payloads', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'better-workflows-dlq-tracing-'))
+  const filename = join(directory, 'workflows.sqlite')
+  const secret = 'SUPER_SECRET_TEST_VALUE'
+  let incompatibleApp: DeadLetterTestApp | undefined
+  let operatorApp: DeadLetterTestApp | undefined
+  let restoredApp: DeadLetterTestApp | undefined
+
+  const requests = await collectOtlpRequests(async (endpoint) => {
+    const telemetry = otlp({
+      serviceName: 'dead-letter-tracing-test',
+      endpoint,
+      traces: { exportInterval: '5ms' },
+      metrics: false,
+      logs: false,
+      shutdownTimeout: '1s'
+    })
+    try {
+      incompatibleApp = await testApp(OtlpDeadLetterWorkflow, {
+        filename,
+        providers: [IncompatibleActivities],
+        activityContracts: [RecoverableActivities],
+        queues: [{ queue: DeadLetterTraceQueue, concurrency: 1 }],
+        observability: telemetry
+      })
+      const handle = await incompatibleApp.client.start(secret)
+      const blocked = await eventually(
+        () => handle.describe(),
+        (snapshot) => snapshot.status === 'blocked' && snapshot.blockedOn !== undefined
+      )
+      expect(blocked.blockedOn).toBeDefined()
+      const deadLetters = await eventually(
+        () => incompatibleApp!.module.get(WorkflowsAdmin).listDeadLetters({ state: 'open' }),
+        (page) => page.deadLetters.length === 1
+      )
+      const deadLetter = deadLetters.deadLetters[0]!
+      await incompatibleApp.close()
+      incompatibleApp = undefined
+
+      operatorApp = await testApp(OtlpDeadLetterWorkflow, {
+        filename,
+        execution: { workflows: { enabled: false }, activities: { enabled: false } },
+        activityContracts: [RecoverableActivities],
+        queues: [{ queue: DeadLetterTraceQueue, concurrency: 1 }],
+        observability: telemetry
+      })
+      await operatorApp.module.get(WorkflowsAdmin).requeueDeadLetter(deadLetter.id)
+      await operatorApp.close()
+      operatorApp = undefined
+
+      restoredApp = await testApp(OtlpDeadLetterWorkflow, {
+        filename,
+        providers: [RecoverableActivities],
+        queues: [{ queue: DeadLetterTraceQueue, concurrency: 1 }],
+        observability: telemetry
+      })
+      const restored = restoredApp.client.getHandle(handle.executionId)
+      expect(await restored.result({ timeout: '5s' })).toBe(`recovered:${secret}`)
+    } finally {
+      await restoredApp?.close()
+      restoredApp = undefined
+      await operatorApp?.close()
+      operatorApp = undefined
+      await incompatibleApp?.close()
+      incompatibleApp = undefined
+    }
+  })
+  await rm(directory, { recursive: true, force: true })
+
+  const spans = exportedOtlpSpans(requests)
+  const created = spans.find((span) => span.name === 'better-workflows.dead_letter.create')
+  const requeued = spans.find((span) => span.name === 'better-workflows.dead_letter.requeue')
+  const executed = spans.find((span) => span.name === 'better-workflows.activity.execute')
+  expect(created).toBeDefined()
+  expect(requeued).toBeDefined()
+  expect(executed).toBeDefined()
+  // SAFETY: these assertions verify that all expected DLQ and execution spans were exported.
+  expect(spanAttribute(created!, 'better_workflows.execution.id')).toBeDefined()
+  expect(spanAttribute(requeued!, 'better_workflows.execution.id')).toBe(
+    spanAttribute(created!, 'better_workflows.execution.id')
+  )
+  expect(spanAttribute(executed!, 'better_workflows.execution.id')).toBe(
+    spanAttribute(created!, 'better_workflows.execution.id')
+  )
+  expect(spanAttribute(created!, 'better_workflows.dead_letter.id')).toBe(
+    spanAttribute(requeued!, 'better_workflows.dead_letter.id')
+  )
+  expect(requests.map((request) => request.body).join('\n')).not.toContain(secret)
 })
