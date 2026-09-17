@@ -137,6 +137,68 @@ export interface RetentionResult {
   readonly tombstonesRetained: number
 }
 
+/** Counts of active executions in the administered namespace by observable status. */
+export interface WorkflowExecutionStats {
+  /** Executions persisted but not yet dispatched. */
+  readonly accepted: number
+  /** Executions whose interpreter is advancing. */
+  readonly running: number
+  /** Executions with one or more durable commands pending. */
+  readonly waiting: number
+  /** Executions blocked on an operational activity dependency. */
+  readonly blocked: number
+  /** Executions with a cooperative pause requested. */
+  readonly paused: number
+  /** Executions with cancellation being reconciled. */
+  readonly cancelling: number
+}
+
+/** Namespace-wide activity delivery backlog grouped by logical queue. */
+export interface QueueStats {
+  /** Logical activity queue name. */
+  readonly name: string
+  /** Deliveries waiting to become visible or be acquired. */
+  readonly pending: number
+  /** Deliveries currently owned by a worker. */
+  readonly processing: number
+  /** Age of the oldest pending delivery, or zero when none are pending. */
+  readonly oldestPendingAgeMs: number
+}
+
+/** Namespace-wide dead-letter backlog counts. */
+export interface DeadLetterStats {
+  /** Dead letters awaiting operator action. */
+  readonly open: number
+  /** Dead letters that have been requeued and await a replacement outcome. */
+  readonly requeued: number
+  /** Age of the oldest open dead letter, or zero when none are open. */
+  readonly oldestOpenAgeMs: number
+}
+
+/** Namespace-wide overdue durable deadline counts. */
+export interface DeadlineStats {
+  /** Timers whose deadline has passed and have not been delivered. */
+  readonly dueTimers: number
+  /** Activity retries whose deadline has passed and have not been delivered. */
+  readonly overdueRetries: number
+  /** Greatest overdue age across due timers and retries, or zero when none are due. */
+  readonly oldestLagMs: number
+}
+
+/** Read-only operational snapshot of the durable namespace; payloads are excluded. */
+export interface WorkflowsStats {
+  /** Database time at which this global snapshot was generated. */
+  readonly generatedAt: string
+  /** Active execution counts; terminal and continued history is intentionally omitted. */
+  readonly executions: WorkflowExecutionStats
+  /** Activity delivery backlog grouped by queue. */
+  readonly queues: readonly QueueStats[]
+  /** Operational dead-letter backlog. */
+  readonly deadLetters: DeadLetterStats
+  /** Overdue timer and retry backlog. */
+  readonly deadlines: DeadlineStats
+}
+
 /** Operational state of one persisted activity delivery dead letter. */
 export type DeadLetterState = 'open' | 'requeued' | 'resolved' | 'discarded'
 
@@ -210,6 +272,7 @@ export interface AdminBackend {
   migrationStatus(): Promise<MigrationStatus>
   migrate(): Promise<MigrationStatus>
   validateMigrations(): Promise<MigrationStatus>
+  stats(): Promise<WorkflowsStats>
   previewRetention(options: RetentionOptions): Promise<RetentionPlan>
   pruneRetention(plan: RetentionPlan, confirm: boolean): Promise<RetentionResult>
   setQueueLimits(

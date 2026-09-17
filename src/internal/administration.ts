@@ -2,8 +2,18 @@ import { createHash } from 'node:crypto'
 import { Effect } from 'effect'
 import type { Failure } from '../errors'
 import type { QueueOptions } from '../types'
-import type { RetentionOptions, RetentionPlan, RetentionResult } from '../admin-types'
-import type { DeadLetterListOptions, DiscardDeadLetterOptions } from '../admin-types'
+import type {
+  DeadLetterListOptions,
+  DeadlineStats,
+  DeadLetterStats,
+  DiscardDeadLetterOptions,
+  QueueStats,
+  RetentionOptions,
+  RetentionPlan,
+  RetentionResult,
+  WorkflowExecutionStats,
+  WorkflowsStats
+} from '../admin-types'
 import type { Journal, RunRow } from './journal'
 import { encode, identifier, positiveInteger } from './values'
 import { workflowDefinition } from './wire'
@@ -34,6 +44,147 @@ const tables = [
 /** Preview is read-only; apply revalidates and locks each candidate in one transaction. */
 export class SqlAdministration {
   constructor(readonly journal: Journal) {}
+
+  /** Read a namespace-wide operational snapshot using fixed-size aggregation queries. */
+  stats() {
+    const self = this
+    return Effect.gen(function* () {
+      const now = yield* self.journal.databaseNow()
+      const executionRows = yield* self.journal.sql<{
+        status: string
+        count: number
+      }>`SELECT status, COUNT(*) AS count FROM (
+        SELECT CASE
+          WHEN state IN ('continued', 'completed', 'failed', 'cancelled') THEN state
+          WHEN control = 'pause' THEN 'paused'
+          WHEN control = 'cancel' THEN 'cancelling'
+          ELSE state
+        END AS status
+        FROM better_workflows_runs
+        WHERE namespace = ${self.journal.namespace}
+      ) AS current_executions
+      WHERE status IN ('accepted', 'running', 'waiting', 'blocked', 'paused', 'cancelling')
+      GROUP BY status`
+      const executions = {
+        accepted: 0,
+        running: 0,
+        waiting: 0,
+        blocked: 0,
+        paused: 0,
+        cancelling: 0
+      } satisfies WorkflowExecutionStats
+      for (const row of executionRows) {
+        switch (row.status) {
+          case 'accepted':
+            executions.accepted = Number(row.count)
+            break
+          case 'running':
+            executions.running = Number(row.count)
+            break
+          case 'waiting':
+            executions.waiting = Number(row.count)
+            break
+          case 'blocked':
+            executions.blocked = Number(row.count)
+            break
+          case 'paused':
+            executions.paused = Number(row.count)
+            break
+          case 'cancelling':
+            executions.cancelling = Number(row.count)
+            break
+        }
+      }
+
+      const queueRows = yield* self.journal.sql<{
+        name: string
+        pending: number
+        processing: number
+        oldest_pending_at: number | null
+      }>`SELECT queue_name AS name,
+        COUNT(CASE WHEN state = 'pending' THEN 1 END) AS pending,
+        COUNT(CASE WHEN state = 'processing' THEN 1 END) AS processing,
+        MIN(CASE WHEN state = 'pending' THEN created_at END) AS oldest_pending_at
+        FROM better_workflows_activity_deliveries
+        WHERE namespace = ${self.journal.namespace}
+        GROUP BY queue_name
+        ORDER BY queue_name`
+      const queues: QueueStats[] = queueRows.map((row) => ({
+        name: row.name,
+        pending: Number(row.pending),
+        processing: Number(row.processing),
+        oldestPendingAgeMs:
+          row.oldest_pending_at === null
+            ? 0
+            : Math.max(0, Number(now) - Number(row.oldest_pending_at))
+      }))
+
+      const [deadLettersRow] = yield* self.journal.sql<{
+        open_count: number
+        requeued_count: number
+        oldest_open_at: number | null
+      }>`SELECT
+        COUNT(CASE WHEN state = 'open' THEN 1 END) AS open_count,
+        COUNT(CASE WHEN state = 'requeued' THEN 1 END) AS requeued_count,
+        MIN(CASE WHEN state = 'open' THEN first_failed_at END) AS oldest_open_at
+        FROM better_workflows_dead_letters
+        WHERE namespace = ${self.journal.namespace}`
+      const deadLetters: DeadLetterStats = {
+        open: Number(deadLettersRow?.open_count ?? 0),
+        requeued: Number(deadLettersRow?.requeued_count ?? 0),
+        oldestOpenAgeMs:
+          deadLettersRow?.oldest_open_at === null || deadLettersRow?.oldest_open_at === undefined
+            ? 0
+            : Math.max(0, Number(now) - Number(deadLettersRow.oldest_open_at))
+      }
+
+      const [deadlineRow] = yield* self.journal.sql<{
+        due_timers: number
+        overdue_retries: number
+        oldest_timer_lag: number | null
+        oldest_retry_lag: number | null
+      }>`SELECT
+        (SELECT COUNT(*) FROM better_workflows_timers
+          JOIN better_workflows_runs ON better_workflows_runs.execution_id = better_workflows_timers.execution_id
+          WHERE better_workflows_runs.namespace = ${self.journal.namespace}
+            AND better_workflows_runs.control <> 'cancel'
+            AND better_workflows_runs.state NOT IN ('continued', 'completed', 'failed', 'cancelled')
+            AND better_workflows_timers.delivered = 0 AND better_workflows_timers.deadline <= ${now}) AS due_timers,
+        (SELECT COUNT(*) FROM better_workflows_retries
+          JOIN better_workflows_runs ON better_workflows_runs.execution_id = better_workflows_retries.execution_id
+          WHERE better_workflows_runs.namespace = ${self.journal.namespace}
+            AND better_workflows_runs.control <> 'cancel'
+            AND better_workflows_runs.state NOT IN ('continued', 'completed', 'failed', 'cancelled')
+            AND better_workflows_retries.delivered = 0 AND better_workflows_retries.deadline <= ${now}) AS overdue_retries,
+        (SELECT MAX(${now} - better_workflows_timers.deadline) FROM better_workflows_timers
+          JOIN better_workflows_runs ON better_workflows_runs.execution_id = better_workflows_timers.execution_id
+          WHERE better_workflows_runs.namespace = ${self.journal.namespace}
+            AND better_workflows_runs.control <> 'cancel'
+            AND better_workflows_runs.state NOT IN ('continued', 'completed', 'failed', 'cancelled')
+            AND better_workflows_timers.delivered = 0 AND better_workflows_timers.deadline <= ${now}) AS oldest_timer_lag,
+        (SELECT MAX(${now} - better_workflows_retries.deadline) FROM better_workflows_retries
+          JOIN better_workflows_runs ON better_workflows_runs.execution_id = better_workflows_retries.execution_id
+          WHERE better_workflows_runs.namespace = ${self.journal.namespace}
+            AND better_workflows_runs.control <> 'cancel'
+            AND better_workflows_runs.state NOT IN ('continued', 'completed', 'failed', 'cancelled')
+            AND better_workflows_retries.delivered = 0 AND better_workflows_retries.deadline <= ${now}) AS oldest_retry_lag`
+      const timerLag = Number(deadlineRow?.oldest_timer_lag ?? 0)
+      const retryLag = Number(deadlineRow?.oldest_retry_lag ?? 0)
+      const deadlines: DeadlineStats = {
+        dueTimers: Number(deadlineRow?.due_timers ?? 0),
+        overdueRetries: Number(deadlineRow?.overdue_retries ?? 0),
+        oldestLagMs: Math.max(0, timerLag, retryLag)
+      }
+      const snapshot: WorkflowsStats = {
+        generatedAt: new Date(Number(now)).toISOString(),
+        executions,
+        queues,
+        deadLetters,
+        deadlines
+      }
+      return snapshot
+    })
+  }
 
   private reason(run: RunRow) {
     const self = this

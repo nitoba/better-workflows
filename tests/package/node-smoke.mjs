@@ -19,6 +19,14 @@ import {
 } from 'better-workflows'
 import { sqlite } from 'better-workflows/sqlite'
 import { postgres } from 'better-workflows/postgres'
+import { otlp } from 'better-workflows/observability'
+
+const observability = otlp({
+  serviceName: 'package-smoke',
+  endpoint: 'http://127.0.0.1:4318',
+  traces: false
+})
+assert.equal(observability.kind, 'otlp')
 
 const directory = await mkdtemp(join(tmpdir(), 'better-workflows-node-'))
 const signal = defineSignal('approve', z.boolean())

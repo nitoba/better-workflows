@@ -1,13 +1,15 @@
 #!/usr/bin/env node
 import { readFile, writeFile } from 'node:fs/promises'
 import { createWorkflowsAdmin } from './admin'
-import type { RetentionPlan } from './admin'
+import type { RetentionPlan, WorkflowsStats } from './admin'
 import type { DeadLetterListOptions } from './admin-types'
 import { sqlite } from './sqlite'
 import { postgres } from './postgres'
 import { WorkflowError } from './errors'
 
-const usage = `better-workflows migrations status|run|validate
+const usage = `better-workflows stats
+better-workflows status
+better-workflows migrations status|run|validate
 better-workflows retention preview --before <ISO date> --plan <file.json> [--limit 100]
 better-workflows retention prune --plan <file.json> --confirm
 better-workflows dead-letters list [--queue <name>] [--execution-id <id>] [--activity <name>] [--state <state>] [--cursor <id>] [--limit 100]
@@ -19,24 +21,65 @@ Set WORKFLOWS_NAMESPACE and exactly one of WORKFLOWS_SQLITE_FILE or WORKFLOWS_DA
 Migration run is an offline operation. Retention prune requires an unchanged preview file.
 `
 
+const formatAge = (ageMs: number): string => {
+  if (ageMs < 1_000) return `${Math.round(ageMs)}ms`
+  const seconds = Math.floor(ageMs / 1_000)
+  if (seconds < 60) return `${Number((ageMs / 1_000).toFixed(1))}s`
+  const minutes = Math.floor(seconds / 60)
+  const remainder = seconds % 60
+  return `${minutes}m${remainder === 0 ? '' : `${remainder}s`}`
+}
+
+const formatStats = (namespace: string, stats: WorkflowsStats): string => {
+  const queues = stats.queues.length
+    ? stats.queues.map(
+        (queue) =>
+          `  ${queue.name} pending=${queue.pending} processing=${queue.processing} oldest=${formatAge(queue.oldestPendingAgeMs)}`
+      )
+    : ['  (none)']
+  return [
+    `Namespace: ${namespace}`,
+    '',
+    'Executions',
+    `  Accepted:  ${stats.executions.accepted}`,
+    `  Running:   ${stats.executions.running}`,
+    `  Waiting:   ${stats.executions.waiting}`,
+    `  Blocked:   ${stats.executions.blocked}`,
+    `  Paused:    ${stats.executions.paused}`,
+    `  Cancelling:${stats.executions.cancelling}`,
+    '',
+    'Queues',
+    ...queues,
+    '',
+    'Dead letters',
+    `  open=${stats.deadLetters.open} requeued=${stats.deadLetters.requeued} oldest=${formatAge(stats.deadLetters.oldestOpenAgeMs)}`,
+    '',
+    'Deadlines',
+    `  timers=${stats.deadlines.dueTimers} retries=${stats.deadlines.overdueRetries} oldest=${formatAge(stats.deadlines.oldestLagMs)}`
+  ].join('\n')
+}
+
 async function main(): Promise<void> {
   const [group, command, ...args] = process.argv.slice(2)
   if (!group || group === '--help') {
     console.log(usage)
     return
   }
+  const statsCommand = group === 'stats' || group === 'status'
   const allowed = new Set(
-    group === 'retention' && command === 'preview'
-      ? ['--before', '--plan', '--limit']
-      : group === 'retention' && command === 'prune'
-        ? ['--plan', '--confirm']
-        : group === 'dead-letters' && command === 'list'
-          ? ['--queue', '--execution-id', '--activity', '--state', '--cursor', '--limit']
-          : group === 'dead-letters' && command === 'show'
-            ? ['--payload']
-            : group === 'dead-letters' && command === 'discard'
-              ? ['--reason']
-              : []
+    statsCommand
+      ? []
+      : group === 'retention' && command === 'preview'
+        ? ['--before', '--plan', '--limit']
+        : group === 'retention' && command === 'prune'
+          ? ['--plan', '--confirm']
+          : group === 'dead-letters' && command === 'list'
+            ? ['--queue', '--execution-id', '--activity', '--state', '--cursor', '--limit']
+            : group === 'dead-letters' && command === 'show'
+              ? ['--payload']
+              : group === 'dead-letters' && command === 'discard'
+                ? ['--reason']
+                : []
   )
   const flags = new Map<string, string>()
   const positional: string[] = []
@@ -56,6 +99,8 @@ async function main(): Promise<void> {
       flags.set(key, value)
     }
   }
+  if (statsCommand && (command !== undefined || positional.length > 0 || flags.size > 0))
+    throw new WorkflowError('INVALID_ARGUMENT', usage)
   const namespace = process.env.WORKFLOWS_NAMESPACE
   const filename = process.env.WORKFLOWS_SQLITE_FILE
   const connectionString = process.env.WORKFLOWS_DATABASE_URL
@@ -75,7 +120,8 @@ async function main(): Promise<void> {
         (command !== 'list' && positional.length !== 1))
     )
       throw new WorkflowError('INVALID_ARGUMENT', usage)
-    if (group === 'migrations') {
+    if (statsCommand) console.log(formatStats(namespace, await admin.stats()))
+    else if (group === 'migrations') {
       if (command === 'status')
         console.log(JSON.stringify(await admin.migrations.status(), null, 2))
       else if (command === 'run') console.log(JSON.stringify(await admin.migrations.run(), null, 2))

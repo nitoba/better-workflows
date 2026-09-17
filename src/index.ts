@@ -17,6 +17,7 @@ export {
   getWorkflowToken
 } from './decorators'
 export { WorkflowsModule } from './module'
+export { WorkflowsHealth } from './health'
 export { WorkflowClient, WorkflowHandle } from './client'
 export { ActivityError, WorkflowError, WorkflowExecutionError } from './errors'
 export type { Failure } from './errors'
@@ -73,7 +74,11 @@ export type {
   OtlpObservabilityOptions,
   OtlpOptions,
   OtlpSignalOptions,
-  ObservabilityOptions
+  ObservabilityOptions,
+  HealthCheckStatus,
+  HealthStatus,
+  WorkflowsLiveness,
+  WorkflowsReadiness
 } from './types'
 
 export { WorkflowsAdmin } from './admin'
@@ -82,5 +87,10 @@ export type {
   DeadLetterListOptions,
   DeadLetterPage,
   DeadLetterState,
-  DiscardDeadLetterOptions
+  DeadlineStats,
+  DeadLetterStats,
+  DiscardDeadLetterOptions,
+  QueueStats,
+  WorkflowExecutionStats,
+  WorkflowsStats
 } from './admin-types'

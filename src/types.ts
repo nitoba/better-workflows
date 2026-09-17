@@ -598,6 +598,61 @@ export interface OtlpObservabilityOptions extends OtlpOptions {
 /** Public observability configuration accepted by the workflow root module. */
 export type ObservabilityOptions = OtlpObservabilityOptions
 
+/** Overall status returned by workflow liveness and readiness checks. */
+export type HealthStatus = 'up' | 'degraded' | 'down'
+
+/** Status of one readiness dependency; disabled means it is not required here. */
+export type HealthCheckStatus = HealthStatus | 'disabled'
+
+/** Lightweight process liveness result; it does not query the database. */
+export interface WorkflowsLiveness {
+  /** `up` while the managed runtime is initialized and not stopping. */
+  readonly status: Exclude<HealthStatus, 'degraded'>
+  /** Runtime lifecycle flags useful to a liveness endpoint. */
+  readonly runtime: {
+    /** Whether the runtime completed bootstrap. */
+    readonly running: boolean
+    /** Whether shutdown has begun. */
+    readonly stopping: boolean
+  }
+}
+
+/** Operational readiness result for an application-owned health endpoint. */
+export interface WorkflowsReadiness {
+  /** Overall state; notifier degradation does not make `ready` false. */
+  readonly status: HealthStatus
+  /** Whether the process can serve its configured workflow responsibilities. */
+  readonly ready: boolean
+  /** UTC timestamp at which the checks were evaluated. */
+  readonly checkedAt: string
+  /** Individual runtime, storage and background-loop results. */
+  readonly checks: {
+    /** Root runtime initialization state. */
+    readonly runtime: HealthCheckStatus
+    /** Whether a cheap storage connectivity query succeeded. */
+    readonly storage: HealthCheckStatus
+    /** Whether required package migrations and tables are valid. */
+    readonly schema: HealthCheckStatus
+    /** Dispatcher loop health, including its staleness threshold. */
+    readonly dispatcher: HealthCheckStatus
+    /** PostgreSQL notifier state; local SQLite notification is always up. */
+    readonly notifier: HealthCheckStatus
+    /** Workflow engine registration when workflow execution is configured. */
+    readonly workflows: HealthCheckStatus
+    /** Activity worker loops when activity execution is configured. */
+    readonly workers: HealthCheckStatus
+  }
+  /** Dispatcher timing information without failure messages or user data. */
+  readonly dispatcher: {
+    /** Maximum tolerated time without a successful dispatcher iteration. */
+    readonly staleAfterMs: number
+    /** Last successful iteration, when one has completed. */
+    readonly lastSuccessfulAt?: string
+    /** Last failed iteration, when one has failed. */
+    readonly lastFailureAt?: string
+  }
+}
+
 /**
  * Register a Nest implementation class or reuse an already-exported instance.
  * A class is instantiated in the feature; `{ provide, useExisting }` identifies the

@@ -46,6 +46,40 @@ Migrations are forward-only and transactional. The standalone admin API and CLI 
 
 Retention previews terminal executions before a cutoff. Application rechecks locks, active parent/child links, live claims/permits, unacknowledged activity deliveries, open/requeued dead letters and pending engine messages. Removal covers that execution's journal, activity transport and native message/reply records in one transaction, with namespace isolation. A tombstone containing the key and input hash prevents the execution from being silently recreated. Tombstones are retained indefinitely; there is no unbounded-duplicate resurrection, automatic archival scheme or file compaction. Use backups and the API, not manual table deletion.
 
+## Observability and operational state
+
+The public `better-workflows/observability` subpath configures optional OTLP/HTTP
+export. Traces are enabled by default when configured; metrics and logs are opt-in.
+The internal Effect layers share the runtime's metric registry, while exporter setup,
+network failures and bounded shutdown flushes remain outside durable workflow
+transactions. Resource attributes identify the service, package version, namespace,
+topology, storage driver and process role without including database URLs or headers.
+
+The telemetry vocabulary separates safe metric dimensions from diagnostic attributes.
+Metrics use contract names, versions, logical queues and bounded reason/status values;
+execution IDs, step IDs, delivery attempts, dead-letter IDs and idempotency keys never
+become metric labels. Structured logs and short-lived spans may retain diagnostic
+correlation, but they do not automatically record workflow/activity/signal results,
+payloads, heartbeat details or authorization data. User resource attributes are static
+strings, numbers or booleans; callbacks are not accepted.
+
+`better_workflows.execution.id` is the canonical correlation attribute in logs and
+traces. `WorkflowHandle.describe()`, history and dead-letter administration expose the
+same execution identifier in their public models, and the CLI accepts it as a filter.
+Activity dispatch persists the trace envelope and the worker creates a consumer span
+with that external parent, so correlation survives a process boundary. Continuation
+generations add chain and generation attributes; span IDs are deliberately not stored
+in the journal, whose durable correlation remains execution/chain identity.
+
+`WorkflowsHealth` exposes liveness without a database query and readiness with storage,
+schema, dispatcher and configured-loop checks. A disconnected PostgreSQL notifier is
+`degraded`, not automatically unready, because result waits retain a database fallback.
+`WorkflowsAdmin.stats()` is different from local metrics: it uses fixed aggregation
+queries to return the durable namespace-wide view of active executions, activity queue
+backlog, dead letters and overdue deadlines. It excludes payload columns and does not
+make open dead letters a readiness failure. The standalone CLI renders the same admin
+backend through `better-workflows stats` or `better-workflows status`.
+
 ## Validation boundaries
 
 The suite includes actual Effect-engine suspension, Nest injection, real SQLite storage, business retries, local waits, control requests, FIFO/early signals, timeout resolution, queue concurrency, ownership fencing and dead-letter recovery. Crash tests spawn subprocesses, wait for a persisted checkpoint, send **SIGKILL**, and restart with the same SQLite file. Timer/retry tests let the original deadline expire while no process exists and verify the recovery does not restart the delay.

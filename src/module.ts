@@ -5,6 +5,7 @@ import { WorkflowsAdmin, WORKFLOWS_ADMIN_BACKEND } from './admin'
 import { WorkflowClient } from './client'
 import { getWorkflowToken, workflowContractClass } from './decorators'
 import { WorkflowError } from './errors'
+import { WorkflowsHealth } from './health'
 import { queueToken } from './queues'
 import type {
   FeatureConfiguration,
@@ -67,9 +68,10 @@ export class WorkflowsModule {
       providers: [
         { provide: WORKFLOWS_OPTIONS, useValue: options },
         WorkflowsRuntime,
+        WorkflowsHealth,
         ...adminProviders
       ],
-      exports: [WorkflowsRuntime, WorkflowsAdmin]
+      exports: [WorkflowsRuntime, WorkflowsHealth, WorkflowsAdmin]
     }
   }
 
@@ -107,9 +109,10 @@ export class WorkflowsModule {
           inject: [...(options.inject ?? [])]
         },
         WorkflowsRuntime,
+        WorkflowsHealth,
         ...adminProviders
       ],
-      exports: [WorkflowsRuntime, WorkflowsAdmin]
+      exports: [WorkflowsRuntime, WorkflowsHealth, WorkflowsAdmin]
     }
   }
 

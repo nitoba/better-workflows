@@ -17,7 +17,8 @@ import type {
   RetentionPlan,
   RetentionOptions,
   DeadLetterListOptions,
-  DiscardDeadLetterOptions
+  DiscardDeadLetterOptions,
+  WorkflowsStats
 } from './admin-types'
 
 /**
@@ -67,6 +68,16 @@ export class WorkflowsAdmin {
      * @throws WorkflowError with MIGRATIONS_REQUIRED, SCHEMA_TOO_NEW or SCHEMA_CORRUPT.
      */
     validate: () => this.backend.validateMigrations()
+  }
+  /**
+   * Read the durable namespace's current operational state from aggregate queries.
+   * This is a global storage view rather than a process-local metric and never includes
+   * workflow inputs, activity payloads, signal payloads, dead-letter payloads or messages.
+   * @returns Namespace-wide execution, queue, dead-letter and deadline counts.
+   * @throws WorkflowError when the schema is unavailable or the storage query fails.
+   */
+  stats(): Promise<WorkflowsStats> {
+    return this.backend.stats()
   }
   /**
    * Read-only preview and explicit transactional removal of eligible terminal history.
@@ -276,6 +287,10 @@ export async function createWorkflowsAdmin(
       migrationStatus: () => run(migrationStatus(sql)),
       migrate: () => run(migrateAll(options.namespace)),
       validateMigrations: () => run(validateMigrations(sql)),
+      stats: async () => {
+        await run(validateMigrations(sql))
+        return run(admin.stats())
+      },
       previewRetention: async (settings) => {
         await run(validateMigrations(sql))
         return run(admin.preview(settings))
@@ -318,9 +333,14 @@ export type {
   DeadLetterListOptions,
   DeadLetterPage,
   DeadLetterState,
+  DeadlineStats,
+  DeadLetterStats,
   DiscardDeadLetterOptions,
   MigrationStatus,
+  QueueStats,
   RetentionOptions,
   RetentionPlan,
-  RetentionResult
+  RetentionResult,
+  WorkflowExecutionStats,
+  WorkflowsStats
 } from './admin-types'

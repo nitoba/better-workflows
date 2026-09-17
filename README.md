@@ -309,6 +309,53 @@ Keyed activities declare `key: (input) => input.tenantId` in `@Activity()`. Limi
 
 See the **[advanced API and operations guide](docs/advanced.md)** for complete examples of branches, children, compensation, virtual time, migrations, retention and shared limits. The **[architecture guide](docs/architecture.md)** documents recovery boundaries, compatibility and validation evidence.
 
+## Observability, health and diagnostics
+
+Observability is optional and uses the public `better-workflows/observability` entry
+point. Traces are enabled by default when OTLP is configured; metrics and logs are
+opt-in. Exporter requests are best-effort and bounded during shutdown, so an
+unavailable collector does not change workflow or activity outcomes:
+
+```ts
+import { WorkflowsModule } from 'better-workflows'
+import { sqlite } from 'better-workflows/sqlite'
+import { otlp } from 'better-workflows/observability'
+
+WorkflowsModule.forRoot({
+  namespace: 'reports-app',
+  storage: sqlite({ filename: './data/workflows.sqlite' }),
+  observability: otlp({
+    serviceName: 'reports-worker',
+    endpoint: 'https://otel-collector.internal:4318',
+    traces: true,
+    metrics: { enabled: true, exportInterval: '10s' },
+    logs: { enabled: true, level: 'info' },
+    attributes: { 'deployment.environment.name': 'production' }
+  })
+})
+```
+
+`WorkflowsHealth` is provided by the root module, but no controller is installed.
+Expose `liveness()` for a cheap process check and `await readiness()` for storage,
+schema, dispatcher and configured worker checks. A disconnected PostgreSQL notifier
+is reported as `degraded`; result-wait fallback keeps it from being a correctness
+dependency. Open dead letters are operational work and do not make readiness fail.
+
+`await admin.stats()` reads a namespace-wide snapshot from durable storage. It reports
+active execution states, activity queue backlog, dead-letter counts and overdue timers
+or retries using aggregate queries. The snapshot never returns workflow inputs,
+activity/signal payloads, dead-letter payloads, idempotency keys or authorization
+headers. The equivalent CLI view is `better-workflows stats` (or `status`) with
+`WORKFLOWS_NAMESPACE` and exactly one of `WORKFLOWS_SQLITE_FILE` or
+`WORKFLOWS_DATABASE_URL` set.
+
+Use the same `executionId` from `WorkflowHandle.describe()`, history and dead-letter
+administration when investigating an execution. Structured logs and spans use the
+canonical `better_workflows.execution.id` attribute; continuation spans also carry
+the chain and generation. Trace context crosses the persisted activity envelope, but
+span IDs are not written into the workflow journal. Telemetry does not capture payloads
+or heartbeat details by default.
+
 ## Release scope
 
 This remains an alpha. External effects are at least once and must be idempotent. Business failures inside a saga scope trigger its registered compensations; suspension, infrastructure loss and forced cancellation do not masquerade as business failures. Completed saga scopes are committed, not an automatic rollback of any later workflow failure.

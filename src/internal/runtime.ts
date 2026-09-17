@@ -15,6 +15,8 @@ import type {
   SignalDefinition,
   WorkflowContractClass,
   WorkflowInput,
+  WorkflowsLiveness,
+  WorkflowsReadiness,
   WorkflowsOptions
 } from '../types'
 import { Registry } from './registry'
@@ -63,6 +65,12 @@ const terminal = (row: RunRow) =>
   ['continued', 'completed', 'failed', 'cancelled'].includes(row.state)
 const safetySweepInterval = 60_000
 
+interface DispatcherDetails {
+  staleAfterMs: number
+  lastSuccessfulAt?: string
+  lastFailureAt?: string
+}
+
 @Injectable()
 export class WorkflowsRuntime
   implements OnApplicationBootstrap, OnModuleDestroy, OnApplicationShutdown
@@ -81,8 +89,15 @@ export class WorkflowsRuntime
   private readonly dispatchLock = Semaphore.makeUnsafe(1)
   private lastDispatchError: string | undefined
   private dispatcherFailed = false
+  private dispatcherStartedAt: number | undefined
   private lastSuccessfulDispatchAt: number | undefined
   private lastDispatchFailureAt: number | undefined
+  private dispatcherRunning = false
+  private readonly activityWorkerRunning: boolean[] = []
+  private configuredWorkflowCount = 0
+  private workflowRuntimeRegistered = false
+  private configuredActivityWorkerCount = 0
+  private notifierConnected = false
 
   constructor(
     @Inject(WORKFLOWS_OPTIONS) readonly options: WorkflowsOptions,
@@ -125,8 +140,10 @@ export class WorkflowsRuntime
         undefined,
         telemetry
       )
+      this.notifierConnected = this.options.storage.driver !== 'postgres'
       if (this.options.storage.driver === 'postgres') {
         const pg = await infrastructure.runPromise(PgClient.PgClient)
+        this.notifierConnected = false
         this.startPostgresNotifier(pg.config, this.notifier)
       }
       this.activityTransport = new ActivityTransport(this.journal)
@@ -136,6 +153,10 @@ export class WorkflowsRuntime
         this.options.execution?.workflows?.concurrency ?? 20
       )
       const featureSlots = new Map<symbol, Semaphore.Semaphore>()
+      this.configuredWorkflowCount = [...this.registry.workflows.values()].filter(
+        (workflow) => workflow.invoke && workflow.enabled
+      ).length
+      this.workflowRuntimeRegistered = false
       if (this.options.execution?.workflows?.enabled !== false) {
         for (const workflow of this.registry.workflows.values()) {
           if (!workflow.invoke || !workflow.enabled) continue
@@ -155,8 +176,11 @@ export class WorkflowsRuntime
               infrastructure.scope
             )
           )
+          this.workflowRuntimeRegistered = true
         }
       }
+      this.configuredActivityWorkerCount = 0
+      this.activityWorkerRunning.length = 0
       if (this.options.execution?.activities?.enabled !== false) {
         const slots = new Map(
           [...this.registry.queues].map(([name, queue]) => [
@@ -169,7 +193,9 @@ export class WorkflowsRuntime
             (activity) => activity.enabled && activity.options.queue === name
           )
           if (activities.length === 0) continue
-          infrastructure.runFork(
+          this.configuredActivityWorkerCount += 1
+          const workerIndex = this.activityWorkerRunning.push(true) - 1
+          const workerFiber = infrastructure.runFork(
             activityWorker(
               name,
               activities,
@@ -180,11 +206,16 @@ export class WorkflowsRuntime
               this.activityTransport!
             )
           )
+          workerFiber.addObserver(() => {
+            this.activityWorkerRunning[workerIndex] = false
+          })
         }
       }
       this.ready = true
+      this.dispatcherStartedAt = Date.now()
       const self = this
-      infrastructure.runFork(
+      this.dispatcherRunning = true
+      const dispatcherFiber = infrastructure.runFork(
         Effect.gen(function* () {
           yield* Effect.annotateLogs(
             Effect.logInfo('Runtime started'),
@@ -216,6 +247,9 @@ export class WorkflowsRuntime
           }
         })
       )
+      dispatcherFiber.addObserver(() => {
+        self.dispatcherRunning = false
+      })
     } catch (error) {
       await infrastructure
         .runPromise(
@@ -233,6 +267,10 @@ export class WorkflowsRuntime
       this.journal = undefined
       this.activityTransport = undefined
       this.telemetry = undefined
+      this.dispatcherRunning = false
+      this.dispatcherStartedAt = undefined
+      this.lastSuccessfulDispatchAt = undefined
+      this.activityWorkerRunning.length = 0
       this.notifier?.shutdown()
       this.notifier = undefined
       throw error
@@ -271,6 +309,112 @@ export class WorkflowsRuntime
 
   health() {
     return { ready: this.ready && !this.stopping, lastDispatchError: this.lastDispatchError }
+  }
+
+  liveness(): WorkflowsLiveness {
+    const running = this.ready && !this.stopping
+    return {
+      status: running ? 'up' : 'down',
+      runtime: { running, stopping: this.stopping }
+    }
+  }
+
+  async readiness(): Promise<WorkflowsReadiness> {
+    const checkedAt = new Date().toISOString()
+    const runtimeUp = this.ready && !this.stopping && this.infrastructure !== undefined
+    if (!runtimeUp)
+      return {
+        status: 'down',
+        ready: false,
+        checkedAt,
+        checks: {
+          runtime: 'down',
+          storage: 'down',
+          schema: 'down',
+          dispatcher: 'down',
+          notifier: 'down',
+          workflows: 'down',
+          workers: 'down'
+        },
+        dispatcher: { staleAfterMs: this.dispatcherStalenessThreshold() }
+      }
+
+    const infrastructure = this.infrastructure!
+    const storageExit = await infrastructure
+      .runPromiseExit(
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient
+          yield* sql`SELECT 1`
+        })
+      )
+      .catch(() => undefined)
+    const storage = storageExit && Exit.isSuccess(storageExit) ? 'up' : 'down'
+    let schema: 'up' | 'down' = 'down'
+    if (storage === 'up') {
+      const schemaExit = await infrastructure
+        .runPromiseExit(
+          Effect.gen(function* () {
+            const sql = yield* SqlClient.SqlClient
+            return yield* migrationStatus(sql)
+          })
+        )
+        .catch(() => undefined)
+      if (schemaExit && Exit.isSuccess(schemaExit) && schemaExit.value.valid) schema = 'up'
+    }
+
+    const staleAfterMs = this.dispatcherStalenessThreshold()
+    const lastSuccessfulAt = this.lastSuccessfulDispatchAt
+    const freshnessAt = lastSuccessfulAt ?? this.dispatcherStartedAt
+    const stale = freshnessAt === undefined || Date.now() - freshnessAt > staleAfterMs
+    const dispatcher =
+      !this.dispatcherRunning || stale ? 'down' : this.dispatcherFailed ? 'degraded' : 'up'
+    const notifier =
+      this.options.storage.driver === 'postgres'
+        ? this.notifierConnected
+          ? 'up'
+          : 'degraded'
+        : 'up'
+    const workflows =
+      this.options.execution?.workflows?.enabled === false || this.configuredWorkflowCount === 0
+        ? 'disabled'
+        : this.workflowRuntimeRegistered
+          ? 'up'
+          : 'down'
+    const workers =
+      this.options.execution?.activities?.enabled === false ||
+      this.configuredActivityWorkerCount === 0
+        ? 'disabled'
+        : this.activityWorkerRunning.length === this.configuredActivityWorkerCount &&
+            this.activityWorkerRunning.every((running) => running)
+          ? 'up'
+          : 'down'
+    const checks = {
+      runtime: 'up' as const,
+      storage,
+      schema,
+      dispatcher,
+      notifier,
+      workflows,
+      workers
+    } satisfies WorkflowsReadiness['checks']
+    const hardFailure = Object.values(checks).some((check) => check === 'down')
+    const degraded = Object.values(checks).some((check) => check === 'degraded')
+    const dispatcherDetails: DispatcherDetails = { staleAfterMs }
+    if (lastSuccessfulAt !== undefined)
+      dispatcherDetails.lastSuccessfulAt = new Date(lastSuccessfulAt).toISOString()
+    if (this.lastDispatchFailureAt !== undefined)
+      dispatcherDetails.lastFailureAt = new Date(this.lastDispatchFailureAt).toISOString()
+    return {
+      status: hardFailure ? 'down' : degraded ? 'degraded' : 'up',
+      ready: !hardFailure,
+      checkedAt,
+      checks,
+      dispatcher: dispatcherDetails
+    }
+  }
+
+  private dispatcherStalenessThreshold(): number {
+    return Math.max(milliseconds(this.options.pollInterval ?? '100ms') * 3, 1_000)
   }
 
   private store(): Journal {
@@ -315,6 +459,7 @@ export class WorkflowsRuntime
                       })
                     )
                   everConnected = true
+                  self.notifierConnected = true
                   notifier.reconnected()
                   while (true) {
                     const notification = yield* Queue.take(queue)
@@ -337,7 +482,7 @@ export class WorkflowsRuntime
           )
           if (Exit.isFailure(listening) && Cause.hasInterruptsOnly(listening.cause))
             return yield* Effect.failCause(listening.cause)
-          notifier.reconnected()
+          self.notifierConnected = false
           if (Exit.isFailure(listening))
             yield* Effect.annotateLogs(
               Effect.logWarning('Notifier connection lost'),
@@ -638,6 +783,7 @@ export class WorkflowsRuntime
     return {
       migrationStatus: () => this.run(migrationStatus(this.store().sql)),
       validateMigrations: () => this.run(validateMigrations(this.store().sql)),
+      stats: () => this.run(new SqlAdministration(this.store()).stats()),
       migrate: () =>
         Promise.reject(
           new WorkflowError(

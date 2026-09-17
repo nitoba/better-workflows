@@ -46,6 +46,110 @@ test('standalone migration status/validate are read-only; run creates all schema
   }
 })
 
+test('stats returns a namespace-wide operational snapshot without payloads', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'bw-stats-'))
+  const filename = join(dir, 'data.sqlite')
+  const admin = await createWorkflowsAdmin({ namespace: 'stats', storage: sqlite({ filename }) })
+  const db = new Database(filename)
+  const now = Date.now()
+  try {
+    await admin.migrations.run()
+    const addRun = (id: string, state: string, control = 'run') =>
+      db
+        .query(
+          `INSERT INTO better_workflows_runs(
+             execution_id, namespace, workflow_name, version, dedupe_key, input_json,
+             created_at, updated_at, state, control, chain_id, generation
+           ) VALUES (?, 'stats', 'example', 1, ?, 'private-input', ?, ?, ?, ?, ?, 0)`
+        )
+        .run(id, id, now - 1_000, now - 1_000, state, control, id)
+    addRun('accepted', 'accepted')
+    addRun('running', 'running')
+    addRun('waiting', 'waiting')
+    addRun('blocked', 'blocked')
+    addRun('paused', 'waiting', 'pause')
+    addRun('cancelling', 'running', 'cancel')
+    addRun('completed', 'completed')
+    addRun('continued', 'continued')
+
+    const addDelivery = (id: string, state: string, createdAt: number) =>
+      db
+        .query(
+          `INSERT INTO better_workflows_activity_deliveries(
+             namespace, queue_name, delivery_id, payload_json, attempts, state,
+             visible_at, created_at, updated_at
+           ) VALUES ('stats', 'emails', ?, 'private-activity-payload', 0, ?, ?, ?, ?)`
+        )
+        .run(id, state, now, createdAt, createdAt)
+    addDelivery('pending-delivery', 'pending', now - 12_400)
+    addDelivery('processing-delivery', 'processing', now)
+
+    const addDeadLetter = (id: string, state: string, failedAt: number) =>
+      db
+        .query(
+          `INSERT INTO better_workflows_dead_letters(
+             id, namespace, queue_name, delivery_id, delivery_attempt,
+             reason_code, reason_message, first_failed_at, updated_at, state, payload_json
+           ) VALUES (?, 'stats', 'emails', ?, 1, 'TEST_FAILURE', 'private-message', ?, ?, ?, 'private-dlq-payload')`
+        )
+        .run(id, `${id}-delivery`, failedAt, failedAt, state)
+    addDeadLetter('open-letter', 'open', now - 86_000)
+    addDeadLetter('requeued-letter', 'requeued', now - 1_000)
+
+    db.query(
+      `INSERT INTO better_workflows_timers(execution_id, step_id, deadline, delivered)
+         VALUES ('waiting', 'due-timer', ?, 0), ('waiting', 'future-timer', ?, 0)`
+    ).run(now - 2_000, now + 60_000)
+    db.query(
+      `INSERT INTO better_workflows_retries(execution_id, step_id, attempt, deadline, delivered)
+         VALUES ('running', 'retry', 1, ?, 0)`
+    ).run(now - 500)
+    db.query(
+      `INSERT INTO better_workflows_runs(
+         execution_id, namespace, workflow_name, version, dedupe_key, input_json,
+         created_at, updated_at, state, control, chain_id, generation
+       ) VALUES ('foreign-run', 'other-namespace', 'example', 1, 'foreign-key', 'foreign-input', ?, ?, 'waiting', 'run', 'foreign-chain', 0)`
+    ).run(now - 1_000, now - 1_000)
+    db.query(
+      `INSERT INTO better_workflows_timers(execution_id, step_id, deadline, delivered)
+         VALUES ('foreign-run', 'foreign-timer', ?, 0)`
+    ).run(now - 2_000)
+    db.query(
+      `INSERT INTO better_workflows_retries(execution_id, step_id, attempt, deadline, delivered)
+         VALUES ('foreign-run', 'foreign-retry', 1, ?, 0)`
+    ).run(now - 2_000)
+
+    const stats = await admin.stats()
+    expect(stats.executions).toEqual({
+      accepted: 1,
+      running: 1,
+      waiting: 1,
+      blocked: 1,
+      paused: 1,
+      cancelling: 1
+    })
+    expect(stats.queues).toEqual([
+      {
+        name: 'emails',
+        pending: 1,
+        processing: 1,
+        oldestPendingAgeMs: expect.any(Number)
+      }
+    ])
+    expect(stats.queues[0]!.oldestPendingAgeMs).toBeGreaterThanOrEqual(10_000)
+    expect(stats.deadLetters.open).toBe(1)
+    expect(stats.deadLetters.requeued).toBe(1)
+    expect(stats.deadLetters.oldestOpenAgeMs).toBeGreaterThanOrEqual(80_000)
+    expect(stats.deadlines).toMatchObject({ dueTimers: 1, overdueRetries: 1 })
+    expect(stats.deadlines.oldestLagMs).toBeGreaterThanOrEqual(1_500)
+    expect(JSON.stringify(stats)).not.toContain('private-')
+  } finally {
+    db.close()
+    await admin.close()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
 test('journal v6 backfills existing v5 executions into singleton continuation chains', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'bw-v4-v5-'))
   const filename = join(dir, 'data.sqlite')
