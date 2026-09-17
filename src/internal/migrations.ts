@@ -1,7 +1,7 @@
 import { Effect } from 'effect'
 import type { SqlClient } from 'effect/unstable/sql/SqlClient'
 
-export const JOURNAL_VERSION = 6
+export const JOURNAL_VERSION = 11
 export const ENGINE_VERSION = '4.0.0-rc.115'
 
 /** All DDL is transactional on the supported PostgreSQL and SQLite adapters. */
@@ -180,6 +180,167 @@ export function migrateAdvanced(sql: SqlClient) {
       yield* sql`CREATE INDEX IF NOT EXISTS better_workflows_dead_letter_execution
         ON better_workflows_dead_letters(namespace, execution_id, state)`
       yield* sql`INSERT INTO better_workflows_schema(version) VALUES (6)`
+    }
+    if (!versions.some((row) => row.version === 7)) {
+      yield* sql`CREATE TABLE IF NOT EXISTS better_workflows_schedules (
+        namespace TEXT NOT NULL,
+        schedule_name TEXT NOT NULL,
+        workflow_name TEXT NOT NULL,
+        workflow_version INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        expression TEXT,
+        timezone TEXT,
+        interval_ms DOUBLE PRECISION,
+        definition_hash TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'active',
+        last_occurrence_at DOUBLE PRECISION,
+        next_occurrence_at DOUBLE PRECISION NOT NULL,
+        last_execution_id TEXT,
+        revision INTEGER NOT NULL DEFAULT 0,
+        claim_owner TEXT,
+        claim_until DOUBLE PRECISION,
+        paused_at DOUBLE PRECISION,
+        created_at DOUBLE PRECISION NOT NULL,
+        updated_at DOUBLE PRECISION NOT NULL,
+        PRIMARY KEY(namespace, schedule_name)
+      )`
+      yield* sql`CREATE INDEX IF NOT EXISTS better_workflows_schedule_due
+        ON better_workflows_schedules(namespace, next_occurrence_at, state)`
+      yield* sql`CREATE INDEX IF NOT EXISTS better_workflows_schedule_workflow
+        ON better_workflows_schedules(namespace, workflow_name, workflow_version)`
+      yield* sql`CREATE TABLE IF NOT EXISTS better_workflows_schedule_occurrences (
+        namespace TEXT NOT NULL,
+        schedule_name TEXT NOT NULL,
+        scheduled_at DOUBLE PRECISION NOT NULL,
+        sequence INTEGER NOT NULL,
+        trigger_type TEXT NOT NULL,
+        state TEXT NOT NULL,
+        execution_id TEXT,
+        reason_code TEXT,
+        created_at DOUBLE PRECISION NOT NULL,
+        PRIMARY KEY(namespace, schedule_name, scheduled_at),
+        UNIQUE(namespace, schedule_name, sequence)
+      )`
+      yield* sql`CREATE INDEX IF NOT EXISTS better_workflows_schedule_occurrence_list
+        ON better_workflows_schedule_occurrences(namespace, schedule_name, scheduled_at)`
+      yield* sql`CREATE INDEX IF NOT EXISTS better_workflows_schedule_occurrence_execution
+        ON better_workflows_schedule_occurrences(namespace, execution_id)`
+      yield* sql`INSERT INTO better_workflows_schema(version) VALUES (7)`
+    }
+    if (!versions.some((row) => row.version === 8)) {
+      yield* sql`CREATE TABLE IF NOT EXISTS better_workflows_schedule_inputs (
+        namespace TEXT NOT NULL,
+        schedule_name TEXT NOT NULL,
+        input_json TEXT,
+        PRIMARY KEY(namespace, schedule_name)
+      )`
+      yield* sql`CREATE TABLE IF NOT EXISTS better_workflows_schedule_manual_keys (
+        namespace TEXT NOT NULL,
+        schedule_name TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        scheduled_at DOUBLE PRECISION NOT NULL,
+        execution_id TEXT NOT NULL,
+        created_at DOUBLE PRECISION NOT NULL,
+        PRIMARY KEY(namespace, schedule_name, idempotency_key)
+      )`
+      yield* sql`CREATE INDEX IF NOT EXISTS better_workflows_schedule_manual_key_execution
+        ON better_workflows_schedule_manual_keys(namespace, execution_id)`
+      yield* sql`INSERT INTO better_workflows_schema(version) VALUES (8)`
+    }
+    if (!versions.some((row) => row.version === 9)) {
+      // Separate manual rows from recurring rows so both may represent the
+      // same business-clock instant without losing either occurrence.
+      yield* sql`CREATE TABLE better_workflows_schedule_occurrences_v9 (
+        namespace TEXT NOT NULL,
+        schedule_name TEXT NOT NULL,
+        scheduled_at DOUBLE PRECISION NOT NULL,
+        sequence INTEGER NOT NULL,
+        trigger_type TEXT NOT NULL,
+        state TEXT NOT NULL,
+        execution_id TEXT,
+        reason_code TEXT,
+        created_at DOUBLE PRECISION NOT NULL,
+        PRIMARY KEY(namespace, schedule_name, sequence)
+      )`
+      yield* sql`INSERT INTO better_workflows_schedule_occurrences_v9(
+        namespace, schedule_name, scheduled_at, sequence, trigger_type, state,
+        execution_id, reason_code, created_at
+      ) SELECT namespace, schedule_name, scheduled_at, sequence, trigger_type, state,
+        execution_id, reason_code, created_at
+        FROM better_workflows_schedule_occurrences`
+      yield* sql`DROP TABLE better_workflows_schedule_occurrences`
+      yield* sql`ALTER TABLE better_workflows_schedule_occurrences_v9
+        RENAME TO better_workflows_schedule_occurrences`
+      yield* sql`CREATE INDEX better_workflows_schedule_occurrence_list
+        ON better_workflows_schedule_occurrences(namespace, schedule_name, sequence)`
+      yield* sql`CREATE INDEX better_workflows_schedule_occurrence_execution
+        ON better_workflows_schedule_occurrences(namespace, execution_id)`
+      yield* sql`CREATE UNIQUE INDEX better_workflows_schedule_occurrence_recurring
+        ON better_workflows_schedule_occurrences(namespace, schedule_name, scheduled_at)
+        WHERE trigger_type <> 'manual'`
+
+      yield* sql`CREATE TABLE better_workflows_schedule_manual_keys_v9 (
+        namespace TEXT NOT NULL,
+        schedule_name TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        scheduled_at DOUBLE PRECISION NOT NULL,
+        sequence INTEGER NOT NULL,
+        execution_id TEXT NOT NULL,
+        created_at DOUBLE PRECISION NOT NULL,
+        PRIMARY KEY(namespace, schedule_name, idempotency_key)
+      )`
+      yield* sql`INSERT INTO better_workflows_schedule_manual_keys_v9(
+        namespace, schedule_name, idempotency_key, scheduled_at, sequence,
+        execution_id, created_at
+      ) SELECT keys.namespace, keys.schedule_name, keys.idempotency_key, keys.scheduled_at,
+        occurrences.sequence, keys.execution_id, keys.created_at
+        FROM better_workflows_schedule_manual_keys AS keys
+        JOIN better_workflows_schedule_occurrences AS occurrences
+          ON occurrences.namespace=keys.namespace
+          AND occurrences.schedule_name=keys.schedule_name
+          AND occurrences.scheduled_at=keys.scheduled_at
+          AND occurrences.trigger_type='manual'`
+      yield* sql`DROP TABLE better_workflows_schedule_manual_keys`
+      yield* sql`ALTER TABLE better_workflows_schedule_manual_keys_v9
+        RENAME TO better_workflows_schedule_manual_keys`
+      yield* sql`CREATE INDEX better_workflows_schedule_manual_key_execution
+        ON better_workflows_schedule_manual_keys(namespace, execution_id)`
+      yield* sql`INSERT INTO better_workflows_schema(version) VALUES (9)`
+    }
+    if (!versions.some((row) => row.version === 10)) {
+      // Persist implementation ownership separately from the short-lived
+      // materialization claim. Expired owners allow complete removals to be
+      // reconciled without orphaning schedules kept by partial deployments.
+      yield* sql`CREATE TABLE IF NOT EXISTS better_workflows_schedule_owners (
+        namespace TEXT NOT NULL,
+        schedule_name TEXT NOT NULL,
+        owner_id TEXT NOT NULL,
+        lease_until DOUBLE PRECISION NOT NULL,
+        created_at DOUBLE PRECISION NOT NULL,
+        updated_at DOUBLE PRECISION NOT NULL,
+        PRIMARY KEY(namespace, schedule_name, owner_id)
+      )`
+      yield* sql`CREATE INDEX IF NOT EXISTS better_workflows_schedule_owner_expiry
+        ON better_workflows_schedule_owners(namespace, schedule_name, lease_until)`
+      yield* sql`CREATE INDEX IF NOT EXISTS better_workflows_schedule_owner_runtime
+        ON better_workflows_schedule_owners(namespace, owner_id, schedule_name)`
+      yield* sql`INSERT INTO better_workflows_schema(version) VALUES (10)`
+    }
+    if (!versions.some((row) => row.version === 11)) {
+      const columns = yield* sql.onDialectOrElse({
+        pg: () =>
+          sql<{ name: string }>`SELECT column_name AS name FROM information_schema.columns
+            WHERE table_schema=current_schema() AND table_name='better_workflows_runs'`,
+        orElse: () => sql<{ name: string }>`PRAGMA table_info(better_workflows_runs)`
+      })
+      const existing = new Set(columns.map((column) => column.name))
+      if (!existing.has('trace_id'))
+        yield* sql`ALTER TABLE better_workflows_runs ADD COLUMN trace_id TEXT`
+      if (!existing.has('trace_span_id'))
+        yield* sql`ALTER TABLE better_workflows_runs ADD COLUMN trace_span_id TEXT`
+      if (!existing.has('trace_sampled'))
+        yield* sql`ALTER TABLE better_workflows_runs ADD COLUMN trace_sampled INTEGER`
+      yield* sql`INSERT INTO better_workflows_schema(version) VALUES (11)`
     }
   })
 }

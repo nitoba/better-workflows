@@ -16,6 +16,114 @@ import type { Failure } from './errors'
  * ```
  */
 export type Duration = number | `${number}${'ms' | 's' | 'm' | 'h' | 'd'}`
+
+/**
+ * Policy applied when one or more recurring schedule deadlines were missed.
+ * `latest` is the default and materializes only the newest missed deadline.
+ */
+export type ScheduleMisfirePolicy = 'skip' | 'latest' | 'catch-up'
+
+/**
+ * Policy applied when a schedule's previous workflow execution is still active.
+ * `allow` is the default and does not serialize recurring executions.
+ */
+export type ScheduleOverlapPolicy = 'allow' | 'skip'
+
+/**
+ * Stable occurrence information supplied to a schedule input resolver.
+ * The timestamp is the scheduled timeline instant, not the materialization time.
+ */
+export interface ScheduleOccurrence {
+  /** Explicit schedule identity within the namespace. */
+  readonly schedule: string
+  /** Scheduled instant as a UTC ISO 8601 string. */
+  readonly scheduledAt: string
+  /** One-based position of this occurrence in the schedule timeline. */
+  readonly occurrence: number
+  /** Why this occurrence is being materialized. */
+  readonly trigger: 'scheduled' | 'catch-up' | 'manual'
+}
+
+/** Lifecycle state recorded for one durable schedule occurrence. */
+export type ScheduleOccurrenceStatus = 'started' | 'skipped' | 'failed'
+
+/**
+ * Public administrative view of one durable schedule occurrence.
+ * It contains operational metadata only; schedule input is never returned.
+ */
+export interface ScheduleOccurrenceSnapshot extends ScheduleOccurrence {
+  /** Materialization outcome recorded by the scheduler or manual trigger. */
+  readonly state: ScheduleOccurrenceStatus
+  /** Accepted workflow execution, when the occurrence started one. */
+  readonly executionId?: string
+  /** Controlled failure or skip category, when one was recorded. */
+  readonly reasonCode?: string
+  /** Business/database time at which the occurrence row was created. */
+  readonly createdAt: string
+}
+
+/** Static value or synchronous, pure function used to build one workflow input. */
+export type ScheduleInput<I = unknown> = I | ((occurrence: ScheduleOccurrence) => I)
+
+/**
+ * Common configuration accepted by {@link Cron} and {@link Interval}.
+ * Input callbacks must be synchronous and pure; they must not perform I/O or read a clock.
+ * @typeParam I - Input value accepted by the workflow schema.
+ */
+export interface ScheduleCommonOptions<I = unknown> {
+  /** Stable schedule identity within the application namespace. */
+  readonly name: string
+  /** Static workflow input, or a synchronous resolver based on the occurrence. */
+  readonly input?: I | ((occurrence: ScheduleOccurrence) => I)
+  /** Behavior for deadlines missed while the schedule could not run. @defaultValue "latest" */
+  readonly misfire?: ScheduleMisfirePolicy
+  /** Behavior when a previous execution or continuation chain is active. @defaultValue "allow" */
+  readonly overlap?: ScheduleOverlapPolicy
+  /** Maximum missed occurrences materialized in one catch-up cycle. @defaultValue 100 */
+  readonly maxCatchUp?: number
+}
+
+/** Configuration for a cron schedule decorator. */
+export interface CronOptions<I = unknown> extends ScheduleCommonOptions<I> {
+  /** Five- or six-field cron expression parsed by Effect's pinned Cron primitive. */
+  readonly expression: string
+  /** IANA timezone used to interpret the cron expression; defaults to UTC. */
+  readonly timezone?: string
+}
+
+/** Configuration for an interval schedule decorator. */
+export interface IntervalOptions<I = unknown> extends ScheduleCommonOptions<I> {
+  /** Positive interval measured in milliseconds or a supported duration string. */
+  readonly every: Duration
+}
+
+/**
+ * Point-in-time administrative view of a persisted schedule definition and cursor.
+ * It intentionally contains no input or storage implementation details.
+ */
+export interface ScheduleSnapshot {
+  /** Explicit schedule identity within the namespace. */
+  readonly name: string
+  /** Registered workflow contract name. */
+  readonly workflow: string
+  /** Workflow contract version used by future occurrences. */
+  readonly workflowVersion: number
+  /** Recurrence kind. */
+  readonly type: 'cron' | 'interval'
+  /** Persisted administrative state. */
+  readonly status: ScheduleStatus
+  /** Most recently materialized normal-timeline occurrence, when present. */
+  readonly lastOccurrence?: string
+  /** Next normal-timeline occurrence. */
+  readonly nextOccurrence: string
+  /** Most recent accepted execution, when present. */
+  readonly lastExecutionId?: string
+  /** Optimistic revision of the persisted schedule row. */
+  readonly revision: number
+}
+
+/** Lifecycle state of a persisted schedule definition. */
+export type ScheduleStatus = 'active' | 'paused' | 'orphaned'
 /**
  * Values that can cross a durable serialization boundary without losing information.
  * Use finite numbers, strings, booleans, null, dense arrays and plain objects.
@@ -536,6 +644,14 @@ export interface ExecutionOptions {
     /** Allowlist intersected with the root selector; omission permits all visible queues, [] permits none. */
     readonly queues?: readonly QueueReference[]
   }
+  /**
+   * Schedule ownership/dispatch activation at this level. The schedule registry is
+   * still validated and persisted when dispatch is disabled. @defaultValue true
+   */
+  readonly schedules?: {
+    /** Enable schedule infrastructure at this level. @defaultValue true */
+    readonly enabled?: boolean
+  }
 }
 
 /** Log severities accepted by the OTLP logging exporter configuration. */
@@ -635,6 +751,8 @@ export interface WorkflowsReadiness {
     readonly schema: HealthCheckStatus
     /** Dispatcher loop health, including its staleness threshold. */
     readonly dispatcher: HealthCheckStatus
+    /** Durable schedule dispatcher health when schedules are enabled. */
+    readonly scheduler: HealthCheckStatus
     /** PostgreSQL notifier state; local SQLite notification is always up. */
     readonly notifier: HealthCheckStatus
     /** Workflow engine registration when workflow execution is configured. */
@@ -649,6 +767,15 @@ export interface WorkflowsReadiness {
     /** Last successful iteration, when one has completed. */
     readonly lastSuccessfulAt?: string
     /** Last failed iteration, when one has failed. */
+    readonly lastFailureAt?: string
+  }
+  /** Scheduler timing information when schedule dispatch is enabled. */
+  readonly scheduler: {
+    /** Maximum tolerated time without a successful scheduler pass. */
+    readonly staleAfterMs: number
+    /** Last successful scheduler pass, when one has completed. */
+    readonly lastSuccessfulAt?: string
+    /** Last failed scheduler pass, when one has failed. */
     readonly lastFailureAt?: string
   }
 }

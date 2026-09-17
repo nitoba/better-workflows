@@ -2,7 +2,13 @@
 import { readFile, writeFile } from 'node:fs/promises'
 import { createWorkflowsAdmin } from './admin'
 import type { RetentionPlan, WorkflowsStats } from './admin'
-import type { DeadLetterListOptions } from './admin-types'
+import type {
+  DeadLetterListOptions,
+  ScheduleDefinitionUpdate,
+  ScheduleListOptions,
+  ScheduleOccurrenceListOptions
+} from './admin-types'
+import type { JsonValue } from './types'
 import { sqlite } from './sqlite'
 import { postgres } from './postgres'
 import { WorkflowError } from './errors'
@@ -16,6 +22,14 @@ better-workflows dead-letters list [--queue <name>] [--execution-id <id>] [--act
 better-workflows dead-letters show <id> [--payload]
 better-workflows dead-letters requeue <id>
 better-workflows dead-letters discard <id> --reason "..."
+better-workflows schedules list [--status <active|paused|orphaned>] [--cursor <name>] [--limit 100]
+better-workflows schedules show <name>
+better-workflows schedules occurrences <name> [--state <started|skipped|failed>] [--cursor <n>] [--limit 100]
+better-workflows schedules pause <name>
+better-workflows schedules resume <name>
+better-workflows schedules remove <name> --confirm
+better-workflows schedules trigger <name> [--idempotency-key <key>]
+better-workflows schedules reconcile <name> --confirm --from now --workflow <name> --version <n> --type <cron|interval> [--expression <cron>] [--timezone <iana-zone>] [--interval-ms <n>] [--misfire <policy>] [--overlap <policy>] [--max-catch-up <n>] [--input-json <json>|--resolver]
 
 Set WORKFLOWS_NAMESPACE and exactly one of WORKFLOWS_SQLITE_FILE or WORKFLOWS_DATABASE_URL.
 Migration run is an offline operation. Retention prune requires an unchanged preview file.
@@ -55,7 +69,10 @@ const formatStats = (namespace: string, stats: WorkflowsStats): string => {
     `  open=${stats.deadLetters.open} requeued=${stats.deadLetters.requeued} oldest=${formatAge(stats.deadLetters.oldestOpenAgeMs)}`,
     '',
     'Deadlines',
-    `  timers=${stats.deadlines.dueTimers} retries=${stats.deadlines.overdueRetries} oldest=${formatAge(stats.deadlines.oldestLagMs)}`
+    `  timers=${stats.deadlines.dueTimers} retries=${stats.deadlines.overdueRetries} oldest=${formatAge(stats.deadlines.oldestLagMs)}`,
+    '',
+    'Schedules',
+    `  active=${stats.schedules.active} paused=${stats.schedules.paused} overdue=${stats.schedules.overdue} oldest=${formatAge(stats.schedules.oldestLagMs)}`
   ].join('\n')
 }
 
@@ -79,7 +96,31 @@ async function main(): Promise<void> {
               ? ['--payload']
               : group === 'dead-letters' && command === 'discard'
                 ? ['--reason']
-                : []
+                : group === 'schedules' && command === 'list'
+                  ? ['--status', '--cursor', '--limit']
+                  : group === 'schedules' && command === 'occurrences'
+                    ? ['--state', '--cursor', '--limit']
+                    : group === 'schedules' && command === 'trigger'
+                      ? ['--idempotency-key']
+                      : group === 'schedules' && command === 'remove'
+                        ? ['--confirm']
+                        : group === 'schedules' && command === 'reconcile'
+                          ? [
+                              '--confirm',
+                              '--from',
+                              '--workflow',
+                              '--version',
+                              '--type',
+                              '--expression',
+                              '--timezone',
+                              '--interval-ms',
+                              '--misfire',
+                              '--overlap',
+                              '--max-catch-up',
+                              '--input-json',
+                              '--resolver'
+                            ]
+                          : []
   )
   const flags = new Map<string, string>()
   const positional: string[] = []
@@ -91,7 +132,7 @@ async function main(): Promise<void> {
     }
     if (!allowed.has(key) || flags.has(key))
       throw new WorkflowError('INVALID_ARGUMENT', `Unknown or duplicate argument: ${key}`)
-    if (key === '--confirm' || key === '--payload') flags.set(key, 'true')
+    if (key === '--confirm' || key === '--payload' || key === '--resolver') flags.set(key, 'true')
     else {
       const value = args[++i]
       if (!value || value.startsWith('--'))
@@ -116,6 +157,12 @@ async function main(): Promise<void> {
   try {
     if (
       group === 'dead-letters' &&
+      ((command === 'list' && positional.length > 0) ||
+        (command !== 'list' && positional.length !== 1))
+    )
+      throw new WorkflowError('INVALID_ARGUMENT', usage)
+    if (
+      group === 'schedules' &&
       ((command === 'list' && positional.length > 0) ||
         (command !== 'list' && positional.length !== 1))
     )
@@ -182,6 +229,135 @@ async function main(): Promise<void> {
       if (!reason) throw new WorkflowError('INVALID_REASON', 'Discard requires --reason')
       console.log(
         JSON.stringify(await admin.discardDeadLetter(positional[0]!, { reason }), null, 2)
+      )
+    } else if (group === 'schedules' && command === 'list') {
+      const statusValues = ['active', 'paused', 'orphaned'] as const
+      const status = statusValues.find((value) => value === flags.get('--status'))
+      if (flags.has('--status') && !status)
+        throw new WorkflowError(
+          'INVALID_ARGUMENT',
+          `Unknown schedule status: ${flags.get('--status')}`
+        )
+      let listOptions: ScheduleListOptions = {}
+      const cursor = flags.get('--cursor')
+      if (status !== undefined) listOptions = { ...listOptions, status }
+      if (cursor !== undefined) listOptions = { ...listOptions, cursor }
+      if (flags.has('--limit'))
+        listOptions = { ...listOptions, limit: Number(flags.get('--limit')) }
+      console.log(JSON.stringify(await admin.listSchedules(listOptions), null, 2))
+    } else if (group === 'schedules' && command === 'show') {
+      console.log(JSON.stringify(await admin.getSchedule(positional[0]!), null, 2))
+    } else if (group === 'schedules' && command === 'occurrences') {
+      const stateValues = ['started', 'skipped', 'failed'] as const
+      const state = stateValues.find((value) => value === flags.get('--state'))
+      if (flags.has('--state') && !state)
+        throw new WorkflowError(
+          'INVALID_ARGUMENT',
+          `Unknown schedule occurrence state: ${flags.get('--state')}`
+        )
+      let occurrenceOptions: ScheduleOccurrenceListOptions = {}
+      const cursor = flags.get('--cursor')
+      if (state !== undefined) occurrenceOptions = { ...occurrenceOptions, state }
+      if (cursor !== undefined) occurrenceOptions = { ...occurrenceOptions, after: Number(cursor) }
+      if (flags.has('--limit'))
+        occurrenceOptions = { ...occurrenceOptions, limit: Number(flags.get('--limit')) }
+      console.log(
+        JSON.stringify(
+          await admin.listScheduleOccurrences(positional[0]!, occurrenceOptions),
+          null,
+          2
+        )
+      )
+    } else if (group === 'schedules' && command === 'pause') {
+      console.log(JSON.stringify(await admin.pauseSchedule(positional[0]!), null, 2))
+    } else if (group === 'schedules' && command === 'resume') {
+      console.log(JSON.stringify(await admin.resumeSchedule(positional[0]!), null, 2))
+    } else if (group === 'schedules' && command === 'remove') {
+      if (flags.get('--confirm') !== 'true')
+        throw new WorkflowError('CONFIRMATION_REQUIRED', 'Schedule removal requires --confirm')
+      await admin.removeSchedule(positional[0]!, { confirm: true })
+      console.log(JSON.stringify({ removed: positional[0] }, null, 2))
+    } else if (group === 'schedules' && command === 'trigger') {
+      const idempotencyKey = flags.get('--idempotency-key')
+      console.log(
+        JSON.stringify(
+          await admin.triggerSchedule(
+            positional[0]!,
+            idempotencyKey === undefined ? undefined : { idempotencyKey }
+          ),
+          null,
+          2
+        )
+      )
+    } else if (group === 'schedules' && command === 'reconcile') {
+      const workflow = flags.get('--workflow')
+      const version = Number(flags.get('--version'))
+      const type = flags.get('--type')
+      const from = flags.get('--from')
+      const misfireValue = flags.get('--misfire') ?? 'latest'
+      const overlapValue = flags.get('--overlap') ?? 'allow'
+      const maxCatchUp = Number(flags.get('--max-catch-up') ?? 100)
+      if (
+        flags.get('--confirm') !== 'true' ||
+        from !== 'now' ||
+        !workflow ||
+        !Number.isSafeInteger(version) ||
+        (type !== 'cron' && type !== 'interval') ||
+        (misfireValue !== 'skip' && misfireValue !== 'latest' && misfireValue !== 'catch-up') ||
+        (overlapValue !== 'allow' && overlapValue !== 'skip') ||
+        !Number.isSafeInteger(maxCatchUp)
+      )
+        throw new WorkflowError('INVALID_ARGUMENT', usage)
+      if (flags.has('--resolver') && flags.has('--input-json'))
+        throw new WorkflowError('INVALID_ARGUMENT', 'Choose --resolver or --input-json, not both')
+      if (type === 'cron' && !flags.get('--expression'))
+        throw new WorkflowError('INVALID_ARGUMENT', 'Cron reconciliation requires --expression')
+      if (type === 'interval' && !flags.has('--interval-ms'))
+        throw new WorkflowError(
+          'INVALID_ARGUMENT',
+          'Interval reconciliation requires --interval-ms'
+        )
+      const misfire: ScheduleDefinitionUpdate['misfire'] =
+        misfireValue === 'skip' ? 'skip' : misfireValue === 'catch-up' ? 'catch-up' : 'latest'
+      const overlap: ScheduleDefinitionUpdate['overlap'] =
+        overlapValue === 'skip' ? 'skip' : 'allow'
+      let input: JsonValue = null
+      if (flags.has('--input-json')) {
+        try {
+          input = JSON.parse(flags.get('--input-json')!)
+        } catch {
+          throw new WorkflowError('INVALID_ARGUMENT', 'Invalid --input-json value')
+        }
+      }
+      const inputDefinition = flags.has('--resolver')
+        ? { inputMode: 'resolver' as const }
+        : flags.has('--input-json')
+          ? { inputMode: 'static' as const, input }
+          : { inputMode: 'none' as const }
+      const commonDefinition = {
+        workflow,
+        workflowVersion: version,
+        misfire,
+        overlap,
+        maxCatchUp,
+        ...inputDefinition
+      }
+      const timezone = flags.get('--timezone')
+      let definition: ScheduleDefinitionUpdate =
+        type === 'cron'
+          ? { ...commonDefinition, type, expression: flags.get('--expression')! }
+          : { ...commonDefinition, type, intervalMs: Number(flags.get('--interval-ms')) }
+      if (timezone !== undefined) definition = { ...definition, timezone }
+      console.log(
+        JSON.stringify(
+          await admin.updateScheduleDefinition(positional[0]!, {
+            confirm: true,
+            from: 'now',
+            definition
+          }),
+          null,
+          2
+        )
       )
     } else throw new WorkflowError('INVALID_ARGUMENT', usage)
   } finally {

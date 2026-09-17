@@ -42,9 +42,53 @@ Production journal deadlines, activity-delivery leases and claim leases use data
 
 SQLite is an embedded single-process deployment. Distributed topology uses PostgreSQL plus the Effect socket cluster; changing a connection string alone is not cluster configuration. Runner sockets need private-network access and valid advertised addresses. Local administrative connections and runtimes referencing the same canonical SQLite file share the driver and its asynchronous transaction semaphore; reference-counted ownership closes it only after the last owner disposes. In-memory test stores remain isolated. SQLite result notifications are process-local and best-effort; the revision read plus fallback preserves correctness. Local queue slots are per process. Optional global/per-key admission uses SQL row locks and leased permits shared by namespace and queue. Expired owners cannot renew or commit through an old permit. This is a limit on current leased ownership, not a mechanism to kill non-cooperative external work after a process pause. Database credentials, application authorization, payload sensitivity, logging, backups and capacity planning remain deployment responsibilities.
 
-Migrations are forward-only and transactional. The standalone admin API and CLI apply the journal and pinned native engine schemas without starting workers. Bootstrap can run them or validate first. The journal rejects newer/gapped ledgers and missing previously applied journal structures. Version 2 rebuilds the command ordinal index to include scope, preserves v1 command identities and records their timer protocol explicitly. Version 3 adds the signal wake/deadline outbox markers without scanning dormant waits. Version 4 adds the engine-result reconciliation outbox. Version 5 adds continuation-chain metadata. Version 6 adds the application-owned activity-delivery and dead-letter tables. Existing v1 timers continue through the native DurableClock protocol; newly recorded timers use a journal deadline and deferred outbox so test business time can advance them.
+Migrations are forward-only and transactional. The standalone admin API and CLI apply the journal and pinned native engine schemas without starting workers. Bootstrap can run them or validate first. The journal rejects newer/gapped ledgers and missing previously applied journal structures. Version 2 rebuilds the command ordinal index to include scope, preserves v1 command identities and records their timer protocol explicitly. Version 3 adds the signal wake/deadline outbox markers without scanning dormant waits. Version 4 adds the engine-result reconciliation outbox. Version 5 adds continuation-chain metadata. Version 6 adds the application-owned activity-delivery and dead-letter tables. Version 7 adds schedule definitions and occurrence history; version 8 adds persisted static inputs and manual-trigger idempotency keys; version 9 separates manual and recurring occurrence identity so both may share the current business-clock timestamp; version 10 adds durable schedule ownership leases; version 11 adds optional persisted trace-parent context without changing workflow identity. Existing v1 timers continue through the native DurableClock protocol; newly recorded timers use a journal deadline and deferred outbox so test business time can advance them.
 
 Retention previews terminal executions before a cutoff. Application rechecks locks, active parent/child links, live claims/permits, unacknowledged activity deliveries, open/requeued dead letters and pending engine messages. Removal covers that execution's journal, activity transport and native message/reply records in one transaction, with namespace isolation. A tombstone containing the key and input hash prevents the execution from being silently recreated. Tombstones are retained indefinitely; there is no unbounded-duplicate resurrection, automatic archival scheme or file compaction. Use backups and the API, not manual table deletion.
+
+## Durable scheduling and operational state
+
+`@Cron` and `@Interval` metadata is normalized onto the workflow contract, never the
+concrete handler. The registry is immutable after discovery. A schedule name is the
+stable namespace identity; its definition hash covers the timeline, timezone, policies,
+input mode and workflow contract version. A changed hash fails bootstrap with
+`SCHEDULE_DEFINITION_CHANGED` instead of silently moving a cursor. Missing definitions
+remain as `orphaned` rows and are not deleted by deployment; client-only and
+activity-only processes do not claim schedule ownership. An operator may remove a
+definition only after pausing it (or for an orphan) with explicit confirmation; occurrence
+history is retained.
+
+Cron definitions without an explicit timezone use UTC. Implementation ownership is
+durable: a runtime renews a lease for each schedule it registers. Expired owners can
+be reconciled as orphaned, while a live owner in another partial deployment protects
+its schedule from removal. Ownership reconciliation continues during runtime so a
+rolling deployment eventually orphans a removed schedule after its old owner stops.
+
+Schedule definitions own a persisted cursor and each materialized occurrence has a
+unique `(namespace, schedule_name, sequence)` identity; recurring rows additionally
+have a unique scheduled timestamp. A scheduler pass selects a
+bounded due batch, claims a row with database-time fencing, then records the occurrence,
+accepts the workflow and advances the cursor in one SQL transaction. A crash before
+commit retries the transaction; a crash after commit reuses the deterministic schedule
+occurrence idempotency key. SQLite is single-process; PostgreSQL permits concurrent
+schedulers without duplicate starts.
+
+`skip`, `latest` and bounded `catch-up` operate on the persisted timeline, while
+`allow` and `skip` control active workflow overlap. Continuation chains are followed
+when evaluating overlap. Pausing only stops new occurrences; resume leaves the cursor
+in place and reapplies the configured misfire policy. Manual triggers are separate
+occurrences and never move the recurring cursor; their optional idempotency keys are
+durable. Input resolvers are synchronous, schema-validated and excluded from all
+telemetry. Execution retention keeps occurrence metadata but clears links to deleted
+executions, while retaining the idempotency tombstone/key reservation.
+
+The scheduler is part of the dispatcher loop but has its own readiness state and
+staleness timestamp. It polls indexed due rows rather than creating one in-memory timer
+per definition. `schedule.tick` and `schedule.trigger` spans, bounded schedule metrics,
+and structured logs expose materialization, skip, misfire, catch-up and failure events;
+schedule names, workflow identities, type, trigger and policies are the only schedule
+dimensions permitted on metric series. Occurrence timestamps, sequence numbers,
+execution IDs, idempotency keys and inputs remain span/log-only or durable storage.
 
 ## Observability and operational state
 

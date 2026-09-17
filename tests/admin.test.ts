@@ -3,11 +3,16 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { Database } from 'bun:sqlite'
+import { Layer, ManagedRuntime } from 'effect'
+import * as NodeCrypto from '@effect/platform-node/NodeCrypto'
+import { SqlClient } from 'effect/unstable/sql'
 import { z } from 'zod'
 import { Workflow, WorkflowsAdmin } from '../src'
 import type { WorkflowContext } from '../src'
 import { createWorkflowsAdmin } from '../src/admin'
+import { postgres } from '../src/postgres'
 import { sqlite } from '../src/sqlite'
+import { makeDatabase } from '../src/internal/infrastructure'
 import { testApp } from './helpers'
 
 @Workflow({
@@ -33,12 +38,27 @@ test('standalone migration status/validate are read-only; run creates all schema
     const db = new Database(filename)
     expect(db.query("SELECT name FROM sqlite_master WHERE type='table'").all()).toEqual([])
     const migrated = await admin.migrations.run()
-    expect(migrated.journal.applied).toEqual([1, 2, 3, 4, 5, 6])
+    expect(migrated.journal.applied).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
     expect(migrated.cluster.applied).toEqual([1, 2, 3])
     expect(migrated.queue.applied).toEqual([1, 2])
     expect((await admin.migrations.validate()).valid).toBe(true)
     expect((await admin.migrations.run()).valid).toBe(true)
     expect(db.query('SELECT * FROM better_workflows_runs').all()).toEqual([])
+    db.exec(`
+      ALTER TABLE better_workflows_runs DROP COLUMN trace_id;
+      ALTER TABLE better_workflows_runs DROP COLUMN trace_span_id;
+      ALTER TABLE better_workflows_runs DROP COLUMN trace_sampled;
+      DELETE FROM better_workflows_schema WHERE version=11;
+    `)
+    expect((await admin.migrations.status()).journal.pending).toEqual([11])
+    expect((await admin.migrations.run()).valid).toBe(true)
+    expect(db.query('PRAGMA table_info(better_workflows_runs)').all()).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ name: 'trace_id' }),
+        expect.objectContaining({ name: 'trace_span_id' }),
+        expect.objectContaining({ name: 'trace_sampled' })
+      ])
+    )
     db.close()
   } finally {
     await admin.close()
@@ -165,9 +185,9 @@ test('journal v6 backfills existing v5 executions into singleton continuation ch
         execution_id, namespace, workflow_name, version, dedupe_key, input_json, created_at, updated_at,
         chain_id, generation, continued_from, continued_to
       ) VALUES ('legacy-run', 'v4-upgrade', 'legacy', 1, 'legacy-key', '"legacy"', 1, 1, NULL, 0, NULL, NULL);
-       DELETE FROM better_workflows_schema WHERE version IN (5, 6);
+       DELETE FROM better_workflows_schema WHERE version IN (5, 6, 7, 8, 9, 10, 11);
     `)
-    expect((await admin.migrations.status()).journal.pending).toEqual([5, 6])
+    expect((await admin.migrations.status()).journal.pending).toEqual([5, 6, 7, 8, 9, 10, 11])
     await admin.migrations.run()
     expect(
       db
@@ -186,6 +206,169 @@ test('journal v6 backfills existing v5 executions into singleton continuation ch
     db.close()
     await admin.close()
     await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('journal v6 upgrades a database without the later schedule tables', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'bw-v6-schedule-upgrade-'))
+  const filename = join(dir, 'data.sqlite')
+  const admin = await createWorkflowsAdmin({
+    namespace: 'v6-schedule-upgrade',
+    storage: sqlite({ filename })
+  })
+  const db = new Database(filename)
+  try {
+    await admin.migrations.run()
+    db.exec(`
+      DROP TABLE better_workflows_schedule_manual_keys;
+      DROP TABLE better_workflows_schedule_inputs;
+      DROP TABLE better_workflows_schedule_occurrences;
+      DROP TABLE better_workflows_schedule_owners;
+      DROP TABLE better_workflows_schedules;
+       DELETE FROM better_workflows_schema WHERE version IN (7, 8, 9, 10, 11);
+    `)
+    expect((await admin.migrations.status()).journal.pending).toEqual([7, 8, 9, 10, 11])
+    await admin.migrations.run()
+    expect((await admin.migrations.validate()).journal.applied).toEqual([
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11
+    ])
+  } finally {
+    db.close()
+    await admin.close()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+test('journal v8 migrates occurrence and manual-key history to sequence identity', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'bw-v8-schedule-upgrade-'))
+  const filename = join(dir, 'data.sqlite')
+  const admin = await createWorkflowsAdmin({
+    namespace: 'v8-schedule-upgrade',
+    storage: sqlite({ filename })
+  })
+  const db = new Database(filename)
+  try {
+    await admin.migrations.run()
+    db.exec(`
+      DROP TABLE better_workflows_schedule_manual_keys;
+      DROP TABLE better_workflows_schedule_occurrences;
+      DROP TABLE better_workflows_schedule_owners;
+      CREATE TABLE better_workflows_schedule_occurrences (
+        namespace TEXT NOT NULL,
+        schedule_name TEXT NOT NULL,
+        scheduled_at DOUBLE PRECISION NOT NULL,
+        sequence INTEGER NOT NULL,
+        trigger_type TEXT NOT NULL,
+        state TEXT NOT NULL,
+        execution_id TEXT,
+        reason_code TEXT,
+        created_at DOUBLE PRECISION NOT NULL,
+        PRIMARY KEY(namespace, schedule_name, scheduled_at),
+        UNIQUE(namespace, schedule_name, sequence)
+      );
+      INSERT INTO better_workflows_schedule_occurrences
+        (namespace, schedule_name, scheduled_at, sequence, trigger_type, state, execution_id, reason_code, created_at)
+      VALUES
+        ('v8-schedule-upgrade', 'legacy.schedule', 1000, 1, 'scheduled', 'started', 'scheduled-run', NULL, 1000),
+        ('v8-schedule-upgrade', 'legacy.schedule', 2000, 2, 'manual', 'started', 'manual-run', NULL, 2000);
+      CREATE TABLE better_workflows_schedule_manual_keys (
+        namespace TEXT NOT NULL,
+        schedule_name TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        scheduled_at DOUBLE PRECISION NOT NULL,
+        execution_id TEXT NOT NULL,
+        created_at DOUBLE PRECISION NOT NULL,
+        PRIMARY KEY(namespace, schedule_name, idempotency_key)
+      );
+      INSERT INTO better_workflows_schedule_manual_keys
+        (namespace, schedule_name, idempotency_key, scheduled_at, execution_id, created_at)
+      VALUES ('v8-schedule-upgrade', 'legacy.schedule', 'manual-key', 2000, 'manual-run', 2000);
+        DELETE FROM better_workflows_schema WHERE version IN (9, 10, 11);
+    `)
+    await admin.migrations.run()
+    expect(
+      db
+        .query(
+          `SELECT scheduled_at, sequence, trigger_type
+           FROM better_workflows_schedule_occurrences
+           WHERE namespace='v8-schedule-upgrade' ORDER BY sequence`
+        )
+        .all()
+    ).toEqual([
+      { scheduled_at: 1000, sequence: 1, trigger_type: 'scheduled' },
+      { scheduled_at: 2000, sequence: 2, trigger_type: 'manual' }
+    ])
+    expect(
+      db
+        .query(
+          `SELECT idempotency_key, scheduled_at, sequence, execution_id
+           FROM better_workflows_schedule_manual_keys
+           WHERE namespace='v8-schedule-upgrade'`
+        )
+        .all()
+    ).toEqual([
+      { idempotency_key: 'manual-key', scheduled_at: 2000, sequence: 2, execution_id: 'manual-run' }
+    ])
+    expect(db.query('PRAGMA table_info(better_workflows_schedule_owners)').all()).not.toEqual([])
+  } finally {
+    db.close()
+    await admin.close()
+    await rm(dir, { recursive: true, force: true })
+  }
+})
+
+const postgresUrl = process.env.WORKFLOWS_TEST_POSTGRES_URL
+
+test.skipIf(!postgresUrl)('PostgreSQL journal v9 to v11 preserves schedule history', async () => {
+  if (!postgresUrl) return
+  const namespace = `admin-v10-${process.pid}-${Date.now()}`
+  const storage = postgres({ connectionString: postgresUrl, maxConnections: 4 })
+  const admin = await createWorkflowsAdmin({ namespace, storage })
+  const runtime = ManagedRuntime.make(Layer.mergeAll(await makeDatabase(storage), NodeCrypto.layer))
+  try {
+    await admin.migrations.run()
+    const sql = await runtime.runPromise(SqlClient.SqlClient)
+    await runtime.runPromise(
+      sql`INSERT INTO better_workflows_schedules(
+        namespace, schedule_name, workflow_name, workflow_version, kind,
+        expression, timezone, interval_ms, definition_hash, next_occurrence_at,
+        created_at, updated_at
+      ) VALUES (${namespace}, 'legacy.schedule', 'legacy.workflow', 1, 'interval',
+        NULL, NULL, 60000, 'legacy-hash', 3000, 1000, 1000)`
+    )
+    await runtime.runPromise(
+      sql`INSERT INTO better_workflows_schedule_occurrences(
+        namespace, schedule_name, scheduled_at, sequence, trigger_type, state, execution_id, created_at
+      ) VALUES
+        (${namespace}, 'legacy.schedule', 2000, 1, 'scheduled', 'started', 'scheduled-run', 2000),
+        (${namespace}, 'legacy.schedule', 2000, 2, 'manual', 'started', 'manual-run', 2000)`
+    )
+    await runtime.runPromise(
+      sql`INSERT INTO better_workflows_schedule_manual_keys(
+        namespace, schedule_name, idempotency_key, scheduled_at, sequence, execution_id, created_at
+      ) VALUES (${namespace}, 'legacy.schedule', 'manual-key', 2000, 2, 'manual-run', 2000)`
+    )
+    await runtime.runPromise(sql`DROP TABLE better_workflows_schedule_owners`)
+    await runtime.runPromise(sql`DELETE FROM better_workflows_schema WHERE version IN (10, 11)`)
+
+    expect((await admin.migrations.status()).journal.pending).toEqual([10, 11])
+    await admin.migrations.run()
+    expect((await admin.migrations.validate()).journal.applied).toEqual([
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11
+    ])
+    expect(
+      await runtime.runPromise(
+        sql`SELECT scheduled_at, sequence, trigger_type
+            FROM better_workflows_schedule_occurrences
+            WHERE namespace=${namespace} ORDER BY sequence`
+      )
+    ).toEqual([
+      { scheduled_at: 2000, sequence: 1, trigger_type: 'scheduled' },
+      { scheduled_at: 2000, sequence: 2, trigger_type: 'manual' }
+    ])
+  } finally {
+    await admin.close()
+    await runtime.dispose()
   }
 })
 
@@ -227,7 +410,7 @@ test('version 1 migration preserves command identities and timer protocol, and r
     db.exec(`DROP TABLE better_workflows_commands;
       CREATE TABLE better_workflows_commands(execution_id TEXT NOT NULL,step_id TEXT NOT NULL,ordinal INTEGER NOT NULL,signature TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'scheduled',PRIMARY KEY(execution_id,step_id),UNIQUE(execution_id,ordinal));
        INSERT INTO better_workflows_commands VALUES('old-run','sleep',0,'old-signature','scheduled');
-        DELETE FROM better_workflows_schema WHERE version IN (2, 3, 4, 5, 6);`)
+         DELETE FROM better_workflows_schema WHERE version IN (2, 3, 4, 5, 6, 7, 8, 9, 10, 11);`)
     db.exec(`DROP TABLE better_workflows_waits;
       CREATE TABLE better_workflows_waits(execution_id TEXT NOT NULL,step_id TEXT NOT NULL,signal_name TEXT NOT NULL,deadline DOUBLE PRECISION,state TEXT NOT NULL DEFAULT 'pending',result_json TEXT,delivered INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(execution_id,step_id));`)
     for (const table of [
@@ -238,10 +421,14 @@ test('version 1 migration preserves command identities and timer protocol, and r
       'timers',
       'limits',
       'permits',
-      'tombstones'
+      'tombstones',
+      'schedules',
+      'schedule_occurrences'
     ])
       db.exec(`DROP TABLE better_workflows_${table}`)
-    expect((await admin.migrations.status()).journal.pending).toEqual([2, 3, 4, 5, 6])
+    expect((await admin.migrations.status()).journal.pending).toEqual([
+      2, 3, 4, 5, 6, 7, 8, 9, 10, 11
+    ])
     await expect(admin.migrations.validate()).rejects.toMatchObject({ code: 'MIGRATIONS_REQUIRED' })
     await admin.migrations.run()
     expect(
@@ -261,7 +448,7 @@ test('version 1 migration preserves command identities and timer protocol, and r
       }
     ])
     db.exec(
-      'DELETE FROM better_workflows_schema WHERE version IN (2, 3, 4, 5, 6); DROP TABLE better_workflows_claims'
+      'DELETE FROM better_workflows_schema WHERE version IN (2, 3, 4, 5, 6, 7); DROP TABLE better_workflows_claims'
     )
     await expect(admin.migrations.run()).rejects.toMatchObject({ code: 'SCHEMA_CORRUPT' })
     expect(

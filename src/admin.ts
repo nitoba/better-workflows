@@ -11,6 +11,8 @@ import { migrateAll, migrationStatus, validateMigrations } from './internal/sche
 import { identifier } from './internal/values'
 import { WorkflowError, toFailure } from './errors'
 import { executionNotifierKey } from './internal/notifier'
+import { ScheduleStore } from './internal/schedule-store'
+import type { ScheduleTriggerOutcome } from './internal/schedule-store'
 import type {
   AdminBackend,
   AdminOptions,
@@ -18,8 +20,23 @@ import type {
   RetentionOptions,
   DeadLetterListOptions,
   DiscardDeadLetterOptions,
-  WorkflowsStats
+  WorkflowsStats,
+  ScheduleListOptions,
+  ScheduleOccurrenceListOptions,
+  ScheduleDefinitionUpdateOptions,
+  ScheduleRemoveOptions,
+  ScheduleRetentionOptions,
+  ScheduleRetentionPlan,
+  ScheduleRetentionResult,
+  ScheduleTriggerOptions,
+  ScheduleTriggerResult
 } from './admin-types'
+
+function scheduleTriggerResult(outcome: ScheduleTriggerOutcome): ScheduleTriggerResult {
+  if (outcome.status === 'failed')
+    throw new WorkflowError(outcome.failure.code, outcome.failure.message)
+  return outcome.result
+}
 
 /**
  * Nest backend token used internally to construct WorkflowsAdmin.
@@ -78,6 +95,116 @@ export class WorkflowsAdmin {
    */
   stats(): Promise<WorkflowsStats> {
     return this.backend.stats()
+  }
+
+  /**
+   * List persisted schedules in stable name order. Inputs and storage claims are omitted.
+   * @param options - Optional state, cursor and bounded page size.
+   * @returns Public schedule snapshots.
+   * @throws WorkflowError when storage is unavailable or options are invalid.
+   */
+  listSchedules(options?: ScheduleListOptions) {
+    return this.backend.listSchedules(options)
+  }
+
+  /**
+   * List bounded occurrence history for one schedule without returning schedule inputs.
+   * Failed and skipped occurrences remain visible for operational diagnosis.
+   * @param name - Explicit schedule identity within the namespace.
+   * @param options - Optional state filter, sequence cursor and page size.
+   * @returns Occurrence metadata and an optional cursor for the next page.
+   * @throws WorkflowError with SCHEDULE_NOT_FOUND or INVALID_PAGINATION when rejected.
+   */
+  listScheduleOccurrences(name: string, options?: ScheduleOccurrenceListOptions) {
+    return this.backend.listScheduleOccurrences(name, options)
+  }
+
+  /**
+   * Read one persisted schedule definition and cursor.
+   * @param name - Explicit schedule identity within the namespace.
+   * @returns Public schedule snapshot.
+   * @throws WorkflowError with SCHEDULE_NOT_FOUND for an unknown name.
+   */
+  getSchedule(name: string) {
+    return this.backend.getSchedule(name)
+  }
+
+  /**
+   * Pause future occurrences without cancelling executions already accepted.
+   * @param name - Explicit schedule identity.
+   * @returns The paused schedule snapshot.
+   */
+  pauseSchedule(name: string) {
+    return this.backend.pauseSchedule(name)
+  }
+
+  /**
+   * Resume a schedule. Its next runtime pass applies the configured misfire policy.
+   * @param name - Explicit schedule identity.
+   * @returns The active schedule snapshot.
+   */
+  resumeSchedule(name: string) {
+    return this.backend.resumeSchedule(name)
+  }
+
+  /**
+   * Remove a paused or orphaned schedule definition without deleting occurrence history.
+   * @param name - Explicit schedule identity.
+   * @param options - Required explicit confirmation.
+   * @returns Resolves after the definition is removed.
+   * @throws WorkflowError with CONFIRMATION_REQUIRED, SCHEDULE_MUST_BE_PAUSED or
+   * SCHEDULE_NOT_FOUND when the requested removal is not allowed.
+   */
+  removeSchedule(name: string, options: ScheduleRemoveOptions) {
+    return this.backend.removeSchedule(name, options)
+  }
+
+  /**
+   * Start one occurrence through the schedule's input definition without moving its
+   * recurring cursor. A supplied idempotency key makes the operation repeatable.
+   * @param name - Explicit schedule identity.
+   * @param options - Optional manual-trigger idempotency key.
+   * @returns Accepted execution and its manual occurrence metadata.
+   */
+  triggerSchedule(name: string, options?: ScheduleTriggerOptions) {
+    return this.backend.triggerSchedule(name, options)
+  }
+
+  /**
+   * Explicitly reconcile a persisted definition after a deployment change. This never
+   * runs automatically at bootstrap and only supports resetting the next cursor from now.
+   * @param name - Explicit schedule identity.
+   * @param options - Confirmation, `from: 'now'` and the replacement static definition.
+   * @returns The reconciled schedule snapshot.
+   * @throws WorkflowError with SCHEDULE_RUNTIME_RESTART_REQUIRED when called on an active
+   * runtime; use createWorkflowsAdmin and restart the owning deployment afterward.
+   */
+  updateScheduleDefinition(name: string, options: ScheduleDefinitionUpdateOptions) {
+    return this.backend.updateScheduleDefinition(name, options)
+  }
+
+  /**
+   * Preview bounded schedule occurrence history that can be explicitly pruned.
+   * Manual-trigger rows and the highest-sequence row for each schedule are preserved so
+   * idempotency and future sequence allocation remain safe.
+   * @param options - UTC cutoff, optional schedule and bounded scan limit.
+   * @returns An intact plan to review and later pass to pruneScheduleRetention.
+   */
+  previewScheduleRetention(options: ScheduleRetentionOptions) {
+    return this.backend.previewScheduleRetention(options)
+  }
+
+  /**
+   * Delete eligible schedule occurrence metadata after explicit confirmation.
+   * @param plan - Unmodified plan previously returned by previewScheduleRetention.
+   * @param options - Explicit confirmation; confirm must be true.
+   * @returns Deleted occurrence identities and count.
+   */
+  pruneScheduleRetention(
+    plan: ScheduleRetentionPlan,
+    options: { readonly confirm: true }
+  ): Promise<ScheduleRetentionResult> {
+    return this.backend.pruneScheduleRetention(plan, options?.confirm === true)
   }
   /**
    * Read-only preview and explicit transactional removal of eligible terminal history.
@@ -274,6 +401,7 @@ export async function createWorkflowsAdmin(
       undefined,
       executionNotifierKey(options.storage, options.namespace)
     )
+    const schedules = new ScheduleStore(journal)
     const admin = new SqlAdministration(journal)
     const run = async <A, E>(effect: Effect.Effect<A, E, SqlClient.SqlClient | Crypto.Crypto>) => {
       const exit = await runtime.runPromiseExit(effect)
@@ -290,6 +418,46 @@ export async function createWorkflowsAdmin(
       stats: async () => {
         await run(validateMigrations(sql))
         return run(admin.stats())
+      },
+      listSchedules: async (settings) => {
+        await run(validateMigrations(sql))
+        return run(schedules.listSnapshots(settings))
+      },
+      listScheduleOccurrences: async (name, settings) => {
+        await run(validateMigrations(sql))
+        return run(schedules.listOccurrenceSnapshots(name, settings))
+      },
+      getSchedule: async (name) => {
+        await run(validateMigrations(sql))
+        return run(schedules.getSnapshot(name))
+      },
+      pauseSchedule: async (name) => {
+        await run(validateMigrations(sql))
+        return run(schedules.pauseSnapshot(name))
+      },
+      resumeSchedule: async (name) => {
+        await run(validateMigrations(sql))
+        return run(schedules.resumeSnapshot(name))
+      },
+      removeSchedule: async (name, settings) => {
+        await run(validateMigrations(sql))
+        await run(schedules.remove(name, settings))
+      },
+      triggerSchedule: async (name, settings) => {
+        await run(validateMigrations(sql))
+        return scheduleTriggerResult(await run(schedules.trigger(name, undefined, settings)))
+      },
+      updateScheduleDefinition: async (name, settings) => {
+        await run(validateMigrations(sql))
+        return run(schedules.updateDefinition(name, settings))
+      },
+      previewScheduleRetention: async (settings) => {
+        await run(validateMigrations(sql))
+        return run(admin.previewScheduleRetention(settings))
+      },
+      pruneScheduleRetention: async (plan, confirm) => {
+        await run(validateMigrations(sql))
+        return run(admin.pruneScheduleRetention(plan, confirm))
       },
       previewRetention: async (settings) => {
         await run(validateMigrations(sql))
@@ -341,6 +509,19 @@ export type {
   RetentionOptions,
   RetentionPlan,
   RetentionResult,
+  ScheduleRetentionCandidate,
+  ScheduleRetentionOptions,
+  ScheduleRetentionPlan,
+  ScheduleRetentionResult,
+  ScheduleListOptions,
+  ScheduleOccurrenceListOptions,
+  ScheduleOccurrencePage,
+  ScheduleDefinitionUpdate,
+  ScheduleDefinitionUpdateOptions,
+  ScheduleRemoveOptions,
+  ScheduleStats,
+  ScheduleTriggerOptions,
+  ScheduleTriggerResult,
   WorkflowExecutionStats,
   WorkflowsStats
 } from './admin-types'

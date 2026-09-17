@@ -12,6 +12,8 @@ import {
   Activities,
   Activity,
   ActivityError,
+  Cron,
+  Interval,
   Workflow,
   WorkflowsModule,
   getWorkflowToken,
@@ -65,6 +67,32 @@ Workflow({
   signals: [signal],
   idempotencyKey: (value) => value.id
 })(Calculation)
+
+class IntervalSmoke {
+  async run(value) {
+    return value.value
+  }
+}
+Workflow({ name: 'package.smoke.interval-workflow', version: 1, input, output: z.number() })(
+  IntervalSmoke
+)
+Interval({
+  name: 'package.smoke.interval',
+  every: '1d',
+  input: { id: 'scheduled-smoke', value: 1 }
+})(IntervalSmoke)
+
+class CronSmoke {
+  async run(value) {
+    return value.value
+  }
+}
+Workflow({ name: 'package.smoke.cron-workflow', version: 1, input, output: z.number() })(CronSmoke)
+Cron({
+  name: 'package.smoke.cron',
+  expression: '0 0 1 1 *',
+  input: { id: 'cron-smoke', value: 1 }
+})(CronSmoke)
 
 const namespace = `package-${randomUUID()}`
 const url = process.env.WORKFLOWS_TEST_POSTGRES_URL
@@ -137,7 +165,7 @@ try {
       []
     )
   } else {
-    producer = await app(base, [Calculation, Maths])
+    producer = await app(base, [Calculation, Maths, IntervalSmoke, CronSmoke])
   }
   apps.push(producer)
   const client = producer.get(getWorkflowToken(Calculation))

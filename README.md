@@ -2,7 +2,7 @@
 
 Durable workflows for **NestJS 12**, using decorators, modules, dependency injection and `async/await`. Effect's workflow/cluster engine is private infrastructure; application code does not import Effect.
 
-**Status: `0.1.0-alpha.7`.** This repository contains an executable implementation, not just API declarations. It is an initial release candidate for application-level evaluation, not a claim that every proposed feature or failure mode is covered. No npm publication is required to run the repository.
+**Status: `0.1.0-alpha.8`.** This repository contains an executable implementation, not just API declarations. It is an initial release candidate for application-level evaluation, not a claim that every proposed feature or failure mode is covered. No npm publication is required to run the repository.
 
 ## Run the example
 
@@ -339,7 +339,7 @@ WorkflowsModule.forRoot({
 
 `WorkflowsHealth` is provided by the root module, but no controller is installed.
 Expose `liveness()` for a cheap process check and `await readiness()` for storage,
-schema, dispatcher and configured worker checks. A disconnected PostgreSQL notifier
+schema, dispatcher, scheduler and configured worker checks. A disconnected PostgreSQL notifier
 is reported as `degraded`; result-wait fallback keeps it from being a correctness
 dependency. Open dead letters are operational work and do not make readiness fail.
 
@@ -358,13 +358,71 @@ the chain and generation. Trace context crosses the persisted activity envelope,
 span IDs are not written into the workflow journal. Telemetry does not capture payloads
 or heartbeat details by default.
 
+## Scheduled workflows
+
+Schedules are durable dispatch definitions owned by a workflow contract. They use the
+same database/business clock, acceptance transaction and distributed fencing as other
+workflow starts; they do not create one JavaScript timer per schedule.
+
+```ts
+import { z } from 'zod'
+import { Cron, WorkflowContract } from 'better-workflows'
+import type { WorkflowContext } from 'better-workflows'
+
+const ReportInput = z.object({ reportDate: z.string() })
+const ReportOutput = z.string()
+
+@Cron({
+  name: 'reports.daily',
+  expression: '0 8 * * *',
+  timezone: 'America/Fortaleza',
+  misfire: 'latest',
+  overlap: 'skip',
+  input: ({ scheduledAt }) => ({ reportDate: scheduledAt })
+})
+@WorkflowContract({
+  name: 'reports.generate',
+  version: 1,
+  input: ReportInput,
+  output: ReportOutput
+})
+abstract class GenerateReportWorkflow {
+  abstract run(
+    input: z.infer<typeof ReportInput>,
+    ctx: WorkflowContext
+  ): Promise<z.infer<typeof ReportOutput>>
+}
+```
+
+Use `@Interval({ name, every })` for a timeline based on its persisted cursor. Cron
+uses UTC when `timezone` is omitted; provide an explicit IANA timezone when needed.
+Use `misfire: 'skip'`, `'latest'` (the default) or `'catch-up'` with `maxCatchUp`, and
+`overlap: 'allow'` (the default) or `'skip'`. Input resolvers are synchronous and
+pure; their values are validated again before acceptance and are never sent to logs,
+metrics or traces.
+
+`WorkflowsAdmin` and the CLI expose `listSchedules`, `getSchedule`, paginated
+`listScheduleOccurrences`, pause/resume, safe removal and manual trigger operations.
+Occurrence history exposes started, skipped and failed outcomes without schedule inputs.
+Removal requires explicit confirmation and a paused/orphaned schedule, while occurrence history is retained. Manual triggers have
+`trigger: 'manual'` and do not move
+the recurring cursor. `WorkflowsHealth.readiness()` reports a stale or failed
+scheduler separately from the dispatcher. In tests, `WorkflowsTestHarness.flush()` and
+`advanceTime()` process schedule deadlines through the manual business clock without
+waiting on real timers.
+
+Definition reconciliation is an offline operation: use `createWorkflowsAdmin`, then
+restart the owning runtime so its immutable in-memory registry uses the new definition.
+
 ## Release scope
 
 This remains an alpha. External effects are at least once and must be idempotent. Business failures inside a saga scope trigger its registered compensations; suspension, infrastructure loss and forced cancellation do not masquerade as business failures. Completed saga scopes are committed, not an automatic rollback of any later workflow failure.
 
 Schema migrations can run automatically at bootstrap (`migrations: 'run'`, the default), or be applied separately before starting the application with `migrations: 'validate'`. Retention requires an explicit preview and confirmation, preserves active dependencies and keeps compact idempotency tombstones. Open/requeued dead letters protect their owner from retention; resolved, discarded or cancelled-owner records can become eligible. There is no background deletion policy by default.
 
-Scheduling decorators, a visual dashboard and publication automation are outside this release. No npm publication is performed by the development scripts.
+Calendar/RRULE schedules, automatic definition changes, queue/replace overlap
+policies, a visual dashboard and publication automation remain outside this release.
+No npm publication is performed by the development scripts.
 
 ## Editor documentation
 

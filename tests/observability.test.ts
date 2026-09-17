@@ -7,9 +7,19 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { expect, test } from 'bun:test'
 import { Effect, ManagedRuntime } from 'effect'
+import { Test } from '@nestjs/testing'
 import { otlp } from '../src/observability'
-import { Activity, Activities, Workflow, WorkflowsAdmin, defineQueue } from '../src'
+import {
+  Activity,
+  Activities,
+  Interval,
+  Workflow,
+  WorkflowsAdmin,
+  WorkflowsModule,
+  defineQueue
+} from '../src'
 import type { WorkflowContext, WorkflowsOptions } from '../src'
+import { WorkflowsTestHarness, WorkflowsTestingModule } from '../src/testing'
 import { WorkflowError } from '../src/errors'
 import { otlpLayer, otlpResource } from '../src/internal/otlp'
 import { TelemetryService } from '../src/internal/telemetry'
@@ -44,6 +54,23 @@ class OtlpContinuationWorkflow {
   async run(input: number, context: WorkflowContext): Promise<number> {
     if (input === 0) return context.continueAsNew(1)
     return input
+  }
+}
+
+@Interval({
+  name: 'observability.schedule',
+  every: '1m',
+  input: { secret: 'SCHEDULE_TELEMETRY_SECRET' }
+})
+@Workflow({
+  name: 'observability.schedule-workflow',
+  version: 1,
+  input: z.object({ secret: z.string() }),
+  output: z.string()
+})
+class OtlpScheduleWorkflow {
+  async run(input: { secret: string }): Promise<string> {
+    return input.secret
   }
 }
 
@@ -328,7 +355,7 @@ test('otlp resources contain deployment identity but no storage secrets', () => 
   expect(resource.serviceVersion).toBe('2026.9.1')
   expect(resource.attributes['deployment.environment.name']).toBe('test')
   expect(resource.attributes['better_workflows.namespace']).toBe('reports')
-  expect(resource.attributes['better_workflows.version']).toBe('0.1.0-alpha.7')
+  expect(resource.attributes['better_workflows.version']).toBe('0.1.0-alpha.8')
   expect(resource.attributes['better_workflows.topology']).toBe('distributed')
   expect(resource.attributes['better_workflows.storage.driver']).toBe('postgres')
   expect(resource.attributes['better_workflows.role']).toBe('producer')
@@ -489,6 +516,101 @@ test('otlp metrics export the runtime registry', async () => {
   expect(resourceAttributes).toContain('better_workflows.namespace')
   expect(resourceAttributes).toContain('better_workflows.version')
   expect(metricNames).toContain('better_workflows.workflow.started')
+})
+
+test('schedule telemetry exports bounded metadata without schedule input', async () => {
+  const secret = 'SCHEDULE_TELEMETRY_SECRET'
+  const requests = await collectOtlpRequests(async (endpoint) => {
+    const app = await Test.createTestingModule({
+      imports: [
+        WorkflowsTestingModule.forRoot({
+          namespace: 'schedule-observability',
+          initialTime: Date.UTC(2026, 0, 1, 8),
+          execution: { activities: { enabled: false } },
+          observability: otlp({
+            serviceName: 'schedule-observability-test',
+            endpoint,
+            traces: { exportInterval: '5ms' },
+            metrics: { enabled: true, exportInterval: '5ms' },
+            logs: false,
+            shutdownTimeout: '1s'
+          })
+        }),
+        WorkflowsModule.forFeature({
+          name: 'schedule-observability',
+          workflows: [OtlpScheduleWorkflow]
+        })
+      ]
+    }).compile()
+    try {
+      await app.init()
+      await app.get(WorkflowsAdmin).triggerSchedule('observability.schedule')
+      await app.get(WorkflowsTestHarness).runUntilIdle()
+      await app.get(WorkflowsTestHarness).advanceTime('1m')
+    } finally {
+      await app.close()
+    }
+  })
+
+  const spans = exportedOtlpSpans(requests)
+  const tick = spans.find((span) => span.name === 'better-workflows.schedule.tick')
+  const trigger = spans.find(
+    (span) =>
+      span.name === 'better-workflows.schedule.trigger' &&
+      spanAttribute(span, 'better_workflows.schedule.name') === 'observability.schedule' &&
+      spanAttribute(span, 'better_workflows.schedule.trigger') === 'scheduled'
+  )
+  const workflowStart = spans.find(
+    (span) =>
+      span.name === 'better-workflows.workflow.start' &&
+      spanAttribute(span, 'better_workflows.schedule.name') === 'observability.schedule' &&
+      spanAttribute(span, 'better_workflows.schedule.trigger') === 'scheduled'
+  )
+  expect(tick).toBeDefined()
+  expect(trigger).toBeDefined()
+  expect(workflowStart).toBeDefined()
+  const workflowRound = spans.find(
+    (span) =>
+      span.name === 'better-workflows.workflow.round' &&
+      spanAttribute(span, 'better_workflows.workflow.name') === 'observability.schedule-workflow' &&
+      span.traceId === workflowStart?.traceId
+  )
+  expect(workflowRound).toBeDefined()
+  // SAFETY: the preceding assertions verify that schedule and workflow spans were exported.
+  expect(workflowStart!.parentSpanId).toBe(trigger!.spanId)
+  expect(workflowRound!.traceId).toBe(trigger!.traceId)
+  const workflowExecute = spans.find(
+    (span) =>
+      span.name.endsWith('.execute') &&
+      span.name.includes('observability.schedule-workflow') &&
+      span.traceId === workflowStart?.traceId
+  )
+  expect(workflowExecute?.parentSpanId).toBe(workflowStart!.spanId)
+  expect(workflowExecute?.traceId).toBe(trigger!.traceId)
+  const manualWorkflowStart = spans.find(
+    (span) =>
+      span.name === 'better-workflows.workflow.start' &&
+      spanAttribute(span, 'better_workflows.schedule.name') === 'observability.schedule' &&
+      spanAttribute(span, 'better_workflows.schedule.trigger') === 'manual'
+  )
+  const manualWorkflowExecute = spans.find(
+    (span) =>
+      span.name.endsWith('.execute') &&
+      span.name.includes('observability.schedule-workflow') &&
+      span.traceId === manualWorkflowStart?.traceId
+  )
+  expect(manualWorkflowStart).toBeDefined()
+  expect(manualWorkflowExecute?.parentSpanId).toBe(manualWorkflowStart!.spanId)
+  expect(spanAttribute(trigger!, 'better_workflows.schedule.name')).toBe('observability.schedule')
+  expect(spanAttribute(trigger!, 'better_workflows.schedule.trigger')).toBe('scheduled')
+  expect(exportedOtlpMetricNames(requests)).toEqual(
+    expect.arrayContaining([
+      'better_workflows.schedule.occurrence',
+      'better_workflows.schedule.started',
+      'better_workflows.schedule.lag'
+    ])
+  )
+  expect(requests.map((request) => request.body).join('\n')).not.toContain(secret)
 })
 
 test('activity spans use the persisted dispatch context without exporting payloads', async () => {

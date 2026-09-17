@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { Inject, Injectable, Optional } from '@nestjs/common'
 import type { OnApplicationBootstrap, OnModuleDestroy, OnApplicationShutdown } from '@nestjs/common'
 import { DiscoveryService } from '@nestjs/core'
-import { Cause, Effect, Exit, Option, Queue, Scope, Semaphore } from 'effect'
+import { Cause, Effect, Exit, Option, Queue, Scope, Semaphore, Tracer } from 'effect'
 import * as PgClient from '@effect/sql-pg/PgClient'
 import { SqlClient } from 'effect/unstable/sql'
 import * as Reactivity from 'effect/unstable/reactivity/Reactivity'
@@ -29,6 +29,8 @@ import type { Infrastructure } from './infrastructure'
 import { durable, promised } from './effects'
 import { retryDeferred, signalDeferred, workflowDefinition } from './wire'
 import type { AdminBackend } from '../admin-types'
+import type { ScheduleTriggerOutcome } from './schedule-store'
+import { SCHEDULE_IDEMPOTENCY_PREFIX } from './schedule'
 import { SqlAdministration } from './administration'
 import { migrationStatus, validateMigrations } from './schema-admin'
 import { Permits } from './permits'
@@ -39,6 +41,9 @@ import type { BusinessClock } from './clock'
 import { childDeferred, timerDeferred } from './wire'
 import { activityWorker } from './worker'
 import { ActivityTransport } from './activity-transport'
+import { ScheduleStore } from './schedule-store'
+import type { ScheduleRegistrationOptions } from './schedule-store'
+import { Scheduler } from './scheduler'
 import {
   logAnnotations,
   TelemetryAttributeKey,
@@ -65,6 +70,29 @@ const terminal = (row: RunRow) =>
   ['continued', 'completed', 'failed', 'cancelled'].includes(row.state)
 const safetySweepInterval = 60_000
 
+function persistedWorkflowParent(row: RunRow): Tracer.ExternalSpan | undefined {
+  if (
+    row.trace_id === undefined ||
+    row.trace_id === null ||
+    row.trace_span_id === undefined ||
+    row.trace_span_id === null ||
+    row.trace_sampled === undefined ||
+    row.trace_sampled === null
+  )
+    return undefined
+  return Tracer.externalSpan({
+    traceId: row.trace_id,
+    spanId: row.trace_span_id,
+    sampled: Number(row.trace_sampled) === 1
+  })
+}
+
+function scheduleTriggerResult(outcome: ScheduleTriggerOutcome) {
+  if (outcome.status === 'failed')
+    throw new WorkflowError(outcome.failure.code, outcome.failure.message)
+  return outcome.result
+}
+
 interface DispatcherDetails {
   staleAfterMs: number
   lastSuccessfulAt?: string
@@ -79,6 +107,8 @@ export class WorkflowsRuntime
   private infrastructure: Infrastructure | undefined
   private journal: Journal | undefined
   private activityTransport: ActivityTransport | undefined
+  private scheduleStore: ScheduleStore | undefined
+  private scheduler: Scheduler | undefined
   private notifier: ExecutionNotifier | undefined
   private telemetry: TelemetryApi | undefined
   private ready = false
@@ -94,11 +124,22 @@ export class WorkflowsRuntime
   private lastDispatchFailureAt: number | undefined
   private dispatcherRunning = false
   private dispatcherTestFailure: Error | undefined
+  private schedulerStartedAt: number | undefined
+  private lastSuccessfulSchedulerAt: number | undefined
+  private lastSchedulerFailureAt: number | undefined
+  private schedulerFailed = false
+  private schedulerRunning = false
+  private readonly scheduleOwnerId = randomUUID()
+  private readonly scheduleOwnerLeaseMs: number
+  private readonly scheduleOwnerRefreshIntervalMs: number
+  private scheduleOwnershipEnabled = false
   private readonly activityWorkerRunning: boolean[] = []
   private configuredWorkflowCount = 0
   private workflowRuntimeRegistered = false
+  private readonly workflowRuntimeKeys = new Set<string>()
   private configuredActivityWorkerCount = 0
   private notifierConnected = false
+  private schedulerEnabled = false
 
   constructor(
     @Inject(WORKFLOWS_OPTIONS) readonly options: WorkflowsOptions,
@@ -107,6 +148,8 @@ export class WorkflowsRuntime
   ) {
     validateOptions(options)
     this.registry = new Registry(options)
+    this.scheduleOwnerLeaseMs = milliseconds(options.lease?.duration ?? '30s')
+    this.scheduleOwnerRefreshIntervalMs = milliseconds(options.lease?.refreshInterval ?? '10s')
   }
 
   registerContract(workflow: WorkflowContractClass): void {
@@ -135,6 +178,52 @@ export class WorkflowsRuntime
       const notifierKey = executionNotifierKey(this.options.storage, this.options.namespace)
       this.journal = new Journal(sql, this.options.namespace, this.clock, notifierKey, telemetry)
       const journal = this.journal
+      this.scheduleStore = new ScheduleStore(journal)
+      this.scheduleOwnershipEnabled = this.registry.hasWorkflowImplementations()
+      const implementationWorkflowKeys = this.registry.implementationWorkflowKeys()
+      const scheduleRegistrationOptions: ScheduleRegistrationOptions = this.scheduleOwnershipEnabled
+        ? {
+            reconcileMissing: true,
+            implementationWorkflowKeys,
+            ownership: { ownerId: this.scheduleOwnerId, leaseMs: this.scheduleOwnerLeaseMs }
+          }
+        : { reconcileMissing: false, implementationWorkflowKeys }
+      await this.run(
+        this.scheduleStore.registerAll(
+          this.registry.schedules.values(),
+          scheduleRegistrationOptions
+        )
+      )
+      if (this.scheduleOwnershipEnabled) {
+        const self = this
+        infrastructure.runFork(
+          Effect.gen(function* () {
+            while (true) {
+              yield* Effect.sleep(self.scheduleOwnerRefreshIntervalMs)
+              if (!self.scheduleOwnershipEnabled || !self.scheduleStore) return
+              const store = self.scheduleStore
+              const scheduleNames = [...self.registry.schedules.keys()]
+              yield* Effect.exit(
+                store.renewOwnership(scheduleNames, self.scheduleOwnerId, self.scheduleOwnerLeaseMs)
+              )
+              yield* Effect.exit(store.reconcileMissing(scheduleNames))
+            }
+          })
+        )
+      }
+      const enabledSchedules = new Map(
+        [...this.registry.schedules].filter(([, schedule]) => schedule.enabled)
+      )
+      this.schedulerEnabled =
+        this.options.execution?.schedules?.enabled !== false && enabledSchedules.size > 0
+      this.scheduler = new Scheduler(
+        this.scheduleStore,
+        enabledSchedules,
+        milliseconds(this.options.lease?.duration ?? '30s'),
+        100,
+        milliseconds(this.options.pollInterval ?? '100ms') * 2,
+        milliseconds(this.options.lease?.refreshInterval ?? '10s')
+      )
       this.notifier = new ExecutionNotifier(
         notifierKey,
         (executionId) => this.run(journal.revision(executionId)),
@@ -158,6 +247,7 @@ export class WorkflowsRuntime
         (workflow) => workflow.invoke && workflow.enabled
       ).length
       this.workflowRuntimeRegistered = false
+      this.workflowRuntimeKeys.clear()
       if (this.options.execution?.workflows?.enabled !== false) {
         for (const workflow of this.registry.workflows.values()) {
           if (!workflow.invoke || !workflow.enabled) continue
@@ -178,6 +268,9 @@ export class WorkflowsRuntime
             )
           )
           this.workflowRuntimeRegistered = true
+          this.workflowRuntimeKeys.add(
+            this.registry.key(workflow.options.name, workflow.options.version)
+          )
         }
       }
       this.configuredActivityWorkerCount = 0
@@ -214,6 +307,8 @@ export class WorkflowsRuntime
       }
       this.ready = true
       this.dispatcherStartedAt = Date.now()
+      this.schedulerStartedAt = this.schedulerEnabled ? this.dispatcherStartedAt : undefined
+      this.schedulerRunning = this.schedulerEnabled
       const self = this
       this.dispatcherRunning = true
       const dispatcherFiber = infrastructure.runFork(
@@ -224,6 +319,13 @@ export class WorkflowsRuntime
               [TelemetryAttributeKey.namespace]: self.options.namespace
             })
           )
+          if (self.schedulerEnabled)
+            yield* Effect.annotateLogs(
+              Effect.logInfo('Scheduler started'),
+              logAnnotations(TelemetryLogComponent.scheduler, {
+                [TelemetryAttributeKey.namespace]: self.options.namespace
+              })
+            )
           while (true) {
             yield* self.dispatch().pipe(
               Effect.catchCause((cause) => {
@@ -250,6 +352,7 @@ export class WorkflowsRuntime
       )
       dispatcherFiber.addObserver(() => {
         self.dispatcherRunning = false
+        self.schedulerRunning = false
       })
     } catch (error) {
       await infrastructure
@@ -267,10 +370,19 @@ export class WorkflowsRuntime
       this.infrastructure = undefined
       this.journal = undefined
       this.activityTransport = undefined
+      this.scheduleStore = undefined
+      this.scheduler = undefined
+      this.schedulerEnabled = false
+      this.scheduleOwnershipEnabled = false
       this.telemetry = undefined
       this.dispatcherRunning = false
+      this.schedulerRunning = false
       this.dispatcherStartedAt = undefined
       this.lastSuccessfulDispatchAt = undefined
+      this.schedulerStartedAt = undefined
+      this.lastSuccessfulSchedulerAt = undefined
+      this.lastSchedulerFailureAt = undefined
+      this.schedulerFailed = false
       this.activityWorkerRunning.length = 0
       this.notifier?.shutdown()
       this.notifier = undefined
@@ -282,17 +394,29 @@ export class WorkflowsRuntime
     if (!this.stopPromise) {
       this.stopping = true
       this.ready = false
+      this.scheduleOwnershipEnabled = false
       this.notifier?.shutdown()
       const infrastructure = this.infrastructure
+      const schedulerEnabled = this.schedulerEnabled
+      const namespace = this.options.namespace
       this.stopPromise = infrastructure
         ? infrastructure
             .runPromise(
-              Effect.annotateLogs(
-                Effect.logInfo('Runtime stopped'),
-                logAnnotations(TelemetryLogComponent.runtime, {
-                  [TelemetryAttributeKey.namespace]: this.options.namespace
-                })
-              )
+              Effect.gen(function* () {
+                if (schedulerEnabled)
+                  yield* Effect.annotateLogs(
+                    Effect.logInfo('Scheduler stopped'),
+                    logAnnotations(TelemetryLogComponent.scheduler, {
+                      [TelemetryAttributeKey.namespace]: namespace
+                    })
+                  )
+                yield* Effect.annotateLogs(
+                  Effect.logInfo('Runtime stopped'),
+                  logAnnotations(TelemetryLogComponent.runtime, {
+                    [TelemetryAttributeKey.namespace]: namespace
+                  })
+                )
+              })
             )
             .catch(() => undefined)
             .then(() => infrastructure.dispose())
@@ -348,11 +472,13 @@ export class WorkflowsRuntime
           storage: 'down',
           schema: 'down',
           dispatcher: 'down',
+          scheduler: 'down',
           notifier: 'down',
           workflows: 'down',
           workers: 'down'
         },
-        dispatcher: { staleAfterMs: this.dispatcherStalenessThreshold() }
+        dispatcher: { staleAfterMs: this.dispatcherStalenessThreshold() },
+        scheduler: { staleAfterMs: this.dispatcherStalenessThreshold() }
       }
 
     const infrastructure = this.infrastructure!
@@ -384,6 +510,16 @@ export class WorkflowsRuntime
     const stale = freshnessAt === undefined || Date.now() - freshnessAt > staleAfterMs
     const dispatcher =
       !this.dispatcherRunning || stale ? 'down' : this.dispatcherFailed ? 'degraded' : 'up'
+    const schedulerFreshnessAt = this.lastSuccessfulSchedulerAt ?? this.schedulerStartedAt
+    const schedulerStale =
+      schedulerFreshnessAt === undefined || Date.now() - schedulerFreshnessAt > staleAfterMs
+    const scheduler = !this.schedulerEnabled
+      ? 'disabled'
+      : !this.schedulerRunning || schedulerStale
+        ? 'down'
+        : this.schedulerFailed
+          ? 'degraded'
+          : 'up'
     const notifier =
       this.options.storage.driver === 'postgres'
         ? this.notifierConnected
@@ -409,6 +545,7 @@ export class WorkflowsRuntime
       storage,
       schema,
       dispatcher,
+      scheduler,
       notifier,
       workflows,
       workers
@@ -420,12 +557,18 @@ export class WorkflowsRuntime
       dispatcherDetails.lastSuccessfulAt = new Date(lastSuccessfulAt).toISOString()
     if (this.lastDispatchFailureAt !== undefined)
       dispatcherDetails.lastFailureAt = new Date(this.lastDispatchFailureAt).toISOString()
+    const schedulerDetails: DispatcherDetails = { staleAfterMs }
+    if (this.lastSuccessfulSchedulerAt !== undefined)
+      schedulerDetails.lastSuccessfulAt = new Date(this.lastSuccessfulSchedulerAt).toISOString()
+    if (this.lastSchedulerFailureAt !== undefined)
+      schedulerDetails.lastFailureAt = new Date(this.lastSchedulerFailureAt).toISOString()
     return {
       status: hardFailure ? 'down' : degraded ? 'degraded' : 'up',
       ready: !hardFailure,
       checkedAt,
       checks,
-      dispatcher: dispatcherDetails
+      dispatcher: dispatcherDetails,
+      scheduler: schedulerDetails
     }
   }
 
@@ -555,6 +698,11 @@ export class WorkflowsRuntime
               try: () => {
                 const value = keyOverride ?? entry.options.idempotencyKey?.(parsed) ?? randomUUID()
                 identifier(value, 'Idempotency key')
+                if (value.startsWith(SCHEDULE_IDEMPOTENCY_PREFIX))
+                  throw new WorkflowError(
+                    'RESERVED_IDEMPOTENCY_KEY',
+                    'Idempotency keys in the schedule namespace are reserved for schedule triggers'
+                  )
                 return value
               },
               catch: toFailure
@@ -799,6 +947,32 @@ export class WorkflowsRuntime
       migrationStatus: () => this.run(migrationStatus(this.store().sql)),
       validateMigrations: () => this.run(validateMigrations(this.store().sql)),
       stats: () => this.run(new SqlAdministration(this.store()).stats()),
+      listSchedules: (settings) =>
+        this.run(new ScheduleStore(this.store()).listSnapshots(settings)),
+      listScheduleOccurrences: (name, settings) =>
+        this.run(new ScheduleStore(this.store()).listOccurrenceSnapshots(name, settings)),
+      getSchedule: (name) => this.run(new ScheduleStore(this.store()).getSnapshot(name)),
+      pauseSchedule: (name) => this.run(new ScheduleStore(this.store()).pauseSnapshot(name)),
+      resumeSchedule: (name) => this.run(new ScheduleStore(this.store()).resumeSnapshot(name)),
+      removeSchedule: (name, settings) =>
+        this.run(new ScheduleStore(this.store()).remove(name, settings)),
+      triggerSchedule: async (name, settings) => {
+        const schedule = this.registry.schedules.get(name)
+        return scheduleTriggerResult(
+          await this.run(new ScheduleStore(this.store()).trigger(name, schedule, settings))
+        )
+      },
+      updateScheduleDefinition: () =>
+        Promise.reject(
+          new WorkflowError(
+            'SCHEDULE_RUNTIME_RESTART_REQUIRED',
+            'Reconcile schedules with createWorkflowsAdmin, then restart the owning runtime'
+          )
+        ),
+      previewScheduleRetention: (options) =>
+        this.run(new SqlAdministration(this.store()).previewScheduleRetention(options)),
+      pruneScheduleRetention: (plan, confirm) =>
+        this.run(new SqlAdministration(this.store()).pruneScheduleRetention(plan, confirm)),
       migrate: () =>
         Promise.reject(
           new WorkflowError(
@@ -839,6 +1013,7 @@ export class WorkflowsRuntime
 
   async testingSnapshot(): Promise<{ revision: string; nextDeadline: number | null }> {
     const store = this.store()
+    const self = this
     const snapshot = await this.run(
       Effect.gen(function* () {
         const rows = yield* store.sql<{
@@ -854,8 +1029,33 @@ export class WorkflowsRuntime
         SELECT t.deadline FROM better_workflows_timers t JOIN better_workflows_runs r ON r.execution_id=t.execution_id WHERE r.namespace=${store.namespace} AND t.delivered=0 AND r.control<>'cancel' AND r.state NOT IN ('continued','completed','failed','cancelled')
         UNION ALL SELECT t.deadline FROM better_workflows_retries t JOIN better_workflows_runs r ON r.execution_id=t.execution_id WHERE r.namespace=${store.namespace} AND t.delivered=0 AND r.control<>'cancel' AND r.state NOT IN ('continued','completed','failed','cancelled')
         UNION ALL SELECT t.deadline FROM better_workflows_waits t JOIN better_workflows_runs r ON r.execution_id=t.execution_id WHERE r.namespace=${store.namespace} AND t.state='pending' AND r.control<>'cancel' AND r.state NOT IN ('continued','completed','failed','cancelled')
-      ) deadlines`
-        return { revision: JSON.stringify(rows), nextDeadline: timer?.deadline ?? null }
+       ) deadlines`
+        const [scheduleState] = yield* store.sql<{
+          revision: number | string | null
+        }>`SELECT COALESCE(SUM(revision), 0) AS revision
+          FROM better_workflows_schedules WHERE namespace=${store.namespace}`
+        let scheduleDeadline: number | null = null
+        if (self.schedulerEnabled && self.scheduler) {
+          const scheduleFilter = store.sql.in('schedule_name', [...self.scheduler.schedules.keys()])
+          const [schedule] = yield* store.sql<{
+            deadline: number | null
+          }>`SELECT MIN(next_occurrence_at) AS deadline
+            FROM better_workflows_schedules
+            WHERE namespace=${store.namespace} AND state='active' AND ${scheduleFilter}`
+          scheduleDeadline = schedule?.deadline ?? null
+        }
+        const deadlines = [timer?.deadline ?? null, scheduleDeadline].filter(
+          (value): value is number => value !== null
+        )
+        return {
+          // Include schedule revisions so a bounded scheduler pass over a large
+          // catalog cannot look idle while only the first batch was materialized.
+          revision: JSON.stringify({
+            runs: rows,
+            schedules: scheduleState?.revision ?? 0
+          }),
+          nextDeadline: deadlines.length ? Math.min(...deadlines) : null
+        }
       })
     )
     if (this.lastDispatchError)
@@ -873,6 +1073,40 @@ export class WorkflowsRuntime
         return yield* Effect.fail(failure)
       }
       const journal = self.store()
+      if (self.schedulerEnabled && self.scheduler)
+        yield* self.scheduler.pass().pipe(
+          Effect.tap(() =>
+            Effect.gen(function* () {
+              const recovered = yield* Effect.sync(() => {
+                const wasFailed = self.schedulerFailed
+                self.lastSuccessfulSchedulerAt = Date.now()
+                self.schedulerFailed = false
+                return wasFailed
+              })
+              if (recovered)
+                yield* Effect.annotateLogs(
+                  Effect.logWarning('Scheduler loop recovered'),
+                  logAnnotations(TelemetryLogComponent.scheduler, {
+                    [TelemetryAttributeKey.namespace]: self.options.namespace
+                  })
+                )
+            })
+          ),
+          Effect.tapError(() =>
+            Effect.sync(() => {
+              self.lastSchedulerFailureAt = Date.now()
+              self.schedulerFailed = true
+            })
+          ),
+          // A bad schedule must not stop unrelated workflow timers, retries or
+          // continuation delivery in this dispatcher process.
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause) ? Effect.failCause(cause) : Effect.succeed(undefined)
+          )
+        )
+      // Scheduler-only and client-only deployments must not consume workflow
+      // timers, retries, waits or child completions owned by an orchestrator.
+      if (!self.workflowRuntimeRegistered) return
       const advanced = new AdvancedJournal(journal)
       yield* advanced.closeChildren()
       for (const timer of yield* advanced.dueTimers()) {
@@ -958,7 +1192,19 @@ export class WorkflowsRuntime
         })
         yield* advanced.childDelivered(child)
       }
-      for (const row of yield* journal.pendingDispatch()) {
+      // Only a process that registered the workflow engine may dispatch its runs.
+      // Scheduler-only and client-only processes leave these rows for an orchestrator.
+      const localWorkflows = [...self.registry.workflows.values()]
+        .filter((workflow) =>
+          self.workflowRuntimeKeys.has(
+            self.registry.key(workflow.options.name, workflow.options.version)
+          )
+        )
+        .map((workflow) => ({
+          name: workflow.options.name,
+          version: workflow.options.version
+        }))
+      for (const row of yield* journal.pendingDispatch(localWorkflows)) {
         const definition = workflowDefinition(
           self.options.namespace,
           row.workflow_name,
@@ -983,12 +1229,15 @@ export class WorkflowsRuntime
           )
           continue
         }
-        if (!row.dispatched)
-          yield* definition.execute(
+        if (!row.dispatched) {
+          const execution = definition.execute(
             { key: row.dedupe_key, input: row.input_json },
             { discard: true }
           )
-        else if (row.control_revision > row.applied_revision)
+          const parent = persistedWorkflowParent(row)
+          if (parent) yield* Effect.withParentSpan(execution, parent)
+          else yield* execution
+        } else if (row.control_revision > row.applied_revision)
           yield* definition.resume(row.execution_id)
         yield* journal.dispatched(row)
       }

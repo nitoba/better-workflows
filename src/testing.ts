@@ -164,7 +164,7 @@ export class WorkflowsTestHarness {
     while (Date.now() <= deadline) {
       await this.runtime.flush()
       const snapshot = await this.runtime.testingSnapshot()
-      const signature = `${snapshot.revision}/${this.clock.nextDeadline()}`
+      const signature = `${snapshot.revision}/${snapshot.nextDeadline}/${this.clock.nextDeadline()}`
       stable = signature === previous ? stable + 1 : 0
       if (stable >= 5) return
       previous = signature
@@ -174,6 +174,16 @@ export class WorkflowsTestHarness {
       'TEST_NOT_IDLE',
       'The workflow system did not become idle before the real-time safety deadline'
     )
+  }
+
+  /**
+   * Flush one or more scheduler, workflow and activity transitions to quiescence.
+   * Schedule deadlines use the same virtual business clock as durable timers, so no
+   * real-time wait is required.
+   * @returns Resolves after the runtime and schedule dispatcher are observed stable.
+   */
+  async flush(): Promise<void> {
+    await this.runUntilIdle()
   }
 
   /**

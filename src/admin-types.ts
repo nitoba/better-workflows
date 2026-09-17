@@ -1,4 +1,15 @@
-import type { WorkflowsOptions, QueueOptions } from './types'
+import type {
+  WorkflowsOptions,
+  QueueOptions,
+  ScheduleOccurrence,
+  ScheduleOccurrenceSnapshot,
+  ScheduleOccurrenceStatus,
+  ScheduleMisfirePolicy,
+  ScheduleOverlapPolicy,
+  ScheduleSnapshot,
+  ScheduleStatus,
+  JsonValue
+} from './types'
 
 /**
  * Connection settings for createWorkflowsAdmin. Schema inspection concerns the shared
@@ -185,6 +196,148 @@ export interface DeadlineStats {
   readonly oldestLagMs: number
 }
 
+/** Bounded schedule-definition listing options. */
+export interface ScheduleListOptions {
+  /** Restrict the result to one persisted schedule state. */
+  readonly status?: ScheduleStatus
+  /** Return names after this stable schedule name. */
+  readonly cursor?: string
+  /** Maximum records to return, from 1 through 1000. @defaultValue 1000 */
+  readonly limit?: number
+}
+
+/** Bounded occurrence-history listing options for one schedule. */
+export interface ScheduleOccurrenceListOptions {
+  /** Restrict results to one materialization outcome. */
+  readonly state?: ScheduleOccurrenceStatus
+  /** Exclusive occurrence sequence cursor from the previous page. */
+  readonly after?: number
+  /** Maximum records to return, from 1 through 1000. @defaultValue 100 */
+  readonly limit?: number
+}
+
+/** One bounded page of schedule occurrence metadata. */
+export interface ScheduleOccurrencePage {
+  /** Occurrences in ascending sequence order; inputs are intentionally omitted. */
+  readonly occurrences: readonly ScheduleOccurrenceSnapshot[]
+  /** Exclusive cursor for the next page, when more records exist. */
+  readonly nextCursor?: number
+}
+
+/** Bounded preview options for explicitly pruning old schedule occurrence metadata. */
+export interface ScheduleRetentionOptions {
+  /** UTC cutoff; occurrences created strictly before it may be selected. */
+  readonly before: string
+  /** Restrict pruning to one schedule name. */
+  readonly schedule?: string
+  /** Maximum occurrences inspected, from 1 through 1000. @defaultValue 100 */
+  readonly limit?: number
+}
+
+/** One schedule occurrence selected by a retention preview. */
+export interface ScheduleRetentionCandidate {
+  /** Schedule identity within the administered namespace. */
+  readonly scheduleName: string
+  /** Persisted occurrence timestamp in UTC ISO form. */
+  readonly scheduledAt: string
+  /** Stable occurrence sequence used to detect a changed preview. */
+  readonly sequence: number
+  /** Materialization outcome retained by the occurrence row. */
+  readonly state: ScheduleOccurrenceStatus
+  /** Storage creation timestamp used to detect a changed preview. */
+  readonly createdAt: number
+}
+
+/** Read-only schedule-retention preview requiring explicit confirmation to apply. */
+export interface ScheduleRetentionPlan {
+  /** Namespace that created the plan. */
+  readonly namespace: string
+  /** Normalized UTC cutoff used by preview and prune. */
+  readonly before: string
+  /** Occurrences eligible for deletion after safety checks. */
+  readonly candidates: readonly ScheduleRetentionCandidate[]
+  /** Integrity checksum of the preview. */
+  readonly token: string
+}
+
+/** Result of explicitly pruning schedule occurrence metadata. */
+export interface ScheduleRetentionResult {
+  /** Number of occurrence rows deleted. */
+  readonly deleted: number
+  /** Identities of rows deleted from occurrence history. */
+  readonly occurrences: readonly Pick<ScheduleRetentionCandidate, 'scheduleName' | 'scheduledAt'>[]
+}
+
+/** Optional stable identity for an operator-initiated schedule trigger. */
+export interface ScheduleTriggerOptions {
+  /** Repeating this key returns the original manual trigger instead of creating another one. */
+  readonly idempotencyKey?: string
+}
+
+/** Result of one manual schedule trigger. */
+export interface ScheduleTriggerResult {
+  /** Occurrence recorded independently from the normal schedule cursor. */
+  readonly occurrence: ScheduleOccurrence
+  /** Accepted workflow execution identifier. */
+  readonly executionId: string
+  /** False when an idempotency key returned an already accepted trigger. */
+  readonly created: boolean
+}
+
+/** Static schedule definition supplied to an explicit definition reconciliation. */
+export interface ScheduleDefinitionUpdate {
+  /** Workflow contract identity used by future occurrences. */
+  readonly workflow: string
+  /** Workflow contract version used by future occurrences. */
+  readonly workflowVersion: number
+  /** Recurrence kind. */
+  readonly type: 'cron' | 'interval'
+  /** Cron expression; required for cron definitions. */
+  readonly expression?: string
+  /** IANA timezone for cron definitions. */
+  readonly timezone?: string
+  /** Positive interval in milliseconds; required for interval definitions. */
+  readonly intervalMs?: number
+  /** Misfire policy for the reconciled definition. */
+  readonly misfire: ScheduleMisfirePolicy
+  /** Overlap policy for the reconciled definition. */
+  readonly overlap: ScheduleOverlapPolicy
+  /** Maximum catch-up batch. */
+  readonly maxCatchUp: number
+  /** Static input retained for standalone/manual administration. */
+  readonly input?: JsonValue
+  /** Use the application resolver instead of persisted static input. */
+  readonly inputMode?: 'none' | 'static' | 'resolver'
+}
+
+/** Explicit confirmation for changing a persisted schedule timeline. */
+export interface ScheduleDefinitionUpdateOptions {
+  /** Only `now` is supported in this first reconciliation flow. */
+  readonly from: 'now'
+  /** Required acknowledgement that the recurring cursor will be reset from now. */
+  readonly confirm: true
+  /** Replacement definition from the deployment being reconciled. */
+  readonly definition: ScheduleDefinitionUpdate
+}
+
+/** Explicit confirmation required before removing a persisted schedule definition. */
+export interface ScheduleRemoveOptions {
+  /** Acknowledges that the definition is removed while its occurrence history remains. */
+  readonly confirm: true
+}
+
+/** Namespace-wide schedule backlog counts. */
+export interface ScheduleStats {
+  /** Persisted schedules currently generating occurrences. */
+  readonly active: number
+  /** Persisted schedules paused by an operator. */
+  readonly paused: number
+  /** Active schedules whose next occurrence is due. */
+  readonly overdue: number
+  /** Oldest active schedule lag, or zero when none are overdue. */
+  readonly oldestLagMs: number
+}
+
 /** Read-only operational snapshot of the durable namespace; payloads are excluded. */
 export interface WorkflowsStats {
   /** Database time at which this global snapshot was generated. */
@@ -197,6 +350,8 @@ export interface WorkflowsStats {
   readonly deadLetters: DeadLetterStats
   /** Overdue timer and retry backlog. */
   readonly deadlines: DeadlineStats
+  /** Aggregate schedule state; definitions are returned by listSchedules. */
+  readonly schedules: ScheduleStats
 }
 
 /** Operational state of one persisted activity delivery dead letter. */
@@ -273,8 +428,27 @@ export interface AdminBackend {
   migrate(): Promise<MigrationStatus>
   validateMigrations(): Promise<MigrationStatus>
   stats(): Promise<WorkflowsStats>
+  listSchedules(options?: ScheduleListOptions): Promise<readonly ScheduleSnapshot[]>
+  listScheduleOccurrences(
+    name: string,
+    options?: ScheduleOccurrenceListOptions
+  ): Promise<ScheduleOccurrencePage>
+  getSchedule(name: string): Promise<ScheduleSnapshot>
+  pauseSchedule(name: string): Promise<ScheduleSnapshot>
+  resumeSchedule(name: string): Promise<ScheduleSnapshot>
+  triggerSchedule(name: string, options?: ScheduleTriggerOptions): Promise<ScheduleTriggerResult>
+  removeSchedule(name: string, options: ScheduleRemoveOptions): Promise<void>
+  updateScheduleDefinition(
+    name: string,
+    options: ScheduleDefinitionUpdateOptions
+  ): Promise<ScheduleSnapshot>
   previewRetention(options: RetentionOptions): Promise<RetentionPlan>
   pruneRetention(plan: RetentionPlan, confirm: boolean): Promise<RetentionResult>
+  previewScheduleRetention(options: ScheduleRetentionOptions): Promise<ScheduleRetentionPlan>
+  pruneScheduleRetention(
+    plan: ScheduleRetentionPlan,
+    confirm: boolean
+  ): Promise<ScheduleRetentionResult>
   setQueueLimits(
     queue: string,
     options: Pick<QueueOptions, 'globalConcurrency' | 'perKeyConcurrency'>

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.0-alpha.8
+
+- Added durable cron and interval scheduling with persisted cursors, misfire/overlap policies and distributed claims.
+- Added durable manual schedule triggers, collision-safe occurrence identity, bounded occurrence retention and forward-only schedule migrations.
+- Cron schedules without a timezone now use deterministic UTC semantics; persistent ownership leases reconcile completely removed implementations without breaking partial deployments.
+- Added schedule occurrence metrics, lag histograms, trigger/tick tracing, structured scheduler logs and scheduler-specific readiness.
+- Added administrative/CLI schedule operations, virtual-time testing support, crash/concurrency hardening, DST/timezone coverage and package smoke compatibility.
+
 ## 0.1.0-alpha.7
 
 - Added production observability with stable workflow/activity metrics, short-lived distributed tracing, structured logs and bounded OTLP export.

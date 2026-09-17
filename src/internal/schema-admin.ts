@@ -5,7 +5,7 @@ import { PersistedQueue } from 'effect/unstable/persistence'
 import type { Failure } from '../errors'
 import type { MigrationStatus } from '../admin-types'
 import { Journal } from './journal'
-import { ENGINE_VERSION } from './migrations'
+import { ENGINE_VERSION, JOURNAL_VERSION } from './migrations'
 
 const required = {
   better_workflows_schema: ['version'],
@@ -22,7 +22,10 @@ const required = {
     'chain_id',
     'generation',
     'continued_from',
-    'continued_to'
+    'continued_to',
+    'trace_id',
+    'trace_span_id',
+    'trace_sampled'
   ],
   better_workflows_commands: [
     'execution_id',
@@ -95,6 +98,56 @@ const required = {
     'dedupe_key',
     'input_hash'
   ],
+  better_workflows_schedules: [
+    'namespace',
+    'schedule_name',
+    'workflow_name',
+    'workflow_version',
+    'kind',
+    'expression',
+    'timezone',
+    'interval_ms',
+    'definition_hash',
+    'state',
+    'last_occurrence_at',
+    'next_occurrence_at',
+    'last_execution_id',
+    'revision',
+    'claim_owner',
+    'claim_until',
+    'paused_at',
+    'created_at',
+    'updated_at'
+  ],
+  better_workflows_schedule_occurrences: [
+    'namespace',
+    'schedule_name',
+    'scheduled_at',
+    'sequence',
+    'trigger_type',
+    'state',
+    'execution_id',
+    'reason_code',
+    'created_at'
+  ],
+  better_workflows_schedule_inputs: ['namespace', 'schedule_name', 'input_json'],
+  better_workflows_schedule_manual_keys: [
+    'namespace',
+    'schedule_name',
+    'idempotency_key',
+    'scheduled_at',
+    'sequence',
+    'execution_id',
+    'created_at'
+  ],
+  better_workflows_schedule_owners: [
+    'namespace',
+    'schedule_name',
+    'owner_id',
+    'lease_until',
+    'created_at',
+    'updated_at'
+  ],
   cluster_messages: ['id', 'entity_type', 'entity_id', 'processed'],
   cluster_replies: ['id', 'request_id'],
   cluster_runners: ['machine_id', 'address'],
@@ -127,7 +180,7 @@ export function migrationStatus(sql: SqlClient.SqlClient) {
     const cluster = yield* applied('cluster_migrations', 'migration_id')
     const queue = yield* applied('better_workflows_queue_migrations', 'migration_id')
     for (const [name, versions, expected] of [
-      ['journal', journal, 6],
+      ['journal', journal, JOURNAL_VERSION],
       ['cluster', cluster, 3],
       ['queue', queue, 2]
     ] as const) {
@@ -156,12 +209,15 @@ export function migrationStatus(sql: SqlClient.SqlClient) {
       Array.from({ length: count }, (_, i) => i + 1).filter((value) => !values.includes(value))
     const status: MigrationStatus = {
       engine: ENGINE_VERSION,
-      journal: { applied: journal, pending: pending(journal, 6) },
+      journal: { applied: journal, pending: pending(journal, JOURNAL_VERSION) },
       cluster: { applied: cluster, pending: pending(cluster, 3) },
       queue: { applied: queue, pending: pending(queue, 2) },
       missing,
       valid:
-        journal.length === 6 && cluster.length === 3 && queue.length === 2 && missing.length === 0
+        journal.length === JOURNAL_VERSION &&
+        cluster.length === 3 &&
+        queue.length === 2 &&
+        missing.length === 0
     }
     return status
   })
@@ -201,6 +257,11 @@ export function migrateAll(namespace: string) {
             (entry) =>
               v1Tables.has(entry.split('.')[0]!) &&
               entry !== 'better_workflows_waits.wake_requested' &&
+              ![
+                'better_workflows_runs.trace_id',
+                'better_workflows_runs.trace_span_id',
+                'better_workflows_runs.trace_sampled'
+              ].includes(entry) &&
               !['better_workflows_commands.scope', 'better_workflows_commands.protocol'].includes(
                 entry
               )
@@ -233,6 +294,37 @@ export function migrateAll(namespace: string) {
                 before.journal.applied.length === 5 &&
                 (entry.startsWith('better_workflows_activity_deliveries') ||
                   entry.startsWith('better_workflows_dead_letters'))
+              ) &&
+              !(
+                before.journal.applied.length === 6 &&
+                (entry.startsWith('better_workflows_schedules') ||
+                  entry.startsWith('better_workflows_schedule_occurrences') ||
+                  entry.startsWith('better_workflows_schedule_inputs') ||
+                  entry.startsWith('better_workflows_schedule_manual_keys') ||
+                  entry.startsWith('better_workflows_schedule_owners'))
+              ) &&
+              !(
+                before.journal.applied.length === 7 &&
+                (entry.startsWith('better_workflows_schedule_inputs') ||
+                  entry.startsWith('better_workflows_schedule_manual_keys') ||
+                  entry.startsWith('better_workflows_schedule_owners'))
+              ) &&
+              !(
+                before.journal.applied.length === 8 &&
+                (entry === 'better_workflows_schedule_manual_keys.sequence' ||
+                  entry.startsWith('better_workflows_schedule_owners'))
+              ) &&
+              !(
+                before.journal.applied.length === 9 &&
+                entry.startsWith('better_workflows_schedule_owners')
+              ) &&
+              !(
+                before.journal.applied.length < 11 &&
+                [
+                  'better_workflows_runs.trace_id',
+                  'better_workflows_runs.trace_span_id',
+                  'better_workflows_runs.trace_sampled'
+                ].includes(entry)
               )
           )
         )

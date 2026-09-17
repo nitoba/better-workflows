@@ -11,6 +11,11 @@ import type {
   RetentionOptions,
   RetentionPlan,
   RetentionResult,
+  ScheduleRetentionCandidate,
+  ScheduleRetentionOptions,
+  ScheduleRetentionPlan,
+  ScheduleRetentionResult,
+  ScheduleStats,
   WorkflowExecutionStats,
   WorkflowsStats
 } from '../admin-types'
@@ -25,6 +30,7 @@ const fail = (code: string, message: string) =>
   Effect.fail<Failure>({ code, message, retryable: false })
 const hash = (value: string) => createHash('sha256').update(value).digest('hex')
 const tokenFor = (plan: Omit<RetentionPlan, 'token'>) => hash(encode(plan))
+const scheduleRetentionTokenFor = (plan: Omit<ScheduleRetentionPlan, 'token'>) => hash(encode(plan))
 const tables = [
   'commands',
   'events',
@@ -50,6 +56,7 @@ export class SqlAdministration {
     const self = this
     return Effect.gen(function* () {
       const now = yield* self.journal.databaseNow()
+      const businessNow = yield* self.journal.now()
       const executionRows = yield* self.journal.sql<{
         status: string
         count: number
@@ -175,12 +182,32 @@ export class SqlAdministration {
         overdueRetries: Number(deadlineRow?.overdue_retries ?? 0),
         oldestLagMs: Math.max(0, timerLag, retryLag)
       }
+      const [scheduleRow] = yield* self.journal.sql<{
+        active: number
+        paused: number
+        overdue: number
+        oldest_lag: number | null
+      }>`SELECT
+        COUNT(CASE WHEN state = 'active' THEN 1 END) AS active,
+        COUNT(CASE WHEN state = 'paused' THEN 1 END) AS paused,
+        COUNT(CASE WHEN state = 'active' AND next_occurrence_at <= ${businessNow} THEN 1 END) AS overdue,
+        MAX(CASE WHEN state = 'active' AND next_occurrence_at <= ${businessNow}
+          THEN ${businessNow} - next_occurrence_at ELSE 0 END) AS oldest_lag
+        FROM better_workflows_schedules
+        WHERE namespace = ${self.journal.namespace}`
+      const schedules: ScheduleStats = {
+        active: Number(scheduleRow?.active ?? 0),
+        paused: Number(scheduleRow?.paused ?? 0),
+        overdue: Number(scheduleRow?.overdue ?? 0),
+        oldestLagMs: Math.max(0, Number(scheduleRow?.oldest_lag ?? 0))
+      }
       const snapshot: WorkflowsStats = {
         generatedAt: new Date(Number(now)).toISOString(),
         executions,
         queues,
         deadLetters,
-        deadlines
+        deadlines,
+        schedules
       }
       return snapshot
     })
@@ -397,6 +424,14 @@ export class SqlAdministration {
         }
         for (const run of selected) {
           const entity = `Workflow/${workflowDefinition(self.journal.namespace, run.workflow_name, run.version)._tag}`
+          // Occurrence history outlives execution retention. Remove the dangling
+          // operational link while preserving schedule identity, outcome and sequence.
+          yield* sql`UPDATE better_workflows_schedule_occurrences
+            SET execution_id=NULL
+            WHERE namespace=${self.journal.namespace} AND execution_id=${run.execution_id}`
+          yield* sql`UPDATE better_workflows_schedules
+            SET last_execution_id=NULL
+            WHERE namespace=${self.journal.namespace} AND last_execution_id=${run.execution_id}`
           yield* sql`INSERT INTO better_workflows_tombstones(execution_id,namespace,workflow_name,version,dedupe_key,input_hash,state,pruned_at)
           VALUES (${run.execution_id},${run.namespace},${run.workflow_name},${run.version},${run.dedupe_key},${hash(run.input_json)},${run.state},${now})`
           yield* sql`DELETE FROM cluster_replies WHERE request_id IN (SELECT id FROM cluster_messages WHERE entity_id=${run.execution_id} AND entity_type IN (${entity}, 'Workflow/-/DurableClock'))`
@@ -414,6 +449,177 @@ export class SqlAdministration {
           tombstonesRetained: selected.length
         }
         return result
+      })
+    )
+  }
+
+  /** Preview bounded, explicitly removable schedule occurrence history. */
+  previewScheduleRetention(options: ScheduleRetentionOptions) {
+    const self = this
+    const limit = options.limit ?? 100
+    positiveInteger(limit, 'Schedule retention limit')
+    if (options.schedule !== undefined) identifier(options.schedule, 'Schedule name')
+    const before = Date.parse(options.before)
+    const sql = this.journal.sql
+    const scheduleFilter =
+      options.schedule === undefined
+        ? sql``
+        : sql`AND occurrences.schedule_name=${options.schedule}`
+    return Effect.gen(function* () {
+      if (!Number.isFinite(before) || limit > 1000)
+        return yield* fail(
+          'INVALID_RETENTION',
+          'Provide a valid UTC before timestamp and limit <=1000'
+        )
+      const now = yield* self.journal.databaseNow()
+      if (before > now)
+        return yield* fail('INVALID_RETENTION', 'Retention cutoff cannot be in the future')
+      const rows = yield* sql<{
+        schedule_name: string
+        scheduled_at: number
+        sequence: number
+        state: ScheduleRetentionCandidate['state']
+        created_at: number
+      }>`SELECT occurrences.schedule_name, occurrences.scheduled_at, occurrences.sequence,
+          occurrences.state, occurrences.created_at
+        FROM better_workflows_schedule_occurrences AS occurrences
+        WHERE occurrences.namespace=${self.journal.namespace}
+          AND occurrences.created_at < ${before}
+          ${scheduleFilter}
+          AND EXISTS (
+            SELECT 1 FROM better_workflows_schedule_occurrences AS newer
+            WHERE newer.namespace=occurrences.namespace
+              AND newer.schedule_name=occurrences.schedule_name
+              AND newer.sequence > occurrences.sequence
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM better_workflows_schedule_manual_keys AS manual
+            WHERE manual.namespace=occurrences.namespace
+              AND manual.schedule_name=occurrences.schedule_name
+              AND manual.sequence=occurrences.sequence
+          )
+          AND (
+            occurrences.execution_id IS NULL OR NOT EXISTS (
+              SELECT 1 FROM better_workflows_runs AS runs
+              WHERE runs.namespace=occurrences.namespace
+                AND runs.execution_id=occurrences.execution_id
+                AND runs.state NOT IN ('continued','completed','failed','cancelled')
+            )
+          )
+        ORDER BY occurrences.created_at, occurrences.schedule_name, occurrences.scheduled_at
+        LIMIT ${limit}`
+      const candidates: ScheduleRetentionCandidate[] = rows.map((row) => ({
+        scheduleName: row.schedule_name,
+        scheduledAt: new Date(Number(row.scheduled_at)).toISOString(),
+        sequence: Number(row.sequence),
+        state: row.state,
+        createdAt: Number(row.created_at)
+      }))
+      const plan = {
+        namespace: self.journal.namespace,
+        before: new Date(before).toISOString(),
+        candidates
+      }
+      return { ...plan, token: scheduleRetentionTokenFor(plan) }
+    })
+  }
+
+  /** Apply a reviewed schedule occurrence-retention plan atomically. */
+  pruneScheduleRetention(plan: ScheduleRetentionPlan, confirm: boolean) {
+    const self = this
+    const sql = this.journal.sql
+    return sql.withTransaction(
+      Effect.gen(function* () {
+        if (confirm !== true)
+          return yield* fail(
+            'CONFIRMATION_REQUIRED',
+            'Preview schedule retention first, then call prune with {confirm:true}'
+          )
+        if (
+          !plan ||
+          plan.namespace !== self.journal.namespace ||
+          !Array.isArray(plan.candidates) ||
+          plan.candidates.length > 1000
+        )
+          return yield* fail('INVALID_RETENTION_PLAN', 'Plan does not belong to this namespace')
+        const expected = scheduleRetentionTokenFor({
+          namespace: plan.namespace,
+          before: plan.before,
+          candidates: plan.candidates
+        })
+        const before = Date.parse(plan.before)
+        if (expected !== plan.token || !Number.isFinite(before))
+          return yield* fail(
+            'INVALID_RETENTION_PLAN',
+            'The schedule retention preview was modified; generate a new preview'
+          )
+        const now = yield* self.journal.databaseNow()
+        if (before > now) return yield* fail('INVALID_RETENTION_PLAN', 'Cutoff is in the future')
+        const removed: ScheduleRetentionResult['occurrences'][number][] = []
+        for (const candidate of plan.candidates) {
+          identifier(candidate.scheduleName, 'Schedule name')
+          const scheduledAt = Date.parse(candidate.scheduledAt)
+          if (!Number.isFinite(scheduledAt))
+            return yield* fail('INVALID_RETENTION_PLAN', 'Invalid occurrence timestamp')
+          // Serialize pruning with materialization and keep a higher sequence as
+          // the high-water mark for future identity allocation.
+          yield* sql`UPDATE better_workflows_schedules SET revision=revision
+            WHERE namespace=${self.journal.namespace} AND schedule_name=${candidate.scheduleName}`
+          const rows = yield* sql<{
+            scheduled_at: number
+            sequence: number
+            state: ScheduleRetentionCandidate['state']
+            created_at: number
+            execution_id: string | null
+          }>`SELECT scheduled_at, sequence, state, created_at, execution_id
+            FROM better_workflows_schedule_occurrences
+            WHERE namespace=${self.journal.namespace} AND schedule_name=${candidate.scheduleName}
+              AND scheduled_at=${scheduledAt} AND sequence=${candidate.sequence}`
+          const row = rows[0]
+          if (
+            !row ||
+            Number(row.sequence) !== candidate.sequence ||
+            row.state !== candidate.state ||
+            Number(row.created_at) !== candidate.createdAt
+          )
+            return yield* fail(
+              'RETENTION_PLAN_STALE',
+              `Schedule occurrence ${candidate.scheduleName}/${candidate.scheduledAt} changed after preview`
+            )
+          const newer = yield* sql`SELECT 1 FROM better_workflows_schedule_occurrences
+            WHERE namespace=${self.journal.namespace} AND schedule_name=${candidate.scheduleName}
+              AND sequence > ${candidate.sequence} LIMIT 1`
+          const manual = yield* sql`SELECT 1 FROM better_workflows_schedule_manual_keys
+            WHERE namespace=${self.journal.namespace} AND schedule_name=${candidate.scheduleName}
+              AND sequence=${candidate.sequence} LIMIT 1`
+          const active =
+            row.execution_id === null
+              ? []
+              : yield* sql`SELECT 1 FROM better_workflows_runs
+                WHERE namespace=${self.journal.namespace} AND execution_id=${row.execution_id}
+                  AND state NOT IN ('continued','completed','failed','cancelled') LIMIT 1`
+          if (
+            Number(row.created_at) >= before ||
+            newer.length === 0 ||
+            manual.length > 0 ||
+            active.length > 0
+          )
+            return yield* fail(
+              'RETENTION_PLAN_STALE',
+              `Schedule occurrence ${candidate.scheduleName}/${candidate.scheduledAt} is no longer eligible`
+            )
+          const deleted = yield* sql`DELETE FROM better_workflows_schedule_occurrences
+            WHERE namespace=${self.journal.namespace} AND schedule_name=${candidate.scheduleName}
+              AND scheduled_at=${scheduledAt} AND sequence=${candidate.sequence}
+            RETURNING sequence`
+          if (!deleted.length)
+            return yield* fail(
+              'RETENTION_PLAN_STALE',
+              `Schedule occurrence ${candidate.scheduleName}/${candidate.scheduledAt} disappeared`
+            )
+          removed.push({ scheduleName: candidate.scheduleName, scheduledAt: candidate.scheduledAt })
+        }
+        return { deleted: removed.length, occurrences: removed }
       })
     )
   }

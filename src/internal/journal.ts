@@ -1,7 +1,7 @@
 import { Effect, Schema } from 'effect'
 import { createHash } from 'node:crypto'
 import type { BusinessClock } from './clock'
-import { migrateAdvanced } from './migrations'
+import { JOURNAL_VERSION, migrateAdvanced } from './migrations'
 import type { SqlClient } from 'effect/unstable/sql/SqlClient'
 import type { Failure } from '../errors'
 import type { HistoryPage, JsonValue } from '../types'
@@ -41,6 +41,15 @@ export interface RunRow {
   readonly generation: number
   readonly continued_from: string | null
   readonly continued_to: string | null
+  readonly trace_id?: string | null
+  readonly trace_span_id?: string | null
+  readonly trace_sampled?: number | null
+}
+
+export interface WorkflowTraceContext {
+  readonly traceId: string
+  readonly spanId: string
+  readonly sampled: boolean
 }
 
 export interface CommandRow {
@@ -182,7 +191,7 @@ export class Journal {
         const versions = yield* sql<{
           version: number
         }>`SELECT version FROM better_workflows_schema`
-        if (versions.some((row) => row.version > 6)) {
+        if (versions.some((row) => row.version > JOURNAL_VERSION)) {
           return yield* fail(
             'SCHEMA_TOO_NEW',
             'This database was migrated by a newer better-workflows version'
@@ -398,42 +407,59 @@ export class Journal {
   }
 
   accept(executionId: string, name: string, version: number, key: string, input: string) {
-    const self = this
-    return self.sql.withTransaction(
-      Effect.gen(function* () {
-        yield* self.lockDedupe(name, key)
-        const [tombstone] = yield* self.sql<{ input_hash: string; execution_id: string }>`
-          SELECT input_hash, execution_id FROM better_workflows_tombstones
-          WHERE namespace = ${self.namespace} AND workflow_name = ${name} AND dedupe_key = ${key}`
-        if (tombstone)
-          return yield* fail(
-            tombstone.input_hash === createHash('sha256').update(input).digest('hex')
-              ? 'EXECUTION_PRUNED'
-              : 'IDEMPOTENCY_CONFLICT',
-            `Execution ${tombstone.execution_id} was pruned; its idempotency key is still reserved`
-          )
-        const now = yield* self.now()
-        const rows = yield* self.sql<RunRow>`INSERT INTO better_workflows_runs
-        (execution_id, namespace, workflow_name, version, dedupe_key, input_json, created_at, updated_at, chain_id, generation)
-        VALUES (${executionId}, ${self.namespace}, ${name}, ${version}, ${key}, ${input}, ${now}, ${now}, ${executionId}, 0)
-        ON CONFLICT(namespace, workflow_name, dedupe_key) DO NOTHING RETURNING *`
-        const created = rows.length > 0
-        const [existing] = created
-          ? rows
-          : yield* self.sql<RunRow>`SELECT * FROM better_workflows_runs
-        WHERE namespace = ${self.namespace} AND workflow_name = ${name} AND dedupe_key = ${key}`
-        if (!existing)
-          return yield* fail('STORAGE_CONFLICT', 'Could not resolve execution deduplication')
-        if (existing.input_json !== input)
-          return yield* fail(
-            'IDEMPOTENCY_CONFLICT',
-            'The idempotency key already belongs to a different payload'
-          )
-        if (created)
-          yield* self.event(existing.execution_id, 'workflow.accepted', { workflow: name, version })
-        return { row: existing, created }
-      })
+    return this.sql.withTransaction(
+      this.acceptInTransaction(executionId, name, version, key, input)
     )
+  }
+
+  /**
+   * Accept an execution while the caller owns the surrounding SQL transaction.
+   * Schedule materialization uses this boundary so occurrence history, workflow
+   * acceptance and cursor advancement commit (or roll back) together.
+   */
+  acceptInTransaction(
+    executionId: string,
+    name: string,
+    version: number,
+    key: string,
+    input: string,
+    trace?: WorkflowTraceContext
+  ) {
+    const self = this
+    return Effect.gen(function* () {
+      yield* self.lockDedupe(name, key)
+      const [tombstone] = yield* self.sql<{ input_hash: string; execution_id: string }>`
+        SELECT input_hash, execution_id FROM better_workflows_tombstones
+        WHERE namespace = ${self.namespace} AND workflow_name = ${name} AND dedupe_key = ${key}`
+      if (tombstone)
+        return yield* fail(
+          tombstone.input_hash === createHash('sha256').update(input).digest('hex')
+            ? 'EXECUTION_PRUNED'
+            : 'IDEMPOTENCY_CONFLICT',
+          `Execution ${tombstone.execution_id} was pruned; its idempotency key is still reserved`
+        )
+      const now = yield* self.now()
+      const rows = yield* self.sql<RunRow>`INSERT INTO better_workflows_runs
+       (execution_id, namespace, workflow_name, version, dedupe_key, input_json, created_at, updated_at, chain_id, generation, trace_id, trace_span_id, trace_sampled)
+       VALUES (${executionId}, ${self.namespace}, ${name}, ${version}, ${key}, ${input}, ${now}, ${now}, ${executionId}, 0,
+         ${trace?.traceId ?? null}, ${trace?.spanId ?? null}, ${trace === undefined ? null : trace.sampled ? 1 : 0})
+      ON CONFLICT(namespace, workflow_name, dedupe_key) DO NOTHING RETURNING *`
+      const created = rows.length > 0
+      const [existing] = created
+        ? rows
+        : yield* self.sql<RunRow>`SELECT * FROM better_workflows_runs
+      WHERE namespace = ${self.namespace} AND workflow_name = ${name} AND dedupe_key = ${key}`
+      if (!existing)
+        return yield* fail('STORAGE_CONFLICT', 'Could not resolve execution deduplication')
+      if (existing.input_json !== input)
+        return yield* fail(
+          'IDEMPOTENCY_CONFLICT',
+          'The idempotency key already belongs to a different payload'
+        )
+      if (created)
+        yield* self.event(existing.execution_id, 'workflow.accepted', { workflow: name, version })
+      return { row: existing, created }
+    })
   }
 
   /**
@@ -565,8 +591,15 @@ export class Journal {
     )
   }
 
-  pendingDispatch() {
+  pendingDispatch(workflows: readonly { readonly name: string; readonly version: number }[]) {
+    if (workflows.length === 0) return Effect.succeed<readonly RunRow[]>([])
+    const workflowFilter = this.sql.or(
+      workflows.map(
+        (workflow) => this.sql`(workflow_name=${workflow.name} AND version=${workflow.version})`
+      )
+    )
     return this.sql<RunRow>`SELECT * FROM better_workflows_runs WHERE namespace = ${this.namespace}
+      AND ${workflowFilter}
       AND (dispatched = 0 OR control_revision > applied_revision) AND control <> 'pause'
       AND (state NOT IN ('continued', 'completed', 'failed', 'cancelled')
         OR (state='failed' AND control='cancel' AND control_revision>applied_revision))

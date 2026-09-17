@@ -58,6 +58,20 @@ test('business retries persist distinct attempts and reuse one external idempote
   }
 })
 
+test('external starts cannot use the reserved schedule idempotency namespace', async () => {
+  const app = await testApp(RetryWorkflow)
+  try {
+    await expect(
+      app.client.start(
+        { id: 'reserved-schedule-key' },
+        { idempotencyKey: '@better-workflows/schedule/retry/2026-01-01T00:00:00.000Z' }
+      )
+    ).rejects.toMatchObject({ code: 'RESERVED_IDEMPOTENCY_KEY' })
+  } finally {
+    await app.close()
+  }
+})
+
 @Activities()
 class BusinessActivities {
   calls = 0

@@ -9,6 +9,9 @@ import {
   validateActivityDefaults,
   workflowContractClass
 } from '../decorators'
+import { registeredSchedule } from './schedule'
+import type { RegisteredSchedule, ScheduleMetadata } from './schedule'
+import { SCHEDULE_METADATA } from './schedule-metadata'
 import { WorkflowError } from '../errors'
 import { queueName, queueToken } from '../queues'
 import type { QueueReference } from '../queues'
@@ -80,6 +83,8 @@ interface OwnedQueue {
 
 export class Registry {
   readonly workflows = new Map<string, RegisteredWorkflow>()
+  /** Schedules owned by registered workflow implementations, keyed by explicit name. */
+  readonly schedules = new Map<string, RegisteredSchedule>()
   readonly activities = new Map<string, RegisteredActivity>()
   readonly providers = new Map<Type, readonly ActivityContract[]>()
   /** Normalized implementation-to-contract relationships for advanced handlers. */
@@ -91,6 +96,20 @@ export class Registry {
   private sealed = false
 
   constructor(private readonly options: WorkflowsOptions) {}
+
+  /** Whether this process registered at least one workflow implementation. */
+  hasWorkflowImplementations(): boolean {
+    return [...this.workflows.values()].some((workflow) => workflow.handler !== undefined)
+  }
+
+  /** Stable workflow identities implemented by this deployment for schedule reconciliation. */
+  implementationWorkflowKeys(): ReadonlySet<string> {
+    return new Set(
+      [...this.workflows.entries()]
+        .filter(([, workflow]) => workflow.handler !== undefined)
+        .map(([key]) => key)
+    )
+  }
 
   key(name: string, version: number): string {
     return JSON.stringify([name, version])
@@ -279,6 +298,11 @@ export class Registry {
         requireSingleton(feature.host, handlerToken(entry))
         const provider: WorkflowImplementationClass = handlerClass(entry)
         const contractProvider = workflowContractClass(provider)
+        if (contractProvider !== provider && Reflect.hasOwnMetadata(SCHEDULE_METADATA, provider))
+          throw new WorkflowError(
+            'INVALID_SCHEDULE_OWNER',
+            `${provider.name} is a workflow handler; declare its schedule on ${contractProvider.name}`
+          )
         const contract = this.contract(contractProvider)
         if (contract.handler)
           throw new WorkflowError(
@@ -303,6 +327,11 @@ export class Registry {
         contract.handler = provider
         this.handlerContracts.set(provider, contractProvider)
         contract.invoke = (input, context) => handler.call(instance, input, context)
+        this.registerSchedule(
+          contract,
+          this.options.execution?.schedules?.enabled !== false &&
+            execution?.schedules?.enabled !== false
+        )
       }
       for (const provider of structure.clients ?? []) this.contract(provider)
       const implemented = new Set((structure.activities ?? []).map(handlerClass))
@@ -376,6 +405,31 @@ export class Registry {
     }
     this.sealed = true
     for (const workflow of this.workflows.values()) Object.freeze(workflow)
+    for (const schedule of this.schedules.values()) Object.freeze(schedule)
+  }
+
+  private registerSchedule(workflow: RegisteredWorkflow, enabled: boolean): void {
+    // SAFETY: @Cron and @Interval are the only writers of this validated metadata.
+    const metadata = Reflect.getOwnMetadata(SCHEDULE_METADATA, workflow.contract) as
+      | ScheduleMetadata
+      | undefined
+    if (!metadata) return
+    const existing = this.schedules.get(metadata.name)
+    if (existing)
+      throw new WorkflowError(
+        'DUPLICATE_SCHEDULE',
+        `${metadata.name} is declared by both ${existing.workflow.name} and ${workflow.contract.name}`
+      )
+    this.schedules.set(
+      metadata.name,
+      registeredSchedule(
+        workflow.contract,
+        workflow.options,
+        metadata,
+        workflow.definition,
+        enabled
+      )
+    )
   }
 
   private importsExport(

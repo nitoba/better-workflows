@@ -51,7 +51,16 @@ export const TelemetryMetricName = {
 
   dispatcherIterationDuration: 'better_workflows.dispatcher.iteration_duration',
   dispatcherFailure: 'better_workflows.dispatcher.failure',
-  dispatcherRecovery: 'better_workflows.dispatcher.recovery'
+  dispatcherRecovery: 'better_workflows.dispatcher.recovery',
+
+  scheduleOccurrence: 'better_workflows.schedule.occurrence',
+  scheduleStarted: 'better_workflows.schedule.started',
+  scheduleSkipped: 'better_workflows.schedule.skipped',
+  scheduleMisfire: 'better_workflows.schedule.misfire',
+  scheduleCatchUp: 'better_workflows.schedule.catch_up',
+  scheduleManualTrigger: 'better_workflows.schedule.manual_trigger',
+  scheduleFailure: 'better_workflows.schedule.failure',
+  scheduleLag: 'better_workflows.schedule.lag'
 } as const
 
 export type TelemetryMetricName = (typeof TelemetryMetricName)[keyof typeof TelemetryMetricName]
@@ -81,7 +90,14 @@ export const TelemetryCounterName = {
   resultFallbackPoll: TelemetryMetricName.resultFallbackPoll,
   notifierReconnect: TelemetryMetricName.notifierReconnect,
   dispatcherFailure: TelemetryMetricName.dispatcherFailure,
-  dispatcherRecovery: TelemetryMetricName.dispatcherRecovery
+  dispatcherRecovery: TelemetryMetricName.dispatcherRecovery,
+  scheduleOccurrence: TelemetryMetricName.scheduleOccurrence,
+  scheduleStarted: TelemetryMetricName.scheduleStarted,
+  scheduleSkipped: TelemetryMetricName.scheduleSkipped,
+  scheduleMisfire: TelemetryMetricName.scheduleMisfire,
+  scheduleCatchUp: TelemetryMetricName.scheduleCatchUp,
+  scheduleManualTrigger: TelemetryMetricName.scheduleManualTrigger,
+  scheduleFailure: TelemetryMetricName.scheduleFailure
 } as const
 
 export type TelemetryCounterEvent = keyof typeof TelemetryCounterName
@@ -97,7 +113,8 @@ export const TelemetryHistogramName = {
   timerLag: TelemetryMetricName.timerLag,
   signalWaitDuration: TelemetryMetricName.signalWaitDuration,
   resultWaitDuration: TelemetryMetricName.resultWaitDuration,
-  dispatcherIterationDuration: TelemetryMetricName.dispatcherIterationDuration
+  dispatcherIterationDuration: TelemetryMetricName.dispatcherIterationDuration,
+  scheduleLag: TelemetryMetricName.scheduleLag
 } as const
 
 export type TelemetryHistogramEvent = keyof typeof TelemetryHistogramName
@@ -123,7 +140,9 @@ export const TelemetrySpanName = {
   signalAccept: 'better-workflows.signal.accept',
   signalConsume: 'better-workflows.signal.consume',
   timerDeliver: 'better-workflows.timer.deliver',
-  retryDeliver: 'better-workflows.retry.deliver'
+  retryDeliver: 'better-workflows.retry.deliver',
+  scheduleTick: 'better-workflows.schedule.tick',
+  scheduleTrigger: 'better-workflows.schedule.trigger'
 } as const
 
 export type TelemetrySpanName = (typeof TelemetrySpanName)[keyof typeof TelemetrySpanName]
@@ -151,7 +170,14 @@ export const TelemetryAttributeKey = {
   failureCode: 'better_workflows.failure.code',
   deadLetterId: 'better_workflows.dead_letter.id',
   deadLetterReason: 'better_workflows.dead_letter.reason',
-  signalName: 'better_workflows.signal.name'
+  signalName: 'better_workflows.signal.name',
+  scheduleName: 'better_workflows.schedule.name',
+  scheduleType: 'better_workflows.schedule.type',
+  scheduleTrigger: 'better_workflows.schedule.trigger',
+  scheduleMisfirePolicy: 'better_workflows.schedule.misfire_policy',
+  scheduleOverlapPolicy: 'better_workflows.schedule.overlap_policy',
+  scheduleSkipReason: 'better_workflows.schedule.skip.reason',
+  scheduleScheduledAt: 'better_workflows.schedule.scheduled_at'
 } as const
 
 export type TelemetryAttributeKey =
@@ -188,6 +214,12 @@ export type TelemetryMetricAttributeKey =
   | (typeof TelemetryAttributeKey)['executionStatus']
   | (typeof TelemetryAttributeKey)['deadLetterReason']
   | (typeof TelemetryAttributeKey)['signalName']
+  | (typeof TelemetryAttributeKey)['scheduleName']
+  | (typeof TelemetryAttributeKey)['scheduleType']
+  | (typeof TelemetryAttributeKey)['scheduleTrigger']
+  | (typeof TelemetryAttributeKey)['scheduleMisfirePolicy']
+  | (typeof TelemetryAttributeKey)['scheduleOverlapPolicy']
+  | (typeof TelemetryAttributeKey)['scheduleSkipReason']
 
 export type TelemetryMetricAttributes = Partial<Record<TelemetryMetricAttributeKey, string>>
 
@@ -199,7 +231,8 @@ export const TelemetryLogComponent = {
   activityTransport: 'activity-transport',
   notifier: 'notifier',
   deadLetter: 'dead-letter',
-  admin: 'admin'
+  admin: 'admin',
+  scheduler: 'scheduler'
 } as const
 
 export type TelemetryLogComponent =
@@ -223,11 +256,18 @@ const METRIC_ATTRIBUTE_KEYS: readonly TelemetryMetricAttributeKey[] = [
   TelemetryAttributeKey.queueName,
   TelemetryAttributeKey.executionStatus,
   TelemetryAttributeKey.deadLetterReason,
-  TelemetryAttributeKey.signalName
+  TelemetryAttributeKey.signalName,
+  TelemetryAttributeKey.scheduleName,
+  TelemetryAttributeKey.scheduleType,
+  TelemetryAttributeKey.scheduleTrigger,
+  TelemetryAttributeKey.scheduleMisfirePolicy,
+  TelemetryAttributeKey.scheduleOverlapPolicy,
+  TelemetryAttributeKey.scheduleSkipReason
 ]
 const DEAD_LETTER_REASON_CODES: ReadonlySet<string> = new Set(
   Object.values(TelemetryDeadLetterReasonCode)
 )
+const SCHEDULE_SKIP_REASONS: ReadonlySet<string> = new Set(['misfire', 'overlap'])
 
 function copyAttributes(
   attributes: TelemetryAttributes,
@@ -260,7 +300,8 @@ export function metricAttributes(
     if (
       value !== undefined &&
       (key !== TelemetryAttributeKey.deadLetterReason ||
-        DEAD_LETTER_REASON_CODES.has(String(value)))
+        DEAD_LETTER_REASON_CODES.has(String(value))) &&
+      (key !== TelemetryAttributeKey.scheduleSkipReason || SCHEDULE_SKIP_REASONS.has(String(value)))
     )
       result[key] = String(value)
   }
@@ -384,6 +425,34 @@ const COUNTERS: Record<TelemetryCounterEvent, Metric.Counter<number>> = {
   dispatcherRecovery: makeCounter(
     TelemetryMetricName.dispatcherRecovery,
     'Dispatcher recoveries after failure'
+  ),
+  scheduleOccurrence: makeCounter(
+    TelemetryMetricName.scheduleOccurrence,
+    'Durably recorded schedule occurrences'
+  ),
+  scheduleStarted: makeCounter(
+    TelemetryMetricName.scheduleStarted,
+    'Schedule occurrences that accepted workflow starts'
+  ),
+  scheduleSkipped: makeCounter(
+    TelemetryMetricName.scheduleSkipped,
+    'Schedule occurrences skipped by policy'
+  ),
+  scheduleMisfire: makeCounter(
+    TelemetryMetricName.scheduleMisfire,
+    'Schedule occurrences handled as misfires'
+  ),
+  scheduleCatchUp: makeCounter(
+    TelemetryMetricName.scheduleCatchUp,
+    'Schedule catch-up occurrences accepted'
+  ),
+  scheduleManualTrigger: makeCounter(
+    TelemetryMetricName.scheduleManualTrigger,
+    'Operator-triggered schedule occurrences'
+  ),
+  scheduleFailure: makeCounter(
+    TelemetryMetricName.scheduleFailure,
+    'Schedule materialization failures'
   )
 }
 
@@ -434,6 +503,10 @@ const HISTOGRAMS: Record<TelemetryHistogramEvent, Metric.Histogram<number>> = {
   dispatcherIterationDuration: makeHistogram(
     TelemetryMetricName.dispatcherIterationDuration,
     'Dispatcher iteration duration in milliseconds'
+  ),
+  scheduleLag: makeHistogram(
+    TelemetryMetricName.scheduleLag,
+    'Schedule occurrence materialization lag in milliseconds'
   )
 }
 

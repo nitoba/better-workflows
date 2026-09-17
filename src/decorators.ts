@@ -7,11 +7,17 @@ import type {
   SignalDefinition,
   WorkflowContractClass,
   WorkflowImplementationClass,
-  WorkflowOptions
+  WorkflowOptions,
+  CronOptions,
+  IntervalOptions
 } from './types'
 import { identifier, milliseconds, positiveInteger } from './internal/values'
 import { WorkflowError } from './errors'
 import { queueName } from './queues'
+import { normalizeCron, normalizeInterval } from './internal/schedule'
+import { SCHEDULE_METADATA } from './internal/schedule-metadata'
+
+export { SCHEDULE_METADATA } from './internal/schedule-metadata'
 
 export const WORKFLOW_METADATA = Symbol.for('better-workflows/workflow')
 export const WORKFLOW_CONTRACT_METADATA = Symbol.for('better-workflows/workflow-contract')
@@ -22,6 +28,66 @@ const CLIENT_TOKENS = new WeakMap<WorkflowContractClass, symbol>()
 
 export interface WorkflowHandlerMetadata {
   readonly contract: WorkflowContractClass
+}
+
+/**
+ * Declare a durable cron schedule for the workflow contract represented by this class.
+ * The decorator only records a definition; a later runtime phase materializes occurrences
+ * and starts the durable workflow. In advanced mode apply it to the abstract contract,
+ * not to its concrete {@link Workflow} handler.
+ * @typeParam I - Input value accepted by the workflow input schema.
+ * @param options - Stable name, cron expression, optional timezone and policies.
+ * @returns Class decorator storing independent schedule metadata.
+ * @throws WorkflowError for invalid names, expressions, timezones or policies.
+ * @example
+ * ```ts
+ * import { Cron, WorkflowContract } from 'better-workflows'
+ * import { z } from 'zod'
+ * const Input = z.object({ date: z.string() })
+ * @Cron({ name: 'reports.daily', expression: '0 8 * * *', timezone: 'UTC', input: ({ scheduledAt }) => ({ date: scheduledAt }) })
+ * @WorkflowContract({ name: 'reports.daily-report', version: 1, input: Input, output: z.void() })
+ * abstract class DailyReport { abstract run(input: z.infer<typeof Input>): Promise<void> }
+ * ```
+ */
+export function Cron<I = unknown>(options: CronOptions<I>): ClassDecorator {
+  const metadata = normalizeCron(options)
+  return (target) => {
+    if (Reflect.hasOwnMetadata(SCHEDULE_METADATA, target))
+      throw new WorkflowError(
+        'DUPLICATE_SCHEDULE',
+        `${target.name} declares more than one schedule`
+      )
+    Reflect.defineMetadata(SCHEDULE_METADATA, metadata, target)
+  }
+}
+
+/**
+ * Declare a durable interval schedule for the workflow contract represented by this class.
+ * Intervals advance from their persisted cursor rather than from workflow completion.
+ * In advanced mode apply it to the abstract contract, not to its concrete handler.
+ * @typeParam I - Input value accepted by the workflow input schema.
+ * @param options - Stable name, positive interval and optional policies.
+ * @returns Class decorator storing independent schedule metadata.
+ * @throws WorkflowError for invalid names, durations or policies.
+ * @example
+ * ```ts
+ * import { Interval, Workflow } from 'better-workflows'
+ * import { z } from 'zod'
+ * @Interval({ name: 'catalog.sync', every: '15m', input: { kind: 'catalog' } })
+ * @Workflow({ name: 'catalog.sync', version: 1, input: z.object({ kind: z.string() }), output: z.void() })
+ * class SyncCatalog { async run(input: { kind: string }): Promise<void> { void input } }
+ * ```
+ */
+export function Interval<I = unknown>(options: IntervalOptions<I>): ClassDecorator {
+  const metadata = normalizeInterval(options)
+  return (target) => {
+    if (Reflect.hasOwnMetadata(SCHEDULE_METADATA, target))
+      throw new WorkflowError(
+        'DUPLICATE_SCHEDULE',
+        `${target.name} declares more than one schedule`
+      )
+    Reflect.defineMetadata(SCHEDULE_METADATA, metadata, target)
+  }
 }
 
 function validateWorkflowOptions(options: WorkflowOptions<any, any>): void {
