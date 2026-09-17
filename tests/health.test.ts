@@ -4,7 +4,10 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { Test } from '@nestjs/testing'
 import { WorkflowsHealth, WorkflowsModule } from '../src'
+import { postgres } from '../src/postgres'
 import { sqlite } from '../src/sqlite'
+import { WorkflowsRuntime } from '../src/internal/runtime'
+import { eventually } from './helpers'
 
 test('WorkflowsHealth exposes liveness and readiness without an HTTP controller', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'better-workflows-health-'))
@@ -54,3 +57,87 @@ test('WorkflowsHealth exposes liveness and readiness without an HTTP controller'
     await rm(directory, { recursive: true, force: true })
   }
 })
+
+test('readiness distinguishes storage failure and dispatcher recovery', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'better-workflows-health-failure-'))
+  const app = await Test.createTestingModule({
+    imports: [
+      WorkflowsModule.forRoot({
+        namespace: 'health-failure',
+        storage: sqlite({ filename: join(directory, 'workflows.sqlite') }),
+        pollInterval: '20ms',
+        lease: { duration: '1500ms', refreshInterval: '400ms' }
+      })
+    ]
+  }).compile()
+  const health = app.get(WorkflowsHealth)
+  const runtime = app.get(WorkflowsRuntime)
+
+  try {
+    await app.init()
+    runtime.testingFailNextDispatcherIteration('transient dispatcher failure')
+
+    await eventually(
+      () => health.readiness(),
+      (readiness) => readiness.checks.dispatcher === 'degraded'
+    )
+    await eventually(
+      () => health.readiness(),
+      (readiness) => readiness.checks.dispatcher === 'up'
+    )
+
+    await runtime.testingDisposeInfrastructure()
+    await expect(health.readiness()).resolves.toMatchObject({
+      status: 'down',
+      ready: false,
+      checks: { storage: 'down', schema: 'down' }
+    })
+  } finally {
+    await app.close()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+const postgresConnectionString = process.env['WORKFLOWS_TEST_POSTGRES_URL']
+
+test.skipIf(!postgresConnectionString)(
+  'a disconnected PostgreSQL notifier is degraded and reconnect recovery restores readiness',
+  async () => {
+    if (!postgresConnectionString) return
+    const app = await Test.createTestingModule({
+      imports: [
+        WorkflowsModule.forRoot({
+          namespace: `health-postgres-${process.pid}`,
+          storage: postgres({ connectionString: postgresConnectionString }),
+          topology: 'distributed',
+          execution: { workflows: { enabled: false }, activities: { enabled: false } },
+          pollInterval: '20ms',
+          lease: { duration: '1500ms', refreshInterval: '400ms' }
+        })
+      ]
+    }).compile()
+    const health = app.get(WorkflowsHealth)
+    const runtime = app.get(WorkflowsRuntime)
+    try {
+      await app.init()
+      await eventually(
+        () => health.readiness(),
+        (readiness) => readiness.checks.notifier === 'up'
+      )
+      runtime.testingSetNotifierConnected(false)
+      await expect(health.readiness()).resolves.toMatchObject({
+        status: 'degraded',
+        ready: true,
+        checks: { notifier: 'degraded' }
+      })
+      runtime.testingSetNotifierConnected(true)
+      await expect(health.readiness()).resolves.toMatchObject({
+        status: 'up',
+        ready: true,
+        checks: { notifier: 'up' }
+      })
+    } finally {
+      await app.close()
+    }
+  }
+)

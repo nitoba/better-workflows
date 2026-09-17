@@ -15,22 +15,29 @@ if (process.env.DOCKER_HOST?.includes('/podman/'))
 
 const container = await new PostgreSqlContainer('postgres:16-alpine').start()
 const connectionString = container.getConnectionUri()
-const testProcess = spawn(
-  process.env.BUN_BIN ?? 'bun',
-  ['test', 'tests/dead-letter-postgres.test.ts', 'tests/observability.test.ts'],
-  {
+const bun = process.env.BUN_BIN ?? 'bun'
+const environment = { ...process.env, WORKFLOWS_TEST_POSTGRES_URL: connectionString }
+
+async function run(args, env = environment) {
+  const child = spawn(bun, args, {
     cwd: process.cwd(),
-    env: { ...process.env, WORKFLOWS_TEST_POSTGRES_URL: connectionString },
+    env,
     stdio: 'inherit'
-  }
-)
+  })
+  return new Promise((resolve, reject) => {
+    child.once('error', reject)
+    child.once('close', (code) => resolve(code ?? 1))
+  })
+}
 
 let exitCode = 1
 try {
-  exitCode = await new Promise((resolve, reject) => {
-    testProcess.once('error', reject)
-    testProcess.once('close', (code) => resolve(code ?? 1))
-  })
+  for (const args of [['run', 'build'], ['test'], ['run', 'test:node']]) {
+    const env = args[1] === 'test:node' ? { ...environment } : environment
+    if (args[1] === 'test:node') delete env.WORKFLOWS_TEST_POSTGRES_URL
+    exitCode = await run(args, env)
+    if (exitCode !== 0) break
+  }
 } finally {
   await container.stop()
 }

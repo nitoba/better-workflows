@@ -1,10 +1,12 @@
 import { expect, test } from 'bun:test'
+import { ManagedRuntime } from 'effect'
 import {
   ExecutionNotifier,
   executionNotificationChannel,
   executionNotificationPayload,
   publishLocalExecutionChange
 } from '../src/internal/notifier'
+import { TelemetryService, telemetryLayer, TelemetryMetricName } from '../src/internal/telemetry'
 
 const sleep = (duration: number) => new Promise((resolve) => setTimeout(resolve, duration))
 
@@ -68,4 +70,25 @@ test('shutdown rejects outstanding waits and malformed PostgreSQL notifications 
   expect(executionNotificationPayload('{"executionId":"x","revision":-1}')).toBeUndefined()
   expect(executionNotificationPayload('not-json')).toBeUndefined()
   expect(executionNotificationChannel('namespace')).toHaveLength(59)
+})
+
+test('notifier reconnects are recorded without exposing waiter identities', async () => {
+  const runtime = ManagedRuntime.make(telemetryLayer)
+  const notifier = new ExecutionNotifier(
+    `notifier-${crypto.randomUUID()}`,
+    async () => 1,
+    1_000,
+    await runtime.runPromise(TelemetryService)
+  )
+  try {
+    notifier.reconnected()
+    const metric = (await runtime.runPromise(TelemetryService))
+      .snapshot()
+      .find((snapshot) => snapshot.id === TelemetryMetricName.notifierReconnect)
+    expect(metric?.type).toBe('Counter')
+    if (metric?.type === 'Counter') expect(metric.state.count).toBe(1)
+  } finally {
+    notifier.shutdown()
+    await runtime.dispose()
+  }
 })

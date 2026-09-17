@@ -936,9 +936,8 @@ export class ActivityTransport {
           resolved = yield* self.journal.sql<{
             id: string
           }>`UPDATE better_workflows_dead_letters SET state='resolved', updated_at=${now}
-            WHERE namespace=${self.journal.namespace} AND id=${delivery.deadLetterId} AND state='requeued'`.pipe(
-            Effect.map((updated) => updated.length > 0)
-          )
+            WHERE namespace=${self.journal.namespace} AND id=${delivery.deadLetterId} AND state='requeued'
+            RETURNING id`.pipe(Effect.map((updated) => updated.length > 0))
         if (rows.length && delivery.deadLetterId) {
           if (metadata.executionId) {
             const remaining = yield* self.journal.sql`SELECT id FROM better_workflows_dead_letters

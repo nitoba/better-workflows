@@ -113,6 +113,14 @@ interface OtlpTracePayload {
   }>
 }
 
+interface OtlpMetricPayload {
+  readonly resourceMetrics?: ReadonlyArray<{
+    readonly scopeMetrics?: ReadonlyArray<{
+      readonly metrics?: ReadonlyArray<{ readonly name: string }>
+    }>
+  }>
+}
+
 async function collectOtlpRequests(
   run: (endpoint: string) => Promise<void>
 ): Promise<ReadonlyArray<{ readonly url: string; readonly body: string }>> {
@@ -155,6 +163,25 @@ function exportedOtlpSpans(
       return (
         payload.resourceSpans?.flatMap(
           (resource) => resource.scopeSpans?.flatMap((scope) => scope.spans ?? []) ?? []
+        ) ?? []
+      )
+    })
+}
+
+function exportedOtlpMetricNames(
+  requests: ReadonlyArray<{ readonly url: string; readonly body: string }>
+): ReadonlyArray<string> {
+  return requests
+    .filter((request) => request.url === '/v1/metrics')
+    .flatMap((request) => {
+      // SAFETY: this test server only records JSON OTLP metric responses from the exporter.
+      const payload = JSON.parse(request.body) as OtlpMetricPayload
+      return (
+        payload.resourceMetrics?.flatMap(
+          (resource) =>
+            resource.scopeMetrics?.flatMap(
+              (scope) => scope.metrics?.map((metric) => metric.name) ?? []
+            ) ?? []
         ) ?? []
       )
     })
@@ -332,6 +359,73 @@ test('collector failures are isolated from the managed runtime', async () => {
   }
 })
 
+test('an unavailable collector does not interrupt a complete workflow', async () => {
+  const secret = 'SUPER_SECRET_TEST_VALUE'
+  const app = await testApp(OtlpTraceWorkflow, {
+    providers: [OtlpTraceActivity],
+    queues: [{ queue: TraceQueue, concurrency: 1 }],
+    observability: otlp({
+      serviceName: 'offline-workflow-test',
+      endpoint: 'http://127.0.0.1:1',
+      traces: { exportInterval: '1ms' },
+      metrics: false,
+      logs: false,
+      shutdownTimeout: '50ms'
+    })
+  })
+  try {
+    const handle = await app.client.start(secret)
+    await expect(handle.result({ timeout: '5s' })).resolves.toBe(secret)
+    await expect(handle.describe()).resolves.toMatchObject({ status: 'completed' })
+  } finally {
+    await app.close()
+  }
+})
+
+test('collector shutdown is bounded when an OTLP endpoint never responds', async () => {
+  const requests: string[] = []
+  const server = createServer((request) => {
+    requests.push(request.url ?? '')
+    // Deliberately keep the response open: shutdown must abort the exporter.
+  })
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', resolve)
+  })
+
+  // SAFETY: the server was successfully bound to an ephemeral TCP address above.
+  const port = (server.address() as AddressInfo).port
+  const runtime = ManagedRuntime.make(
+    otlpLayer({
+      namespace: 'slow-collector',
+      storage: { driver: 'sqlite', filename: ':memory:', runtime: 'auto' },
+      observability: otlp({
+        serviceName: 'slow-collector-test',
+        endpoint: `http://127.0.0.1:${port}`,
+        traces: false,
+        metrics: { enabled: true, exportInterval: '1ms' },
+        logs: false,
+        shutdownTimeout: '40ms'
+      })
+    })
+  )
+  try {
+    const telemetry = await runtime.runPromise(TelemetryService)
+    telemetry.count('workflowStarted')
+    await eventually(
+      async () => requests.length,
+      (count) => count > 0,
+      2_000
+    )
+    const startedAt = Date.now()
+    await runtime.dispose()
+    expect(Date.now() - startedAt).toBeLessThan(1_000)
+  } finally {
+    await runtime.dispose().catch(() => undefined)
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
+})
+
 test('otlp metrics export the runtime registry', async () => {
   const requests: Array<{ readonly url: string; readonly body: string }> = []
   const server = createServer((request, response) => {
@@ -426,8 +520,8 @@ test('activity spans use the persisted dispatch context without exporting payloa
       serviceName: 'trace-propagation-test',
       endpoint: `http://127.0.0.1:${port}`,
       traces: { exportInterval: '5ms' },
-      metrics: false,
-      logs: false,
+      metrics: { enabled: true, exportInterval: '5ms' },
+      logs: { enabled: true, exportInterval: '5ms', level: 'debug' },
       shutdownTimeout: '1s'
     })
   })
@@ -508,7 +602,7 @@ test('dead-letter tracing correlates create, requeue and restored execution with
       serviceName: 'dead-letter-tracing-test',
       endpoint,
       traces: { exportInterval: '5ms' },
-      metrics: false,
+      metrics: { enabled: true, exportInterval: '5ms' },
       logs: false,
       shutdownTimeout: '1s'
     })
@@ -582,6 +676,10 @@ test('dead-letter tracing correlates create, requeue and restored execution with
   expect(spanAttribute(created!, 'better_workflows.dead_letter.id')).toBe(
     spanAttribute(requeued!, 'better_workflows.dead_letter.id')
   )
+  const metricNames = exportedOtlpMetricNames(requests)
+  expect(metricNames).toContain('better_workflows.dead_letter.created')
+  expect(metricNames).toContain('better_workflows.dead_letter.requeued')
+  expect(metricNames).toContain('better_workflows.dead_letter.resolved')
   expect(requests.map((request) => request.body).join('\n')).not.toContain(secret)
 })
 

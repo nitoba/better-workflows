@@ -93,6 +93,7 @@ export class WorkflowsRuntime
   private lastSuccessfulDispatchAt: number | undefined
   private lastDispatchFailureAt: number | undefined
   private dispatcherRunning = false
+  private dispatcherTestFailure: Error | undefined
   private readonly activityWorkerRunning: boolean[] = []
   private configuredWorkflowCount = 0
   private workflowRuntimeRegistered = false
@@ -311,6 +312,21 @@ export class WorkflowsRuntime
     return { ready: this.ready && !this.stopping, lastDispatchError: this.lastDispatchError }
   }
 
+  /** @internal Test-only fault injection for exercising dispatcher recovery. */
+  testingFailNextDispatcherIteration(message = 'Injected dispatcher failure'): void {
+    this.dispatcherTestFailure = new Error(message)
+  }
+
+  /** @internal Test-only notifier state control for exercising readiness transitions. */
+  testingSetNotifierConnected(connected: boolean): void {
+    this.notifierConnected = connected
+  }
+
+  /** @internal Test-only storage shutdown for exercising readiness failure. */
+  testingDisposeInfrastructure(): Promise<void> {
+    return this.infrastructure?.dispose() ?? Promise.resolve()
+  }
+
   liveness(): WorkflowsLiveness {
     const running = this.ready && !this.stopping
     return {
@@ -432,7 +448,6 @@ export class WorkflowsRuntime
   ): void {
     const self = this
     const channel = executionNotificationChannel(this.options.namespace)
-    const telemetry = this.journal?.telemetry
     this.infrastructure!.runFork(
       Effect.gen(function* () {
         let everConnected = false
@@ -444,7 +459,6 @@ export class WorkflowsRuntime
                   const client = yield* PgClient.makeClient(config)
                   const queue = yield* client.listen(channel)
                   if (everConnected) {
-                    telemetry?.count('notifierReconnect')
                     yield* Effect.annotateLogs(
                       Effect.logWarning('Notifier reconnected'),
                       logAnnotations(TelemetryLogComponent.notifier, {
@@ -458,9 +472,10 @@ export class WorkflowsRuntime
                         [TelemetryAttributeKey.namespace]: self.options.namespace
                       })
                     )
+                  const isReconnect = everConnected
                   everConnected = true
                   self.notifierConnected = true
-                  notifier.reconnected()
+                  notifier.reconnected(isReconnect)
                   while (true) {
                     const notification = yield* Queue.take(queue)
                     const payload = executionNotificationPayload(notification.payload)
@@ -852,6 +867,11 @@ export class WorkflowsRuntime
     const self = this
     const startedAt = Date.now()
     const operation = Effect.gen(function* () {
+      if (self.dispatcherTestFailure) {
+        const failure = self.dispatcherTestFailure
+        self.dispatcherTestFailure = undefined
+        return yield* Effect.fail(failure)
+      }
       const journal = self.store()
       const advanced = new AdvancedJournal(journal)
       yield* advanced.closeChildren()

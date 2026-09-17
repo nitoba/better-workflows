@@ -87,8 +87,9 @@ export class ExecutionNotifier {
   }
 
   /** Recheck all executions after listener recovery or a connection transition. */
-  reconnected(): void {
+  reconnected(isReconnect = true): void {
     if (this.closed) return
+    if (isReconnect) this.telemetry?.count('notifierReconnect')
     for (const waiters of this.waiters.values()) for (const waiter of waiters) this.resolve(waiter)
   }
 

@@ -22,7 +22,7 @@ import type { Journal, RunRow } from '../src/internal/journal'
 import type { Registry, RegisteredWorkflow } from '../src/internal/registry'
 import type { ActivityTransport } from '../src/internal/activity-transport'
 import type { Failure } from '../src/errors'
-import { testApp } from './helpers'
+import { eventually, testApp } from './helpers'
 
 const MetricsQueue = defineQueue('metrics')
 const MetricValue = z.union([z.string(), z.number()])
@@ -104,6 +104,21 @@ class MetricsRetryActivity {
 class MetricsRetryWorkflow {
   async run(input: string, context: WorkflowContext): Promise<string> {
     return context.activities(MetricsRetryActivity).execute(input, { stepId: 'retry' })
+  }
+}
+
+@Workflow({ name: 'metrics.failed-workflow', version: 1, input: z.string(), output: z.string() })
+class MetricsFailedWorkflow {
+  async run(_input: string, _context: WorkflowContext): Promise<string> {
+    throw new Error('business failure')
+  }
+}
+
+@Workflow({ name: 'metrics.cancelled-workflow', version: 1, input: z.string(), output: z.string() })
+class MetricsCancelledWorkflow {
+  async run(input: string, context: WorkflowContext): Promise<string> {
+    await context.sleep('hold', '10s')
+    return input
   }
 }
 
@@ -430,6 +445,44 @@ test('business retries emit retry metrics without delivery redelivery metrics', 
     expect(observations(TelemetryMetricName.activityDuration)).toBe(2)
   } finally {
     await app.close()
+  }
+})
+
+test('terminal workflow outcomes emit distinct failed and cancelled metrics', async () => {
+  const failedApp = await testApp(MetricsFailedWorkflow)
+  try {
+    const handle = await failedApp.client.start('failed')
+    await expect(handle.result({ timeout: '5s' })).rejects.toBeDefined()
+    const telemetry = await failedApp.module.get(WorkflowsRuntime).run(TelemetryService)
+    const failed = telemetry
+      .snapshot()
+      .find((snapshot) => snapshot.id === TelemetryMetricName.workflowFailed)
+    expect(failed?.type).toBe('Counter')
+    if (failed?.type === 'Counter') expect(failed.state.count).toBe(1)
+  } finally {
+    await failedApp.close()
+  }
+
+  const cancelledApp = await testApp(MetricsCancelledWorkflow)
+  try {
+    const handle = await cancelledApp.client.start('cancelled')
+    await eventually(
+      () => handle.describe(),
+      (snapshot) => snapshot.status === 'waiting'
+    )
+    await handle.cancel({ reason: 'test cancellation' })
+    await eventually(
+      () => handle.describe(),
+      (snapshot) => snapshot.status === 'cancelled'
+    )
+    const telemetry = await cancelledApp.module.get(WorkflowsRuntime).run(TelemetryService)
+    const cancelled = telemetry
+      .snapshot()
+      .find((snapshot) => snapshot.id === TelemetryMetricName.workflowCancelled)
+    expect(cancelled?.type).toBe('Counter')
+    if (cancelled?.type === 'Counter') expect(cancelled.state.count).toBe(1)
+  } finally {
+    await cancelledApp.close()
   }
 })
 
