@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.0-alpha.7
+
+- Added production observability with stable workflow/activity metrics, short-lived distributed tracing, structured logs and bounded OTLP export.
+- Added privacy-safe correlation, exporter failure isolation, shutdown flushing, liveness/readiness checks and namespace-wide operational diagnostics.
+- Added administrative stats/status commands and behavioral coverage for trace propagation, continuation chains and dead-letter recovery.
+
 ## 0.1.0-alpha.6
 
 - Added `WorkflowContext.continueAsNew()` with atomic continuation chains, `continued` execution snapshots, chain-aware results and retention.

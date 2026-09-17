@@ -231,7 +231,7 @@ test('otlp resources contain deployment identity but no storage secrets', () => 
   expect(resource.serviceVersion).toBe('2026.9.1')
   expect(resource.attributes['deployment.environment.name']).toBe('test')
   expect(resource.attributes['better_workflows.namespace']).toBe('reports')
-  expect(resource.attributes['better_workflows.version']).toBe('0.1.0-alpha.6')
+  expect(resource.attributes['better_workflows.version']).toBe('0.1.0-alpha.7')
   expect(resource.attributes['better_workflows.topology']).toBe('distributed')
   expect(resource.attributes['better_workflows.storage.driver']).toBe('postgres')
   expect(resource.attributes['better_workflows.role']).toBe('producer')
