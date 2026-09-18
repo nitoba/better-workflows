@@ -279,6 +279,59 @@ test('private activity contracts cannot be used by unrelated workflow features',
   }
 })
 
+test('advanced activity exports expose the contract while keeping the worker queue private', async () => {
+  const PrivateQueue = defineQueue('advanced-private-queue')
+  @ActivitiesContract({ queue: PrivateQueue })
+  abstract class PrivateActivities {
+    @Activity({ name: 'advanced.private', version: 1, input: z.string(), output: z.string() })
+    execute(_value: string, _context: ActivityContext): Promise<string> {
+      throw new Error('contract-only')
+    }
+  }
+  @Activities(PrivateActivities)
+  class PrivateActivitiesHandler implements PrivateActivities {
+    async execute(value: string, _context: ActivityContext): Promise<string> {
+      return `private:${value}`
+    }
+  }
+  @Workflow({
+    name: 'advanced-private-workflow',
+    version: 1,
+    input: z.string(),
+    output: z.string()
+  })
+  class PrivateWorkflow {
+    async run(value: string, context: WorkflowContext): Promise<string> {
+      return context.activities(PrivateActivities).execute(value, { stepId: 'execute' })
+    }
+  }
+  const worker = WorkflowsModule.forFeature({
+    name: 'advanced-private-worker',
+    activities: [PrivateActivitiesHandler],
+    queues: [{ queue: PrivateQueue, concurrency: 1 }],
+    exports: { activities: [PrivateActivities] }
+  })
+  @Module({ imports: [worker], exports: [WorkflowsModule] })
+  class WorkerModule {}
+  const app = await open([
+    WorkflowsModule.forFeature({
+      name: 'advanced-private-caller',
+      imports: [WorkerModule],
+      workflows: [PrivateWorkflow]
+    })
+  ])
+  try {
+    expect(
+      await (await client(app, PrivateWorkflow).start('value')).result({ timeout: '3s' })
+    ).toBe('private:value')
+    expect(app.get(WorkflowsRuntime).registry.queues.get(PrivateQueue.name)).toMatchObject({
+      concurrency: 1
+    })
+  } finally {
+    await app.close()
+  }
+})
+
 test('unknown and unauthorized re-exports fail before workers start', async () => {
   await expect(
     open([WorkflowsModule.forFeature({ name: 'invalid', exports: { queues: [Reports] } })])

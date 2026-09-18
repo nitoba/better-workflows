@@ -153,6 +153,31 @@ class CompositionParentHandler implements CompositionParent {
   }
 }
 
+@Activities({ queue: Queue })
+class SimpleMatrixActivities {
+  @Activity({ name: 'matrix.simple.activity', version: 1, input: z.string(), output: z.string() })
+  async execute(input: string): Promise<string> {
+    return `simple:${input}`
+  }
+}
+
+@WorkflowContract({
+  name: 'matrix.advanced.workflow',
+  version: 1,
+  input: z.string(),
+  output: z.string()
+})
+abstract class MatrixWorkflow {
+  abstract run(input: string, context: WorkflowContext): Promise<string>
+}
+
+@Workflow(MatrixWorkflow)
+class MatrixWorkflowHandler implements MatrixWorkflow {
+  async run(input: string, context: WorkflowContext): Promise<string> {
+    return context.activities(SimpleMatrixActivities).execute(input, { stepId: 'execute' })
+  }
+}
+
 test('abstract activity contracts are metadata-only and advanced handlers use Nest DI', async () => {
   const app = await Test.createTestingModule({
     imports: [
@@ -344,6 +369,32 @@ test('advanced workflow composition supports child, map, parallel and saga activ
       child: 'activity:root',
       saga: 'activity:root'
     })
+  } finally {
+    await app.close()
+  }
+})
+
+test('advanced workflows can call simple-mode activities', async () => {
+  const app = await Test.createTestingModule({
+    imports: [
+      WorkflowsModule.forRoot({
+        namespace: 'advanced-workflow-simple-activity',
+        storage: sqlite({ filename: ':memory:' }),
+        queues: [],
+        pollInterval: '10ms'
+      }),
+      WorkflowsModule.forFeature({
+        name: 'advanced-workflow-simple-activity',
+        workflows: [MatrixWorkflowHandler],
+        activities: [SimpleMatrixActivities],
+        queues: [{ queue: Queue }]
+      })
+    ]
+  }).compile()
+  try {
+    await app.init()
+    const client = app.get<WorkflowClient<typeof MatrixWorkflow>>(getWorkflowToken(MatrixWorkflow))
+    expect(await (await client.start('value')).result({ timeout: '3s' })).toBe('simple:value')
   } finally {
     await app.close()
   }
