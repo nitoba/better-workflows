@@ -351,7 +351,14 @@ export function ActivitiesContract(defaults: ActivityDefaults = {}): ClassDecora
  * }
  * ```
  */
-export function Activity<I, O>(options: ActivityOptions<I, O>): MethodDecorator {
+export function Activity<I, O>(
+  options: ActivityOptions<I, O>
+): (
+  // oxlint-disable-next-line anti-slop/no-object-parameters -- Legacy decorators receive arbitrary prototypes.
+  target: object,
+  property: string | symbol,
+  descriptor?: PropertyDescriptor
+) => void {
   identifier(options.name, 'Activity name')
   validateActivityDefaults(options)
   positiveInteger(options.version, 'Activity version')
