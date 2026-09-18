@@ -1,6 +1,13 @@
 import { expect, test } from 'bun:test'
 import { Effect, ManagedRuntime, Tracer } from 'effect'
-import { Activity, ActivityError, Activities, Workflow, defineQueue } from '../src'
+import {
+  Activity,
+  ActivityError,
+  Activities,
+  ActivitiesContract,
+  Workflow,
+  defineQueue
+} from '../src'
 import type { ActivityContext, WorkflowContext } from '../src'
 import { z } from 'zod'
 import {
@@ -119,6 +126,30 @@ class MetricsCancelledWorkflow {
   async run(input: string, context: WorkflowContext): Promise<string> {
     await context.sleep('hold', '10s')
     return input
+  }
+}
+
+const AdvancedMetricsQueue = defineQueue('advanced-metrics')
+
+@ActivitiesContract({ queue: AdvancedMetricsQueue })
+class AdvancedMetricsContract {
+  @Activity({ name: 'metrics.advanced', version: 3, input: z.string(), output: z.string() })
+  execute(_input: string, _context: ActivityContext): Promise<string> {
+    throw new Error('contract-only')
+  }
+}
+
+@Activities(AdvancedMetricsContract)
+class AdvancedMetricsHandler implements AdvancedMetricsContract {
+  async execute(input: string, _context: ActivityContext): Promise<string> {
+    return `advanced:${input}`
+  }
+}
+
+@Workflow({ name: 'metrics.advanced-workflow', version: 1, input: z.string(), output: z.string() })
+class AdvancedMetricsWorkflow {
+  async run(input: string, context: WorkflowContext): Promise<string> {
+    return context.activities(AdvancedMetricsContract).execute(input, { stepId: 'execute' })
   }
 }
 
@@ -384,6 +415,33 @@ test('runtime emits committed workflow and activity metrics without execution la
 
     for (const snapshot of snapshots)
       expect(snapshot.attributes?.[TelemetryAttributeKey.executionId]).toBeUndefined()
+  } finally {
+    await app.close()
+  }
+})
+
+test('advanced activity metrics use contract identity rather than handler identity', async () => {
+  const app = await testApp(AdvancedMetricsWorkflow, {
+    providers: [AdvancedMetricsHandler],
+    queues: [{ queue: AdvancedMetricsQueue, concurrency: 1 }]
+  })
+  try {
+    const handle = await app.client.start('value')
+    expect(await handle.result({ timeout: '5s' })).toBe('advanced:value')
+
+    const snapshots = (await app.module.get(WorkflowsRuntime).run(TelemetryService)).snapshot()
+    const activity = snapshots.find(
+      (snapshot) =>
+        snapshot.id === TelemetryMetricName.activityCompleted && snapshot.type === 'Counter'
+    )
+    expect(activity?.type).toBe('Counter')
+    if (activity?.type === 'Counter')
+      expect(activity.attributes).toMatchObject({
+        [TelemetryAttributeKey.activityName]: 'metrics.advanced',
+        [TelemetryAttributeKey.activityVersion]: '3',
+        [TelemetryAttributeKey.queueName]: AdvancedMetricsQueue.name
+      })
+    expect(JSON.stringify(snapshots)).not.toContain('AdvancedMetricsHandler')
   } finally {
     await app.close()
   }
