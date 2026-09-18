@@ -187,6 +187,52 @@ Clients and child workflows use the contract class as their token. Durable ident
 continues to come only from the contract's `name` and `version`; the handler class
 name does not affect persistence.
 
+## Contract-first activities (optional)
+
+The simple `@Activities({...})` style remains recommended when a worker and its
+workflow live in one application. For separate orchestrator and worker packages, put
+only the activity contract in the shared package:
+
+```ts
+import { ActivitiesContract, Activity, defineQueue } from 'better-workflows'
+import type { ActivityContext } from 'better-workflows'
+import { z } from 'zod'
+
+const Reports = defineQueue('reports')
+const Input = z.object({ reportId: z.string() })
+
+@ActivitiesContract({ queue: Reports })
+export abstract class ReportActivities {
+  @Activity({ name: 'reports.generate', version: 1, input: Input, output: z.string() })
+  abstract generate(input: z.infer<typeof Input>, ctx: ActivityContext): Promise<string>
+}
+```
+
+The worker associates a Nest implementation with that contract. The orchestrator
+imports only `ReportActivities` and registers `activityContracts: [ReportActivities]`;
+it never constructs the worker or its infrastructure dependencies:
+
+```ts
+@Activities(ReportActivities)
+export class ReportActivitiesHandler implements ReportActivities {
+  constructor(private readonly repository: ReportsRepository) {}
+
+  generate(input: z.infer<typeof Input>, ctx: ActivityContext): Promise<string> {
+    return this.repository.generate(input, ctx.signal)
+  }
+}
+
+WorkflowsModule.forFeature({
+  name: 'reports-worker',
+  activities: [ReportActivitiesHandler],
+  queues: [{ queue: Reports, concurrency: 8 }]
+})
+```
+
+`ctx.activities(ReportActivities)` uses the contract's method schemas, queue, retry and
+timeout policies. Durable identity is always `activity name + version`, never the
+handler class name. A contract-only registration does not instantiate a worker.
+
 See [modules and configuration](docs/modules.md) for precedence, queue ownership, cross-domain calls, asynchronous factories and separated worker processes. Run `bun run example:modular` for a multi-domain application with **no root queue catalog**.
 
 Handlers must be singleton providers with a static dependency tree. Request-scoped dependencies and non-singleton handlers are rejected. Background execution does not retain an HTTP request. HTTP pipes, guards and interceptors are not silently applied to activities. Apply authorization in the application's controllers/services before accepting, inspecting, signalling or cancelling executions.

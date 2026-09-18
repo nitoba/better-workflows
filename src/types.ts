@@ -829,7 +829,7 @@ export interface FeatureExports {
    * Owned or imported activity contracts callable by downstream workflows.
    * Does not export the raw Nest service or require exporting its private queue.
    */
-  readonly activities?: readonly Type[]
+  readonly activities?: readonly ActivityContractClass[]
 }
 
 /**
@@ -858,7 +858,7 @@ export interface FeatureStructure extends Pick<ModuleMetadata, 'imports' | 'prov
    * Owner contracts/defaults without constructing activity services, for orchestrators.
    * Do not list the same contract in activities and activityContracts.
    */
-  readonly activityContracts?: readonly Type[]
+  readonly activityContracts?: readonly ActivityContractClass[]
   /**
    * Typed workflow contracts only. No workflow implementation is instantiated.
    * Also declares contracts that this feature may start as children.
@@ -944,7 +944,7 @@ export interface WorkflowContext {
    * const total = await ctx.activities(ReportActivities).total([10, 20], { stepId: 'total' })
    * ```
    */
-  activities<T>(provider: Type<T>): ActivityClient<T>
+  activities<C extends ActivityContractClass>(provider: C): ActivityClient<InstanceType<C>>
   /**
    * Map items through durably admitted branches and return results in input order.
    * Completed branches are reused. Suspended branches retain their admission slot.
@@ -1174,6 +1174,19 @@ export type WorkflowInput<W extends WorkflowContractClass> = Parameters<Instance
 export type WorkflowOutput<W extends WorkflowContractClass> = Awaited<
   ReturnType<InstanceType<W>['run']>
 >
+
+/**
+ * Constructor of an activity contract. Contracts may be abstract because they are
+ * metadata and type declarations, not Nest providers.
+ */
+export type ActivityContractClass<T = object> = abstract new (...args: any[]) => T
+
+/**
+ * Constructor of a concrete activity implementation associated with a contract.
+ * Nest instantiates implementations; the contract remains metadata-only.
+ */
+export type ActivityImplementationClass<C extends ActivityContractClass = ActivityContractClass> =
+  new (...args: any[]) => InstanceType<C>
 
 /**
  * Immutable SQLite storage description returned by the sqlite adapter.

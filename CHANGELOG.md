@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.0-alpha.9
+
+- Added optional contract-first activities with metadata-only contracts and Nest-injected handlers.
+- Added typed abstract-capable activity contracts, handler association, explicit method metadata and
+  contract-based activity routing while preserving simple-mode registrations and the wire protocol.
+
 ## 0.1.0-alpha.8
 
 - Added durable cron and interval scheduling with persisted cursors, misfire/overlap policies and distributed claims.

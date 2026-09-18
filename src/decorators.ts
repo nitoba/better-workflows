@@ -4,6 +4,8 @@ import type { StandardSchemaV1 } from '@standard-schema/spec'
 import type {
   ActivityDefaults,
   ActivityOptions,
+  ActivityContractClass,
+  ActivityImplementationClass,
   SignalDefinition,
   WorkflowContractClass,
   WorkflowImplementationClass,
@@ -23,11 +25,18 @@ export const WORKFLOW_METADATA = Symbol.for('better-workflows/workflow')
 export const WORKFLOW_CONTRACT_METADATA = Symbol.for('better-workflows/workflow-contract')
 export const WORKFLOW_HANDLER_METADATA = Symbol.for('better-workflows/workflow-handler')
 export const ACTIVITIES_METADATA = Symbol.for('better-workflows/activities')
+export const ACTIVITIES_CONTRACT_METADATA = Symbol.for('better-workflows/activities-contract')
+export const ACTIVITIES_HANDLER_METADATA = Symbol.for('better-workflows/activities-handler')
 export const ACTIVITY_METADATA = Symbol.for('better-workflows/activity')
+export const ACTIVITY_METHODS_METADATA = Symbol.for('better-workflows/activity-methods')
 const CLIENT_TOKENS = new WeakMap<WorkflowContractClass, symbol>()
 
 export interface WorkflowHandlerMetadata {
   readonly contract: WorkflowContractClass
+}
+
+export interface ActivitiesHandlerMetadata {
+  readonly contract: ActivityContractClass
 }
 
 /**
@@ -244,6 +253,7 @@ function requireClientContract(workflow: WorkflowContractClass): WorkflowContrac
  * Also applies Injectable. Defaults override the owner feature and root; individual
  * Activity decorators can override them. A retry policy replaces the inherited object.
  * @param defaults - Queue, timeout and retry defaults; does not register a queue.
+ * @param contract - A metadata-only contract class when associating a worker handler.
  * @returns Class decorator; register the class in forFeature.activities to run workers.
  * @throws WorkflowError for an invalid queue reference, duration or retry policy.
  * @example
@@ -258,12 +268,60 @@ function requireClientContract(workflow: WorkflowContractClass): WorkflowContrac
  * }
  * ```
  */
-export function Activities(defaults: ActivityDefaults = {}): ClassDecorator {
-  validateActivityDefaults(defaults)
-  const settings = freezeActivityDefaults(defaults)
+export function Activities(defaults?: ActivityDefaults): ClassDecorator
+export function Activities<C extends ActivityContractClass>(
+  contract: C
+): <T extends ActivityImplementationClass<C>>(target: T) => void
+export function Activities(
+  defaultsOrContract: ActivityDefaults | ActivityContractClass = {}
+): ClassDecorator {
+  // oxlint-disable-next-line anti-slop/no-runtime-typeof -- Decorator overloads distinguish options objects from class constructors here.
+  if (typeof defaultsOrContract === 'function') {
+    const contract = defaultsOrContract
+    // SAFETY: @ActivitiesContract is the only writer of this metadata and writes ActivityDefaults.
+    const options = Reflect.getOwnMetadata(ACTIVITIES_CONTRACT_METADATA, contract) as
+      | ActivityDefaults
+      | undefined
+    // SAFETY: @Activities is the only writer of this metadata and writes a contract reference.
+    const handler = Reflect.getOwnMetadata(ACTIVITIES_HANDLER_METADATA, contract) as
+      | ActivitiesHandlerMetadata
+      | undefined
+    if (!options || handler)
+      throw new WorkflowError(
+        'INVALID_ACTIVITIES_CONTRACT',
+        `${contract.name} must be declared with @ActivitiesContract() before it can be used by @Activities()`
+      )
+    return (target) => {
+      Injectable()(target)
+      Reflect.defineMetadata(
+        ACTIVITIES_HANDLER_METADATA,
+        Object.freeze({ contract } satisfies ActivitiesHandlerMetadata),
+        target
+      )
+    }
+  }
+  validateActivityDefaults(defaultsOrContract)
+  const settings = freezeActivityDefaults(defaultsOrContract)
   return (target) => {
     Injectable()(target)
     Reflect.defineMetadata(ACTIVITIES_METADATA, settings, target)
+    Reflect.defineMetadata(ACTIVITIES_CONTRACT_METADATA, settings, target)
+    Reflect.defineMetadata(ACTIVITIES_HANDLER_METADATA, Object.freeze({ contract: target }), target)
+  }
+}
+
+/**
+ * Declare an activity contract without creating a Nest provider. The contract owns
+ * durable activity identities, schemas and execution policies; use {@link Activities}
+ * on a separate class for the worker implementation.
+ * @param defaults - Queue and policy defaults inherited by decorated methods.
+ * @returns A metadata-only class decorator, including for abstract classes.
+ */
+export function ActivitiesContract(defaults: ActivityDefaults = {}): ClassDecorator {
+  validateActivityDefaults(defaults)
+  const settings = freezeActivityDefaults(defaults)
+  return (target) => {
+    Reflect.defineMetadata(ACTIVITIES_CONTRACT_METADATA, settings, target)
   }
 }
 
@@ -297,13 +355,9 @@ export function Activity<I, O>(options: ActivityOptions<I, O>): MethodDecorator 
   identifier(options.name, 'Activity name')
   validateActivityDefaults(options)
   positiveInteger(options.version, 'Activity version')
-  return (target, property, descriptor) => {
+  return (target, property, _descriptor) => {
     // oxlint-disable anti-slop/no-runtime-typeof -- Decorator boundary must reject static methods and non-method descriptors.
-    if (
-      typeof target === 'function' ||
-      typeof descriptor.value !== 'function' ||
-      typeof property !== 'string'
-    ) {
+    if (typeof target === 'function' || typeof property !== 'string') {
       throw new WorkflowError('INVALID_ACTIVITY', 'Activities must be named instance methods')
     }
     // oxlint-enable anti-slop/no-runtime-typeof
@@ -313,7 +367,35 @@ export function Activity<I, O>(options: ActivityOptions<I, O>): MethodDecorator 
       target,
       property
     )
+    // SAFETY: this decorator is the only writer of the method list metadata.
+    const methods = new Set(
+      (Reflect.getOwnMetadata(ACTIVITY_METHODS_METADATA, target) as
+        | readonly string[]
+        | undefined) ?? []
+    )
+    methods.add(property)
+    Reflect.defineMetadata(ACTIVITY_METHODS_METADATA, Object.freeze([...methods]), target)
   }
+}
+
+/**
+ * Resolve an activity handler or simple provider to its durable contract class.
+ * @param activity - Decorated contract or implementation constructor.
+ * @returns The constructor that owns activity metadata and durable identities.
+ */
+export function activitiesContractClass(
+  activity: ActivityContractClass | ActivityImplementationClass
+): ActivityContractClass {
+  // SAFETY: @Activities is the only writer of this metadata and writes a contract reference.
+  const handler = Reflect.getOwnMetadata(ACTIVITIES_HANDLER_METADATA, activity) as
+    | ActivitiesHandlerMetadata
+    | undefined
+  if (handler && handler.contract !== activity) return handler.contract
+  if (Reflect.hasOwnMetadata(ACTIVITIES_CONTRACT_METADATA, activity)) return activity
+  throw new WorkflowError(
+    'MISSING_DECORATOR',
+    `${activity.name} has no @ActivitiesContract or @Activities decorator`
+  )
 }
 
 /**

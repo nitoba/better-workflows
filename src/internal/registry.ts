@@ -1,11 +1,13 @@
-import type { Type } from '@nestjs/common'
 import type { DiscoveryService } from '@nestjs/core'
 import {
   ACTIVITY_METADATA,
-  ACTIVITIES_METADATA,
+  ACTIVITY_METHODS_METADATA,
+  ACTIVITIES_CONTRACT_METADATA,
+  ACTIVITIES_HANDLER_METADATA,
   WORKFLOW_CONTRACT_METADATA,
   WORKFLOW_HANDLER_METADATA,
   getWorkflowToken,
+  activitiesContractClass,
   validateActivityDefaults,
   workflowContractClass
 } from '../decorators'
@@ -17,6 +19,8 @@ import { queueName, queueToken } from '../queues'
 import type { QueueReference } from '../queues'
 import type {
   ActivityContext,
+  ActivityContractClass,
+  ActivityImplementationClass,
   ActivityDefaults,
   ActivityOptions,
   QueueOptions,
@@ -48,7 +52,8 @@ export type ResolvedActivityOptions = Omit<ActivityOptions<any, any>, 'queue'> &
   readonly queue: string
 }
 export interface ActivityContract {
-  readonly provider: Type
+  /** Contract class that owns the durable identity and method metadata. */
+  readonly provider: ActivityContractClass
   readonly method: string
   readonly options: ResolvedActivityOptions
 }
@@ -86,13 +91,15 @@ export class Registry {
   /** Schedules owned by registered workflow implementations, keyed by explicit name. */
   readonly schedules = new Map<string, RegisteredSchedule>()
   readonly activities = new Map<string, RegisteredActivity>()
-  readonly providers = new Map<Type, readonly ActivityContract[]>()
+  readonly providers = new Map<ActivityContractClass, readonly ActivityContract[]>()
   /** Normalized implementation-to-contract relationships for advanced handlers. */
   readonly handlerContracts = new Map<WorkflowImplementationClass, WorkflowContractClass>()
+  readonly activityHandlerContracts = new Map<ActivityImplementationClass, ActivityContractClass>()
+  private readonly activityHandlers = new Map<ActivityContractClass, ActivityImplementationClass>()
   readonly queues = new Map<string, QueueOptions>()
   private readonly ownedQueues = new Map<string, OwnedQueue>()
   private readonly features = new Map<symbol, Feature>()
-  private readonly activityOwners = new Map<Type, Feature>()
+  private readonly activityOwners = new Map<ActivityContractClass, Feature>()
   private sealed = false
 
   constructor(private readonly options: WorkflowsOptions) {}
@@ -162,7 +169,16 @@ export class Registry {
     return registered
   }
 
-  activityContracts(provider: Type): readonly ActivityContract[] {
+  activityContracts(provider: ActivityContractClass): readonly ActivityContract[] {
+    // SAFETY: @Activities is the only writer of this metadata and writes a contract reference.
+    const handler = Reflect.getOwnMetadata(ACTIVITIES_HANDLER_METADATA, provider) as
+      | { readonly contract: ActivityContractClass }
+      | undefined
+    if (handler && handler.contract !== provider)
+      throw new WorkflowError(
+        'INVALID_ACTIVITIES_CONTRACT',
+        `${provider.name} is an activities handler; use ${handler.contract.name} when calling ctx.activities()`
+      )
     const contracts = this.providers.get(provider)
     if (!contracts)
       throw new WorkflowError(
@@ -172,7 +188,10 @@ export class Registry {
     return contracts
   }
 
-  activitiesFor(workflow: RegisteredWorkflow, provider: Type): readonly ActivityContract[] {
+  activitiesFor(
+    workflow: RegisteredWorkflow,
+    provider: ActivityContractClass
+  ): readonly ActivityContract[] {
     const owner = this.activityOwners.get(provider)
     if (!owner) return this.activityContracts(provider)
     if (
@@ -334,8 +353,29 @@ export class Registry {
         )
       }
       for (const provider of structure.clients ?? []) this.contract(provider)
-      const implemented = new Set((structure.activities ?? []).map(handlerClass))
-      const contracts = [...implemented, ...(structure.activityContracts ?? [])]
+      // SAFETY: feature activity registrations are concrete handler registrations.
+      const implementations = (structure.activities ?? []).map(
+        handlerClass
+      ) as ActivityImplementationClass[]
+      const implemented = new Set(
+        implementations.map((handler) => activitiesContractClass(handler))
+      )
+      // SAFETY: feature activityContracts are validated abstract/concrete contract constructors.
+      const contracts = [
+        ...implemented,
+        ...(structure.activityContracts ?? [])
+      ] as ActivityContractClass[]
+      for (const contract of structure.activityContracts ?? []) {
+        // SAFETY: @Activities is the only writer of this metadata and writes a contract reference.
+        const metadata = Reflect.getOwnMetadata(ACTIVITIES_HANDLER_METADATA, contract) as
+          | { readonly contract: ActivityContractClass }
+          | undefined
+        if (metadata && metadata.contract !== contract)
+          throw new WorkflowError(
+            'INVALID_ACTIVITIES_CONTRACT',
+            `${contract.name} is an activities handler; register ${metadata.contract.name} instead`
+          )
+      }
       if (new Set(contracts).size !== contracts.length)
         throw new WorkflowError(
           'DUPLICATE_ACTIVITY_PROVIDER',
@@ -343,24 +383,53 @@ export class Registry {
         )
       for (const provider of contracts) {
         if (this.activityOwners.has(provider))
+          if (implemented.has(provider) && this.activityHandlers.has(provider))
+            throw new WorkflowError(
+              'DUPLICATE_ACTIVITY_HANDLER',
+              `${handlerName(implementations, provider)} and ${this.activityHandlers.get(provider)!.name} implement ${provider.name}`
+            )
+        if (this.activityOwners.has(provider))
           throw new WorkflowError(
             'DUPLICATE_ACTIVITY_PROVIDER',
             `${provider.name} already has an owning feature; import its exports instead`
           )
         this.activityOwners.set(provider, feature)
-        const instance = feature.registration.instances.get(provider)
-        const registration = structure.activities?.find((entry) => handlerClass(entry) === provider)
+        const handler = implementations.find(
+          (candidate) => activitiesContractClass(candidate) === provider
+        )
+        const instance = handler ? feature.registration.instances.get(handler) : undefined
+        const registration = structure.activities?.find((entry) => handlerClass(entry) === handler)
         if (registration) requireSingleton(feature.host, handlerToken(registration))
         const resolved = this.resolveActivities(provider, feature)
         this.providers.set(provider, Object.freeze(resolved))
-        if (!implemented.has(provider)) continue
+        if (!handler) continue
+        if (this.activityHandlerContracts.has(handler))
+          throw new WorkflowError(
+            'DUPLICATE_ACTIVITY_HANDLER',
+            `${handler.name} is registered more than once for ${provider.name}`
+          )
+        this.activityHandlerContracts.set(handler, provider)
+        this.activityHandlers.set(provider, handler)
+        for (const method of this.activityMethods(provider)) {
+          if (
+            handler !== provider &&
+            Reflect.getOwnMetadata(ACTIVITY_METADATA, handler.prototype, method)
+          )
+            throw new WorkflowError(
+              'ACTIVITY_HANDLER_REDECLARES_CONTRACT',
+              `${handler.name}.${method} redeclares ${provider.name}.${method}; decorate the contract only`
+            )
+        }
         for (const activity of resolved) {
           const key = this.key(activity.options.name, activity.options.version)
           if (this.activities.has(key)) throw new WorkflowError('DUPLICATE_ACTIVITY', key)
-          const handler = instance?.[activity.method]
+          const implementation = instance?.[activity.method]
           // oxlint-disable-next-line anti-slop/no-runtime-typeof -- An overridden Nest provider must implement the declared contract.
-          if (typeof handler !== 'function')
-            throw new WorkflowError('MISSING_HANDLER', `${provider.name}.${activity.method}`)
+          if (typeof implementation !== 'function')
+            throw new WorkflowError(
+              'MISSING_ACTIVITY_HANDLER',
+              `${handler.name}.${activity.method} does not implement ${provider.name}.${activity.method}`
+            )
           const enabled =
             this.options.execution?.activities?.enabled !== false &&
             execution?.activities?.enabled !== false &&
@@ -372,7 +441,7 @@ export class Registry {
               ...activity,
               enabled,
               invoke: (input: any, context: ActivityContext) =>
-                handler.call(instance, input, context)
+                implementation.call(instance, input, context)
             })
           )
         }
@@ -508,51 +577,81 @@ export class Registry {
     if (defaults?.activities) validateActivityDefaults(defaults.activities)
   }
 
-  private resolveActivities(provider: Type, feature: Feature): ActivityContract[] {
-    // SAFETY: @Activities writes and validates these defaults; getOwnMetadata avoids implicit class ownership inheritance.
-    const classDefaults = Reflect.getOwnMetadata(ACTIVITIES_METADATA, provider) as
+  private resolveActivities(provider: ActivityContractClass, feature: Feature): ActivityContract[] {
+    // SAFETY: @Activities/@ActivitiesContract write validated defaults; own metadata avoids accidental inheritance.
+    const classDefaults = Reflect.getOwnMetadata(ACTIVITIES_CONTRACT_METADATA, provider) as
       | ActivityDefaults
       | undefined
     if (!classDefaults)
       throw new WorkflowError('MISSING_DECORATOR', `${provider.name} has no @Activities decorator`)
-    const methods = new Set<string>()
     const contracts: ActivityContract[] = []
+    for (const method of this.activityMethods(provider)) {
+      const prototype = this.activityPrototype(provider, method)
+      if (!prototype) continue
+      // SAFETY: @Activity is the only writer of validated method metadata.
+      const declared = Reflect.getOwnMetadata(ACTIVITY_METADATA, prototype, method) as
+        | ActivityOptions<any, any>
+        | undefined
+      if (!declared) continue
+      const defaults = mergeActivityDefaults(
+        this.options.defaults?.activities,
+        feature.registration.configuration.defaults?.activities,
+        classDefaults,
+        declared
+      )
+      if (!defaults.queue)
+        throw new WorkflowError(
+          'ACTIVITY_QUEUE_REQUIRED',
+          `${provider.name}.${method} needs an explicit or inherited queue`
+        )
+      const queue = this.requireQueue(feature, defaults.queue)
+      if (queue.options.perKeyConcurrency !== undefined && !declared.key)
+        throw new WorkflowError(
+          'ACTIVITY_KEY_REQUIRED',
+          `${declared.name} needs key for ${queue.reference.name}`
+        )
+      const options = Object.freeze({ ...declared, ...defaults, queue: queue.reference.name })
+      contracts.push(Object.freeze({ provider, method, options }))
+    }
+    return contracts
+  }
+
+  private activityMethods(provider: ActivityContractClass): readonly string[] {
+    const methods = new Set<string>()
     for (
       let prototype = provider.prototype;
       prototype && prototype !== Object.prototype;
       prototype = Object.getPrototypeOf(prototype)
     ) {
-      for (const method of Object.getOwnPropertyNames(prototype)) {
-        if (methods.has(method)) continue
-        methods.add(method)
-        // SAFETY: @Activity is the only writer of validated method metadata.
-        const declared = Reflect.getOwnMetadata(ACTIVITY_METADATA, prototype, method) as
-          | ActivityOptions<any, any>
-          | undefined
-        if (!declared) continue
-        const defaults = mergeActivityDefaults(
-          this.options.defaults?.activities,
-          feature.registration.configuration.defaults?.activities,
-          classDefaults,
-          declared
-        )
-        if (!defaults.queue)
-          throw new WorkflowError(
-            'ACTIVITY_QUEUE_REQUIRED',
-            `${provider.name}.${method} needs an explicit or inherited queue`
-          )
-        const queue = this.requireQueue(feature, defaults.queue)
-        if (queue.options.perKeyConcurrency !== undefined && !declared.key)
-          throw new WorkflowError(
-            'ACTIVITY_KEY_REQUIRED',
-            `${declared.name} needs key for ${queue.reference.name}`
-          )
-        const options = Object.freeze({ ...declared, ...defaults, queue: queue.reference.name })
-        contracts.push(Object.freeze({ provider, method, options }))
-      }
+      // SAFETY: @Activity is the only writer of this metadata and writes method names.
+      const declared = Reflect.getOwnMetadata(ACTIVITY_METHODS_METADATA, prototype) as
+        | readonly string[]
+        | undefined
+      for (const method of declared ?? []) methods.add(method)
     }
-    return contracts
+    return [...methods]
   }
+
+  private activityPrototype(provider: ActivityContractClass, method: string): object | undefined {
+    for (
+      let prototype = provider.prototype;
+      prototype && prototype !== Object.prototype;
+      prototype = Object.getPrototypeOf(prototype)
+    ) {
+      if (Reflect.hasOwnMetadata(ACTIVITY_METADATA, prototype, method)) return prototype
+    }
+    return undefined
+  }
+}
+
+function handlerName(
+  implementations: readonly ActivityImplementationClass[],
+  provider: ActivityContractClass
+): string {
+  return (
+    implementations.find((handler) => activitiesContractClass(handler) === provider)?.name ??
+    provider.name
+  )
 }
 
 function exportedMarkers(

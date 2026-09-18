@@ -1,13 +1,18 @@
 import { Scope } from '@nestjs/common'
 import type { InjectionToken, Type } from '@nestjs/common'
 import type { DiscoveryService } from '@nestjs/core'
-import type { FeatureConfiguration, FeatureStructure, HandlerRegistration } from '../types'
+import type {
+  ActivityContractClass,
+  FeatureConfiguration,
+  FeatureStructure,
+  HandlerRegistration
+} from '../types'
 import { WorkflowError } from '../errors'
 
 export const FEATURE_FACTORY = Symbol.for('better-workflows/feature-factory')
-const ACTIVITY_TOKENS = new WeakMap<Type, symbol>()
+const ACTIVITY_TOKENS = new WeakMap<ActivityContractClass, symbol>()
 
-export function activityToken(provider: Type): symbol {
+export function activityToken(provider: ActivityContractClass): symbol {
   let token = ACTIVITY_TOKENS.get(provider)
   if (!token) {
     token = Symbol(`better-workflows/activity-contract/${provider.name}`)

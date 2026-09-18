@@ -1,5 +1,4 @@
 import { createHash } from 'node:crypto'
-import type { Type } from '@nestjs/common'
 import { Cause, Effect, Exit, Result, Fiber } from 'effect'
 import { SqlClient } from 'effect/unstable/sql'
 import { DurableClock, DurableDeferred, Workflow, WorkflowEngine } from 'effect/unstable/workflow'
@@ -7,6 +6,7 @@ import { toFailure, WorkflowError } from '../errors'
 import type { Failure } from '../errors'
 import type {
   ActivityClient,
+  ActivityContractClass,
   ChildOptions,
   ParallelTasks,
   SagaContext,
@@ -264,7 +264,9 @@ export class WorkflowInterpreter {
                   })
                 ).then(() => suspend())
               },
-              activities<T>(provider: Type<T>): ActivityClient<T> {
+              activities<C extends ActivityContractClass>(
+                provider: C
+              ): ActivityClient<InstanceType<C>> {
                 const entries = self.registry
                   .activitiesFor(self.workflow, provider)
                   .map((activity) => [
@@ -407,7 +409,7 @@ export class WorkflowInterpreter {
                     }
                   ])
                 // SAFETY: discovered decorators define these methods; inputs and results are schema validated.
-                return Object.fromEntries(entries) as ActivityClient<T>
+                return Object.fromEntries(entries) as ActivityClient<InstanceType<C>>
               },
               sleep(step, duration) {
                 const delay = milliseconds(duration)

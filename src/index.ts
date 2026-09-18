@@ -9,6 +9,8 @@ export { defineQueue } from './queues'
 export type { QueueReference } from './queues'
 export {
   Activities,
+  ActivitiesContract,
+  activitiesContractClass,
   Activity,
   Workflow,
   WorkflowContract,
@@ -25,6 +27,8 @@ export { ActivityError, WorkflowError, WorkflowExecutionError } from './errors'
 export type { Failure } from './errors'
 export type {
   ActivityClient,
+  ActivityContractClass,
+  ActivityImplementationClass,
   ActivityContext,
   ActivityOptions,
   Duration,
