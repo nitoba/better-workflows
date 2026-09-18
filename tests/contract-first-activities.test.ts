@@ -14,6 +14,7 @@ import {
   WorkflowsModule
 } from '../src'
 import type { ActivityContext, WorkflowContext } from '../src'
+import { WorkflowsRuntime } from '../src/internal/runtime'
 import { sqlite } from '../src/sqlite'
 
 const Queue = defineQueue('contract-first-activities')
@@ -227,6 +228,163 @@ test('activity handlers cannot be registered as contracts', async () => {
     ]
   }).compile()
   await expect(app.init()).rejects.toMatchObject({ code: 'INVALID_ACTIVITIES_CONTRACT' })
+  await app.close().catch(() => {})
+})
+
+test('advanced handlers are rejected when passed to ctx.activities', async () => {
+  @Workflow({
+    name: 'invalid-activity-handler-call',
+    version: 1,
+    input: Input,
+    output: z.string()
+  })
+  class InvalidActivityHandlerCall {
+    async run(input: z.infer<typeof Input>, context: WorkflowContext): Promise<string> {
+      // Runtime validation covers JavaScript consumers and casts that bypass structural typing.
+      return context.activities(ActivitiesHandler).execute(input, { stepId: 'execute' })
+    }
+  }
+  const app = await Test.createTestingModule({
+    imports: [
+      WorkflowsModule.forRoot({
+        namespace: 'invalid-activity-handler-call',
+        storage: sqlite({ filename: ':memory:' })
+      }),
+      WorkflowsModule.forFeature({
+        name: 'invalid-activity-handler-call',
+        workflows: [InvalidActivityHandlerCall],
+        activities: [ActivitiesHandler],
+        providers: [Prefix],
+        queues: [{ queue: Queue }]
+      })
+    ]
+  }).compile()
+  try {
+    await app.init()
+    const client = app.get<WorkflowClient<typeof InvalidActivityHandlerCall>>(
+      getWorkflowToken(InvalidActivityHandlerCall)
+    )
+    await expect(
+      (await client.start({ value: 'invalid' })).result({ timeout: '3s' })
+    ).rejects.toMatchObject({ code: 'INVALID_ACTIVITIES_CONTRACT' })
+  } finally {
+    await app.close()
+  }
+})
+
+test('Activities contract arguments must be metadata-only contracts', () => {
+  @Activities({ queue: Queue })
+  class SimpleActivities {
+    @Activity({ name: 'invalid.simple-argument', version: 1, input: Input, output: z.string() })
+    async execute(input: z.infer<typeof Input>): Promise<string> {
+      return input.value
+    }
+  }
+  class UndecoratedActivities {
+    async execute(input: z.infer<typeof Input>): Promise<string> {
+      return input.value
+    }
+  }
+  expect(() => Activities(SimpleActivities)(SimpleActivities)).toThrow(
+    expect.objectContaining({ code: 'INVALID_ACTIVITIES_CONTRACT' })
+  )
+  expect(() => Activities(ActivitiesHandler)(ActivitiesHandler)).toThrow(
+    expect.objectContaining({ code: 'INVALID_ACTIVITIES_CONTRACT' })
+  )
+  expect(() => Activities(UndecoratedActivities)(UndecoratedActivities)).toThrow(
+    expect.objectContaining({ code: 'INVALID_ACTIVITIES_CONTRACT' })
+  )
+})
+
+test('activity contract method metadata preserves deterministic declaration order', async () => {
+  @ActivitiesContract({ queue: Queue })
+  class OrderedActivities {
+    async first(_input: string): Promise<string> {
+      return 'first'
+    }
+    async second(_input: string): Promise<string> {
+      return 'second'
+    }
+  }
+  Activity({ name: 'ordered.first', version: 1, input: z.string(), output: z.string() })(
+    OrderedActivities.prototype,
+    'first',
+    undefined
+  )
+  Activity({ name: 'ordered.second', version: 1, input: z.string(), output: z.string() })(
+    OrderedActivities.prototype,
+    'second',
+    undefined
+  )
+
+  const app = await Test.createTestingModule({
+    imports: [
+      WorkflowsModule.forRoot({
+        namespace: 'ordered-activity-contract',
+        storage: sqlite({ filename: ':memory:' }),
+        execution: { workflows: { enabled: false }, activities: { enabled: false } }
+      }),
+      WorkflowsModule.forFeature({
+        name: 'ordered-activity-contract',
+        activityContracts: [OrderedActivities],
+        queues: [{ queue: Queue }]
+      })
+    ]
+  }).compile()
+  try {
+    await app.init()
+    expect(
+      app
+        .get(WorkflowsRuntime)
+        .registry.activityContracts(OrderedActivities)
+        .map((activity) => activity.method)
+    ).toEqual(['first', 'second'])
+  } finally {
+    await app.close()
+  }
+})
+
+test('different activity contracts cannot declare the same durable identity', async () => {
+  @ActivitiesContract({ queue: Queue })
+  class FirstContract {
+    execute(_input: string): Promise<string> {
+      throw new Error('contract-only')
+    }
+  }
+  @ActivitiesContract({ queue: Queue })
+  class SecondContract {
+    execute(_input: string): Promise<string> {
+      throw new Error('contract-only')
+    }
+  }
+  Activity({
+    name: 'duplicate.contract-identity',
+    version: 1,
+    input: z.string(),
+    output: z.string()
+  })(FirstContract.prototype, 'execute', undefined)
+  Activity({
+    name: 'duplicate.contract-identity',
+    version: 1,
+    input: z.string(),
+    output: z.string()
+  })(SecondContract.prototype, 'execute', undefined)
+
+  const app = await Test.createTestingModule({
+    imports: [
+      WorkflowsModule.forRoot({
+        namespace: 'duplicate-contract-identity',
+        storage: sqlite({ filename: ':memory:' }),
+        execution: { workflows: { enabled: false }, activities: { enabled: false } }
+      }),
+      WorkflowsModule.forFeature({
+        name: 'duplicate-contract-identity',
+        activityContracts: [FirstContract, SecondContract],
+        queues: [{ queue: Queue }]
+      })
+    ]
+  }).compile()
+  await expect(app.init()).rejects.toMatchObject({ code: 'DUPLICATE_ACTIVITY' })
   await app.close().catch(() => {})
 })
 
