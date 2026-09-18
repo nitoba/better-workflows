@@ -360,6 +360,19 @@ export class Registry {
       const implemented = new Set(
         implementations.map((handler) => activitiesContractClass(handler))
       )
+      const handlersByContract = new Map<ActivityContractClass, ActivityImplementationClass[]>()
+      for (const handler of implementations) {
+        const contract = activitiesContractClass(handler)
+        const handlers = handlersByContract.get(contract) ?? []
+        handlers.push(handler)
+        handlersByContract.set(contract, handlers)
+      }
+      for (const [contract, handlers] of handlersByContract)
+        if (handlers.length > 1)
+          throw new WorkflowError(
+            'DUPLICATE_ACTIVITY_HANDLER',
+            `${handlers.map((handler) => handler.name).join(' and ')} implement ${contract.name}`
+          )
       // SAFETY: feature activityContracts are validated abstract/concrete contract constructors.
       const contracts = [
         ...implemented,

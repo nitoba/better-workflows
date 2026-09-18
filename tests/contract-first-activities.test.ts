@@ -84,3 +84,48 @@ test('abstract activity contracts are metadata-only and advanced handlers use Ne
     await app.close()
   }
 })
+
+test('activity handlers cannot be registered as contracts', async () => {
+  const app = await Test.createTestingModule({
+    imports: [
+      WorkflowsModule.forRoot({
+        namespace: 'invalid-activity-contract',
+        storage: sqlite({ filename: ':memory:' }),
+        execution: { workflows: { enabled: false }, activities: { enabled: false } }
+      }),
+      WorkflowsModule.forFeature({
+        name: 'invalid-activity-contract',
+        activityContracts: [ActivitiesHandler],
+        queues: [{ queue: Queue }]
+      })
+    ]
+  }).compile()
+  await expect(app.init()).rejects.toMatchObject({ code: 'INVALID_ACTIVITIES_CONTRACT' })
+  await app.close().catch(() => {})
+})
+
+test('two handlers for one activity contract fail bootstrap', async () => {
+  @Activities(ContractActivities)
+  class SecondHandler implements ContractActivities {
+    async execute(input: z.infer<typeof Input>, _context: ActivityContext): Promise<string> {
+      return input.value
+    }
+  }
+  const app = await Test.createTestingModule({
+    imports: [
+      WorkflowsModule.forRoot({
+        namespace: 'duplicate-activity-handler',
+        storage: sqlite({ filename: ':memory:' }),
+        execution: { workflows: { enabled: false } }
+      }),
+      WorkflowsModule.forFeature({
+        name: 'duplicate-activity-handler',
+        activities: [ActivitiesHandler, SecondHandler],
+        providers: [Prefix],
+        queues: [{ queue: Queue }]
+      })
+    ]
+  }).compile()
+  await expect(app.init()).rejects.toMatchObject({ code: 'DUPLICATE_ACTIVITY_HANDLER' })
+  await app.close().catch(() => {})
+})
