@@ -6,6 +6,7 @@ import type { TestingModule } from '@nestjs/testing'
 import { z } from 'zod'
 import {
   Activities,
+  ActivitiesContract,
   Activity,
   Workflow,
   WorkflowsModule,
@@ -425,6 +426,52 @@ test('useExisting reuses an exported Nest implementation and its dependency tree
       heartbeat: async () => {}
     }
     expect(await registration.invoke('same-instance', context)).toBe('same-instance')
+    expect(constructions).toBe(1)
+  } finally {
+    await app.close()
+  }
+})
+
+test('useExisting binds an advanced activity handler to its shared contract', async () => {
+  let constructions = 0
+  @ActivitiesContract({ queue: Reports })
+  abstract class ExistingContract {
+    @Activity({ name: 'existing-advanced', version: 1, input: z.string(), output: z.string() })
+    run(_value: string, _context: ActivityContext): Promise<string> {
+      throw new Error('contract-only')
+    }
+  }
+  @Activities(ExistingContract)
+  class ExistingWorker implements ExistingContract {
+    constructor() {
+      constructions++
+    }
+    async run(value: string, _context: ActivityContext): Promise<string> {
+      return `advanced:${value}`
+    }
+  }
+  @Module({ providers: [ExistingWorker], exports: [ExistingWorker] })
+  class ExistingWorkerModule {}
+  const app = await open([
+    WorkflowsModule.forFeature({
+      name: 'reuse-advanced',
+      imports: [ExistingWorkerModule],
+      activities: [{ provide: ExistingWorker, useExisting: ExistingWorker }],
+      queues: [{ queue: Reports }]
+    })
+  ])
+  try {
+    expect(constructions).toBe(1)
+    const registration = [...app.get(WorkflowsRuntime).registry.activities.values()][0]!
+    const context: ActivityContext = {
+      executionId: 'unit',
+      stepId: 'step',
+      attempt: 1,
+      idempotencyKey: 'key',
+      signal: new AbortController().signal,
+      heartbeat: async () => {}
+    }
+    expect(await registration.invoke('same-instance', context)).toBe('advanced:same-instance')
     expect(constructions).toBe(1)
   } finally {
     await app.close()
