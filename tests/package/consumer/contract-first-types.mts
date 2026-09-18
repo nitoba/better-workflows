@@ -1,8 +1,15 @@
 import assert from 'node:assert/strict'
-import { ActivitiesContract, Activity, WorkflowContract, defineQueue } from 'better-workflows'
+import {
+  Activities,
+  ActivitiesContract,
+  Activity,
+  WorkflowContract,
+  defineQueue
+} from 'better-workflows'
 import type {
   ActivityContext,
   ActivityClient,
+  ActivityImplementationClass,
   StepOptions,
   WorkflowContext,
   WorkflowInput,
@@ -54,3 +61,32 @@ type ExpectedExecute = (
 ) => Promise<string>
 type AssertAssignable<T extends ExpectedExecute> = T
 export type VerifiedExecute = AssertAssignable<Execute>
+
+@Activities(PublishedActivitiesContract)
+class PublishedActivitiesHandler implements PublishedActivitiesContract {
+  async execute(
+    input: z.infer<typeof activityInputSchema>,
+    _context: ActivityContext
+  ): Promise<string> {
+    return input.id
+  }
+}
+
+const publishedHandler: ActivityImplementationClass<typeof PublishedActivitiesContract> =
+  PublishedActivitiesHandler
+assert.equal(publishedHandler, PublishedActivitiesHandler)
+
+// @ts-expect-error Handler methods must preserve the contract input and output types.
+@Activities(PublishedActivitiesContract)
+class InvalidActivitiesHandler {
+  async execute(_input: number, _context: ActivityContext): Promise<boolean> {
+    return false
+  }
+}
+
+// @ts-expect-error Every decorated contract method is required on the implementation.
+@Activities(PublishedActivitiesContract)
+class MissingActivitiesHandler {}
+
+assert.ok(InvalidActivitiesHandler)
+assert.ok(MissingActivitiesHandler)

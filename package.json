@@ -70,11 +70,12 @@
     "format": "oxfmt --write . '!tools/oxlint/**'",
     "format:check": "oxfmt --check . '!tools/oxlint/**'",
     "publint": "publint",
+    "typecheck:package": "node node_modules/typescript/bin/tsc --noEmit -p tests/package/consumer/tsconfig.json",
     "check": "bun run typecheck && bun run test && bun run format:check && bun run build && bun run docs:check && bun run lint && bun run publint",
     "hooks:install": "lefthook install",
     "prepublishOnly": "bun run check",
     "example": "bun examples/reports.ts",
-    "test:node": "node tests/package/node-smoke.mjs && node tests/package/contract-only-smoke.mjs && node tests/package/advanced-smoke.mjs && bun tests/package/consumer/contract-first-types.mts",
+    "test:node": "node tests/package/node-smoke.mjs && node tests/package/contract-only-smoke.mjs && node tests/package/advanced-smoke.mjs && bun run typecheck:package && bun tests/package/consumer/contract-first-types.mts",
     "example:modular": "bun examples/modular.ts",
     "docs:check": "node scripts/check-jsdoc.mjs"
   },
