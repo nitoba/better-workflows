@@ -423,14 +423,12 @@ export class Registry {
           )
         this.activityHandlerContracts.set(handler, provider)
         this.activityHandlers.set(provider, handler)
-        for (const method of this.activityMethods(provider)) {
-          if (
-            handler !== provider &&
-            Reflect.getOwnMetadata(ACTIVITY_METADATA, handler.prototype, method)
-          )
+        if (handler !== provider) {
+          const redeclared = this.activityMethods(handler)
+          if (redeclared.length)
             throw new WorkflowError(
               'ACTIVITY_HANDLER_REDECLARES_CONTRACT',
-              `${handler.name}.${method} redeclares ${provider.name}.${method}; decorate the contract only`
+              `${handler.name}.${redeclared[0]} redeclares activity metadata; decorate ${provider.name} only`
             )
         }
         for (const activity of resolved) {

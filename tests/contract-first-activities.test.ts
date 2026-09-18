@@ -129,3 +129,35 @@ test('two handlers for one activity contract fail bootstrap', async () => {
   await expect(app.init()).rejects.toMatchObject({ code: 'DUPLICATE_ACTIVITY_HANDLER' })
   await app.close().catch(() => {})
 })
+
+test('advanced handlers cannot decorate auxiliary methods as activities', async () => {
+  @Activities(ContractActivities)
+  class InvalidHandler implements ContractActivities {
+    @Activity({ name: 'handler-only.activity', version: 1, input: Input, output: z.string() })
+    async helper(_input: z.infer<typeof Input>, _context: ActivityContext): Promise<string> {
+      return 'invalid'
+    }
+
+    async execute(input: z.infer<typeof Input>, _context: ActivityContext): Promise<string> {
+      return input.value
+    }
+  }
+  const app = await Test.createTestingModule({
+    imports: [
+      WorkflowsModule.forRoot({
+        namespace: 'redeclared-activity-handler',
+        storage: sqlite({ filename: ':memory:' }),
+        execution: { workflows: { enabled: false } }
+      }),
+      WorkflowsModule.forFeature({
+        name: 'redeclared-activity-handler',
+        activities: [InvalidHandler],
+        queues: [{ queue: Queue }]
+      })
+    ]
+  }).compile()
+  await expect(app.init()).rejects.toMatchObject({
+    code: 'ACTIVITY_HANDLER_REDECLARES_CONTRACT'
+  })
+  await app.close().catch(() => {})
+})
