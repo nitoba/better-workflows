@@ -1,4 +1,11 @@
-import { defineQueue, Activities, Activity, Workflow, WorkflowContract } from 'better-workflows'
+import {
+  defineQueue,
+  Activities,
+  ActivitiesContract,
+  Activity,
+  Workflow,
+  WorkflowContract
+} from 'better-workflows'
 import { z } from 'zod'
 
 const input = z.object({ index: z.number().int(), tenant: z.string() })
@@ -15,6 +22,34 @@ async function work(value, context) {
   audit({ ...base, event: 'end', at: Date.now() })
   return value.index * 2
 }
+export class EvenActivities {
+  run() {
+    throw new Error('contract-only')
+  }
+}
+ActivitiesContract({ queue: defineQueue('shared') })(EvenActivities)
+Activity({
+  name: 'shared-even',
+  version: 1,
+  input,
+  output: z.number(),
+  key: (value) => value.tenant
+})(EvenActivities.prototype, 'run', undefined)
+
+export class OddActivities {
+  run() {
+    throw new Error('contract-only')
+  }
+}
+ActivitiesContract({ queue: defineQueue('shared') })(OddActivities)
+Activity({
+  name: 'shared-odd',
+  version: 1,
+  input,
+  output: z.number(),
+  key: (value) => value.tenant
+})(OddActivities.prototype, 'run', undefined)
+
 export class Even {
   run(value, context) {
     return work(value, context)
@@ -25,23 +60,13 @@ export class Odd {
     return work(value, context)
   }
 }
-for (const { provider, name } of [
-  { provider: Even, name: 'even' },
-  { provider: Odd, name: 'odd' }
-]) {
-  Activities()(provider)
-  Activity({
-    name: `shared-${name}`,
-    version: 1,
-    queue: defineQueue('shared'),
-    input,
-    output: z.number(),
-    key: (value) => value.tenant
-  })(provider.prototype, 'run', Object.getOwnPropertyDescriptor(provider.prototype, 'run'))
-}
+Activities(EvenActivities)(Even)
+Activities(OddActivities)(Odd)
 export class Child {
   async run(value, ctx) {
-    return ctx.activities(value.index % 2 === 0 ? Even : Odd).run(value, { stepId: 'work' })
+    return ctx
+      .activities(value.index % 2 === 0 ? EvenActivities : OddActivities)
+      .run(value, { stepId: 'work' })
   }
 }
 Workflow({ name: 'advanced-child', version: 1, input, output: z.number() })(Child)

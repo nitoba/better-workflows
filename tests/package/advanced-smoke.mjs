@@ -12,7 +12,17 @@ import { WorkflowsModule, getWorkflowToken } from 'better-workflows'
 import { createWorkflowsAdmin } from 'better-workflows/admin'
 import { sqlite } from 'better-workflows/sqlite'
 import { postgres } from 'better-workflows/postgres'
-import { Batch, BatchWorkflow, Child, Even, Odd, queues, setAudit } from './advanced-contracts.mjs'
+import {
+  Batch,
+  BatchWorkflow,
+  Child,
+  Even,
+  EvenActivities,
+  Odd,
+  OddActivities,
+  queues,
+  setAudit
+} from './advanced-contracts.mjs'
 
 const distribution = new URL('../../dist/', import.meta.url)
 const declarations = (await readdir(distribution)).filter((name) => name.endsWith('.d.mts'))
@@ -99,7 +109,7 @@ try {
         queues,
         workflows: [Batch, Child],
         activities: url ? [] : [Even, Odd],
-        activityContracts: url ? [Even, Odd] : []
+        activityContracts: url ? [EvenActivities, OddActivities] : []
       })
     ]
   })(App)
