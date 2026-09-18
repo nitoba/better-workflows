@@ -8,6 +8,11 @@ Nest discovers explicit feature registrations after resolving their factories an
 
 Queue references persist their explicit names, not feature names or class/file names. Private queues can be hidden behind exported activity contracts. Calls always use owner-resolved defaults. Queue capacity is shared across handlers/features for one logical queue; application-owned activity deliveries route by logical queue and retain contract name/version in their JSON envelope. Root execution restrictions and feature restrictions intersect. See [modular registration](modules.md).
 
+Activity execution binds a contract method name to a handler method only after the
+contract catalog is resolved. The method name is source-level binding; durable routing
+uses only the contract activity name and version. Direct handler calls bypass the durable
+workflow protocol and are ordinary JavaScript calls.
+
 An internal dispatcher bridges an application's async handler to the workflow's own Effect fiber. Durable commands execute on that fiber, where the engine can suspend correctly. Suspension interrupts the interpreter, invalidates the async round and abandons unresolved awaits without rejecting them into application code. Abandoned promises are not retained in a shared forever-pending promise. Application-created timers, global references or arbitrary background work can still retain its own objects; the library is not a JavaScript sandbox or a compiler enforcing determinism.
 
 ## What is persisted where

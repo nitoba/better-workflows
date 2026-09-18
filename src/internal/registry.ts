@@ -58,6 +58,7 @@ export interface ActivityContract {
   readonly options: ResolvedActivityOptions
 }
 export interface RegisteredActivity extends ActivityContract {
+  readonly handler: ActivityImplementationClass
   readonly enabled: boolean
   readonly invoke: (input: any, context: ActivityContext) => Promise<any>
 }
@@ -450,6 +451,7 @@ export class Registry {
             key,
             Object.freeze({
               ...activity,
+              handler,
               enabled,
               invoke: (input: any, context: ActivityContext) =>
                 implementation.call(instance, input, context)

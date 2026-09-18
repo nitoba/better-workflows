@@ -231,7 +231,9 @@ WorkflowsModule.forFeature({
 
 `ctx.activities(ReportActivities)` uses the contract's method schemas, queue, retry and
 timeout policies. Durable identity is always `activity name + version`, never the
-handler class name. A contract-only registration does not instantiate a worker.
+handler class name. A contract-only registration does not instantiate a worker. Calling
+`handler.generate(...)` directly remains an ordinary JavaScript call; only the proxy
+returned by `ctx.activities(ReportActivities)` is durable.
 
 See [modules and configuration](docs/modules.md) for precedence, queue ownership, cross-domain calls, asynchronous factories and separated worker processes. Run `bun run example:modular` for a multi-domain application with **no root queue catalog**.
 
