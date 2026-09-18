@@ -333,7 +333,9 @@ export function ActivitiesContract(defaults: ActivityDefaults = {}): ClassDecora
  * @typeParam I - Validated method input.
  * @typeParam O - Serializable method output.
  * @param options - Identity, input/output schemas and optional owner-policy overrides.
- * @returns Method decorator for an async method on an Activities provider.
+ * @returns Method decorator for an async method on an Activities provider. The
+ * descriptor is optional at runtime so contract metadata can also be attached to
+ * a method key that has no implementation.
  * @throws WorkflowError for invalid identity/policy or a static, unnamed or non-method target.
  * @example
  * ```ts
@@ -350,6 +352,11 @@ export function ActivitiesContract(defaults: ActivityDefaults = {}): ClassDecora
  *   }
  * }
  * ```
+ * TypeScript's legacy decorator checker currently rejects the syntax
+ * `@Activity(...) abstract method` with TS1249. Until that compiler limitation is
+ * removed, declare the contract method with a throwing metadata-only body (or call
+ * this decorator explicitly with an absent descriptor); the registry still discovers
+ * the method from explicit metadata and never executes the contract body.
  */
 export function Activity<I, O>(
   options: ActivityOptions<I, O>

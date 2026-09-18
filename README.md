@@ -208,6 +208,12 @@ export abstract class ReportActivities {
 }
 ```
 
+TypeScript's legacy decorator checker currently reports `TS1249` for a decorator on
+an `abstract` method declaration. Until that compiler limitation is removed, use a
+throwing metadata-only method body (as in the package fixtures) or apply `Activity`
+explicitly to the contract prototype with no descriptor. The registry still discovers
+the method from explicit metadata and never executes the contract body.
+
 The worker associates a Nest implementation with that contract. The orchestrator
 imports only `ReportActivities` and registers `activityContracts: [ReportActivities]`;
 it never constructs the worker or its infrastructure dependencies:
