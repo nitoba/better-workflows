@@ -74,7 +74,7 @@
     "hooks:install": "lefthook install",
     "prepublishOnly": "bun run check",
     "example": "bun examples/reports.ts",
-    "test:node": "node tests/package/node-smoke.mjs && node tests/package/advanced-smoke.mjs && bun tests/package/consumer/contract-first-types.mts",
+    "test:node": "node tests/package/node-smoke.mjs && node tests/package/contract-only-smoke.mjs && node tests/package/advanced-smoke.mjs && bun tests/package/consumer/contract-first-types.mts",
     "example:modular": "bun examples/modular.ts",
     "docs:check": "node scripts/check-jsdoc.mjs"
   },

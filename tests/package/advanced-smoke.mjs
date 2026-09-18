@@ -12,17 +12,9 @@ import { WorkflowsModule, getWorkflowToken } from 'better-workflows'
 import { createWorkflowsAdmin } from 'better-workflows/admin'
 import { sqlite } from 'better-workflows/sqlite'
 import { postgres } from 'better-workflows/postgres'
-import {
-  Batch,
-  BatchWorkflow,
-  Child,
-  Even,
-  EvenActivities,
-  Odd,
-  OddActivities,
-  queues,
-  setAudit
-} from './advanced-contracts.mjs'
+import { BatchWorkflow, EvenActivities, OddActivities, queues } from './advanced-contracts.mjs'
+import { Batch, Child } from './advanced-workflow-handlers.mjs'
+import { setAudit } from './advanced-activity-events.mjs'
 
 const distribution = new URL('../../dist/', import.meta.url)
 const declarations = (await readdir(distribution)).filter((name) => name.endsWith('.d.mts'))
@@ -36,6 +28,11 @@ for (const name of declarations) {
 }
 
 const url = process.env.WORKFLOWS_TEST_POSTGRES_URL
+const localActivities = url
+  ? []
+  : (() => {
+      return import('./advanced-activity-handlers.mjs').then(({ Even, Odd }) => [Even, Odd])
+    })()
 const dir = await mkdtemp(join(tmpdir(), 'bw-advanced-'))
 const namespace = `advanced-${randomUUID()}`
 const storage = url
@@ -108,7 +105,7 @@ try {
         name: 'advanced',
         queues,
         workflows: [Batch, Child],
-        activities: url ? [] : [Even, Odd],
+        activities: await localActivities,
         activityContracts: url ? [EvenActivities, OddActivities] : []
       })
     ]

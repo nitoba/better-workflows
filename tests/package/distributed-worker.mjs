@@ -2,7 +2,8 @@ import { Module } from '@nestjs/common'
 import { NestFactory } from '@nestjs/core'
 import { WorkflowsModule } from 'better-workflows'
 import { postgres } from 'better-workflows/postgres'
-import { Even, Odd, queues } from './advanced-contracts.mjs'
+import { queues } from './advanced-contracts.mjs'
+import { Even, Odd } from './advanced-activity-handlers.mjs'
 
 class App {}
 Module({
