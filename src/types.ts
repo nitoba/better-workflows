@@ -419,7 +419,7 @@ export interface ActivityContext {
  * Async methods take their input plus StepOptions; the worker receives ActivityContext
  * instead. Only decorated methods are dispatched at runtime, so keep unrelated public
  * async helpers off an activities contract. Await every durable call.
- * @typeParam T - Instance type of the activities provider.
+ * @typeParam T - Instance type of the activity contract.
  */
 export type ActivityClient<T> = {
   [
@@ -924,8 +924,8 @@ export interface WorkflowContext {
    * Create a typed durable-call proxy for an owned or imported activities contract.
    * Calling a proxy method dispatches work to its resolved queue and records its result;
    * calling the original Nest service directly is not a durable activity invocation.
-   * @typeParam T - Instance type of the activities provider.
-   * @param provider - Class decorated with Activities and registered/exported to this feature.
+   * @typeParam C - Contract constructor, including an abstract contract class.
+   * @param provider - Contract decorated with ActivitiesContract/Activities and registered/exported to this feature.
    * @returns Proxy of async activity methods accepting input and StepOptions.
    * @throws WorkflowError if the contract is missing, unregistered or not visible.
    * @example
