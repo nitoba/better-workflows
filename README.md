@@ -235,6 +235,23 @@ handler class name. A contract-only registration does not instantiate a worker. 
 `handler.generate(...)` directly remains an ordinary JavaScript call; only the proxy
 returned by `ctx.activities(ReportActivities)` is durable.
 
+A typical split deployment keeps the shared package free of worker dependencies:
+
+```text
+packages/contracts/
+  reports.workflow.ts
+  reports.activities.ts
+  queues.ts
+apps/orchestrator/
+  workflow-handlers.ts
+apps/activity-worker/
+  reports-activities.handler.ts
+```
+
+The orchestrator registers the workflow handlers and `activityContracts`; the worker
+registers the `activities` handlers and queue capacity. Export activity contracts, not
+handlers, when exposing a private queue-backed capability to another Nest module.
+
 See [modules and configuration](docs/modules.md) for precedence, queue ownership, cross-domain calls, asynchronous factories and separated worker processes. Run `bun run example:modular` for a multi-domain application with **no root queue catalog**.
 
 Handlers must be singleton providers with a static dependency tree. Request-scoped dependencies and non-singleton handlers are rejected. Background execution does not retain an HTTP request. HTTP pipes, guards and interceptors are not silently applied to activities. Apply authorization in the application's controllers/services before accepting, inspecting, signalling or cancelling executions.
