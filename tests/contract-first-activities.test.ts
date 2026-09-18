@@ -52,6 +52,34 @@ class WorkflowHandler {
   }
 }
 
+@ActivitiesContract({ queue: Queue })
+class DescriptorlessActivities {
+  @Activity({ name: 'descriptorless.activity', version: 1, input: Input, output: z.string() })
+  execute(_input: z.infer<typeof Input>, _context: ActivityContext): Promise<string> {
+    throw new Error('contract-only')
+  }
+}
+Reflect.deleteProperty(DescriptorlessActivities.prototype, 'execute')
+
+@Activities(DescriptorlessActivities)
+class DescriptorlessHandler {
+  async execute(input: z.infer<typeof Input>, _context: ActivityContext): Promise<string> {
+    return `descriptorless:${input.value}`
+  }
+}
+
+@Workflow({
+  name: 'descriptorless.activity-workflow',
+  version: 1,
+  input: Input,
+  output: z.string()
+})
+class DescriptorlessWorkflow {
+  async run(input: z.infer<typeof Input>, context: WorkflowContext): Promise<string> {
+    return context.activities(DescriptorlessActivities).execute(input, { stepId: 'execute' })
+  }
+}
+
 test('abstract activity contracts are metadata-only and advanced handlers use Nest DI', async () => {
   const app = await Test.createTestingModule({
     imports: [
@@ -160,4 +188,35 @@ test('advanced handlers cannot decorate auxiliary methods as activities', async 
     code: 'ACTIVITY_HANDLER_REDECLARES_CONTRACT'
   })
   await app.close().catch(() => {})
+})
+
+test('explicit method metadata routes a contract with no runtime prototype method', async () => {
+  expect(Object.getOwnPropertyNames(DescriptorlessActivities.prototype)).not.toContain('execute')
+  const app = await Test.createTestingModule({
+    imports: [
+      WorkflowsModule.forRoot({
+        namespace: 'descriptorless-activity',
+        storage: sqlite({ filename: ':memory:' }),
+        queues: [],
+        pollInterval: '10ms'
+      }),
+      WorkflowsModule.forFeature({
+        name: 'descriptorless-activity',
+        workflows: [DescriptorlessWorkflow],
+        activities: [DescriptorlessHandler],
+        queues: [{ queue: Queue }]
+      })
+    ]
+  }).compile()
+  try {
+    await app.init()
+    const client = app.get<WorkflowClient<typeof DescriptorlessWorkflow>>(
+      getWorkflowToken(DescriptorlessWorkflow)
+    )
+    expect(await (await client.start({ value: 'one' })).result({ timeout: '3s' })).toBe(
+      'descriptorless:one'
+    )
+  } finally {
+    await app.close()
+  }
 })

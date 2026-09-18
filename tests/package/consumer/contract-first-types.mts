@@ -53,5 +53,4 @@ type ExpectedExecute = (
   options: StepOptions
 ) => Promise<string>
 type AssertAssignable<T extends ExpectedExecute> = T
-type VerifiedExecute = AssertAssignable<Execute>
-void (null as unknown as VerifiedExecute)
+export type VerifiedExecute = AssertAssignable<Execute>
