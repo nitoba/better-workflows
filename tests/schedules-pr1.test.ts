@@ -5,8 +5,18 @@ import { tmpdir } from 'node:os'
 import { Database } from 'bun:sqlite'
 import { Test } from '@nestjs/testing'
 import { z } from 'zod'
-import { Cron, Interval, Workflow, WorkflowContract, WorkflowsModule } from '../src'
-import type { WorkflowContext } from '../src'
+import {
+  Activities,
+  ActivitiesContract,
+  Activity,
+  Cron,
+  defineQueue,
+  Interval,
+  Workflow,
+  WorkflowContract,
+  WorkflowsModule
+} from '../src'
+import type { ActivityContext, WorkflowContext } from '../src'
 import { sqlite } from '../src/sqlite'
 import { WorkflowsTestHarness, WorkflowsTestingModule } from '../src/testing'
 
@@ -270,6 +280,90 @@ test('contract-first schedules execute the separate handler regardless of decora
         )
         .all()
     ).toEqual([{ trigger_type: 'scheduled', state: 'started' }])
+  } finally {
+    db.close()
+    await app.close().catch(() => undefined)
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('scheduled contract-first workflows can execute contract-first activities', async () => {
+  const queue = defineQueue('scheduled-contract-first-activities')
+  const activityInput = z.object({ value: z.string() })
+
+  @ActivitiesContract({ queue })
+  abstract class ScheduledActivities {
+    @Activity({
+      name: 'scheduled.contract-first.activity',
+      version: 1,
+      input: activityInput,
+      output: z.string()
+    })
+    execute(_input: z.infer<typeof activityInput>, _context: ActivityContext): Promise<string> {
+      throw new Error('contract-only')
+    }
+  }
+
+  @Activities(ScheduledActivities)
+  class ScheduledActivitiesHandler implements ScheduledActivities {
+    async execute(
+      input: z.infer<typeof activityInput>,
+      _context: ActivityContext
+    ): Promise<string> {
+      return `scheduled:${input.value}`
+    }
+  }
+
+  @Interval({
+    name: 'scheduled.contract-first.schedule',
+    every: '1m',
+    input: { value: 'one' }
+  })
+  @WorkflowContract({
+    name: 'scheduled.contract-first.workflow',
+    version: 1,
+    input: activityInput,
+    output: z.string()
+  })
+  abstract class ScheduledWorkflow {
+    abstract run(input: z.infer<typeof activityInput>, context: WorkflowContext): Promise<string>
+  }
+
+  @Workflow(ScheduledWorkflow)
+  class ScheduledWorkflowHandler implements ScheduledWorkflow {
+    async run(input: z.infer<typeof activityInput>, context: WorkflowContext): Promise<string> {
+      return context.activities(ScheduledActivities).execute(input, { stepId: 'execute' })
+    }
+  }
+
+  const directory = await mkdtemp(join(tmpdir(), 'better-workflows-scheduled-contract-first-'))
+  const filename = join(directory, 'workflows.sqlite')
+  const app = await Test.createTestingModule({
+    imports: [
+      WorkflowsTestingModule.forRoot({
+        namespace: 'scheduled-contract-first-activities',
+        initialTime: Date.UTC(2026, 0, 1, 0, 0),
+        storage: sqlite({ filename })
+      }),
+      WorkflowsModule.forFeature({
+        name: 'scheduled-contract-first-activities',
+        workflows: [ScheduledWorkflowHandler],
+        activities: [ScheduledActivitiesHandler],
+        queues: [{ queue, concurrency: 1 }]
+      })
+    ]
+  }).compile()
+  const db = new Database(filename)
+  try {
+    await app.init()
+    await app.get(WorkflowsTestHarness).advanceTime('1m')
+    expect(
+      db
+        .query<{ workflow_name: string; state: string }, []>(
+          'SELECT workflow_name, state FROM better_workflows_runs'
+        )
+        .all()
+    ).toEqual([{ workflow_name: 'scheduled.contract-first.workflow', state: 'completed' }])
   } finally {
     db.close()
     await app.close().catch(() => undefined)
