@@ -6,7 +6,15 @@ import { tmpdir } from 'node:os'
 import { promisify } from 'node:util'
 import { Database } from 'bun:sqlite'
 import { z } from 'zod'
-import { Activities, Activity, Workflow, WorkflowsAdmin, defineQueue, defineSignal } from '../src'
+import {
+  Activities,
+  ActivitiesContract,
+  Activity,
+  Workflow,
+  WorkflowsAdmin,
+  defineQueue,
+  defineSignal
+} from '../src'
 import type { WorkflowContext } from '../src'
 import { createWorkflowsAdmin } from '../src/admin'
 import { sqlite } from '../src/sqlite'
@@ -62,6 +70,26 @@ class ContractOnlyActivities {
   }
 }
 
+@ActivitiesContract({ queue: Work })
+abstract class AdvancedMissingActivities {
+  @Activity({
+    name: 'advanced.missing.activity',
+    version: 1,
+    input: z.string(),
+    output: z.string()
+  })
+  execute(_value: string): Promise<string> {
+    throw new Error('contract-only')
+  }
+}
+
+@Activities(AdvancedMissingActivities)
+class AdvancedMissingActivitiesHandler {
+  async execute(value: string) {
+    return `advanced-recovered:${value}`
+  }
+}
+
 @Workflow({
   name: 'dead-letter-owner',
   version: 1,
@@ -101,6 +129,18 @@ class DiscardCatchOwner {
     } catch {
       return 'caught'
     }
+  }
+}
+
+@Workflow({
+  name: 'advanced-dead-letter-activity-owner',
+  version: 1,
+  input: z.string(),
+  output: z.string()
+})
+class AdvancedDeadLetterActivityOwner {
+  async run(value: string, ctx: WorkflowContext) {
+    return ctx.activities(AdvancedMissingActivities).execute(value, { stepId: 'advanced-recovery' })
   }
 }
 
@@ -325,6 +365,51 @@ test('concurrent requeue produces one delivery and a corrected deployment resolv
       ).resolves.toBe('recovered:order')
     } finally {
       await recovered.close()
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('contract-first activity deployment can recover a dead letter after requeue', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'bw-dlq-contract-first-'))
+  const filename = join(directory, 'workflows.sqlite')
+  const contractOnly = await testApp(AdvancedDeadLetterActivityOwner, {
+    filename,
+    providers: [KnownActivities],
+    activityContracts: [AdvancedMissingActivities]
+  })
+  try {
+    const handle = await contractOnly.client.start('order')
+    const blocked = await eventually(
+      () => handle.describe(),
+      (snapshot) => snapshot.status === 'blocked' && snapshot.blockedOn !== undefined
+    )
+    const admin = contractOnly.module.get(WorkflowsAdmin)
+    const deadLetter = await admin.getDeadLetter(blocked.blockedOn!.deadLetterId)
+    await contractOnly.close()
+    const requeueAdmin = await createWorkflowsAdmin({
+      namespace: 'integration',
+      storage: sqlite({ filename })
+    })
+
+    const worker = await testApp(AdvancedDeadLetterActivityOwner, {
+      filename,
+      providers: [AdvancedMissingActivitiesHandler]
+    })
+    try {
+      await requeueAdmin.requeueDeadLetter(deadLetter.id)
+      const workerAdmin = worker.module.get(WorkflowsAdmin)
+      await eventually(
+        () => workerAdmin.getDeadLetter(deadLetter.id),
+        (value) => value.state === 'resolved'
+      )
+      await expect(
+        worker.client.getHandle(handle.executionId).result({ timeout: '3s' })
+      ).resolves.toBe('advanced-recovered:order')
+    } finally {
+      await worker.close()
+      await requeueAdmin.close()
     }
   } finally {
     await rm(directory, { recursive: true, force: true })

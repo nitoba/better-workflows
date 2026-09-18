@@ -4,13 +4,17 @@ import { tmpdir } from 'node:os'
 import type { Type } from '@nestjs/common'
 import { Test } from '@nestjs/testing'
 import { defineQueue, WorkflowsModule, getWorkflowToken } from '../src'
-import type { WorkflowClass, WorkflowsOptions, WorkflowClient } from '../src'
+import type { ActivityContractClass, WorkflowClass, WorkflowsOptions, WorkflowClient } from '../src'
 import { sqlite } from '../src/sqlite'
-import { WORKFLOW_METADATA, ACTIVITIES_METADATA } from '../src/decorators'
+import {
+  WORKFLOW_METADATA,
+  ACTIVITIES_HANDLER_METADATA,
+  ACTIVITIES_METADATA
+} from '../src/decorators'
 
 export interface TestAppOptions {
   readonly providers?: readonly Type[]
-  readonly activityContracts?: readonly Type[]
+  readonly activityContracts?: readonly ActivityContractClass[]
   readonly execution?: WorkflowsOptions['execution']
   readonly observability?: WorkflowsOptions['observability']
   readonly queues?: WorkflowsOptions['queues']
@@ -43,14 +47,17 @@ export async function testApp<W extends WorkflowClass>(workflow: W, options: Tes
             )
           ])
         ],
-        activities: (options.providers ?? []).filter((provider) =>
-          Reflect.hasOwnMetadata(ACTIVITIES_METADATA, provider)
+        activities: (options.providers ?? []).filter(
+          (provider) =>
+            Reflect.hasOwnMetadata(ACTIVITIES_METADATA, provider) ||
+            Reflect.hasOwnMetadata(ACTIVITIES_HANDLER_METADATA, provider)
         ),
         activityContracts: options.activityContracts ?? [],
         providers: (options.providers ?? []).filter(
           (provider) =>
             !Reflect.hasOwnMetadata(WORKFLOW_METADATA, provider) &&
-            !Reflect.hasOwnMetadata(ACTIVITIES_METADATA, provider)
+            !Reflect.hasOwnMetadata(ACTIVITIES_METADATA, provider) &&
+            !Reflect.hasOwnMetadata(ACTIVITIES_HANDLER_METADATA, provider)
         ),
         queues: options.queues ?? [{ queue: defineQueue('work'), concurrency: 2 }]
       })
