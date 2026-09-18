@@ -3,7 +3,16 @@ import { mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { Test } from '@nestjs/testing'
-import { WorkflowsHealth, WorkflowsModule } from '../src'
+import { z } from 'zod'
+import {
+  Activities,
+  ActivitiesContract,
+  Activity,
+  WorkflowsHealth,
+  WorkflowsModule,
+  defineQueue
+} from '../src'
+import type { ActivityContext } from '../src'
 import { postgres } from '../src/postgres'
 import { sqlite } from '../src/sqlite'
 import { WorkflowsRuntime } from '../src/internal/runtime'
@@ -95,6 +104,74 @@ test('readiness distinguishes storage failure and dispatcher recovery', async ()
   } finally {
     await app.close()
     await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('readiness reports an advanced activity worker only when an implementation is registered', async () => {
+  const queue = defineQueue('health-advanced-activity')
+  @ActivitiesContract({ queue })
+  abstract class HealthActivities {
+    @Activity({ name: 'health.advanced', version: 1, input: z.string(), output: z.string() })
+    execute(_input: string, _context: ActivityContext): Promise<string> {
+      throw new Error('contract-only')
+    }
+  }
+  @Activities(HealthActivities)
+  class HealthActivitiesHandler implements HealthActivities {
+    async execute(input: string, _context: ActivityContext): Promise<string> {
+      return input
+    }
+  }
+  const workerApp = await Test.createTestingModule({
+    imports: [
+      WorkflowsModule.forRoot({
+        namespace: 'health-advanced-worker',
+        storage: sqlite({ filename: ':memory:' }),
+        execution: { workflows: { enabled: false } }
+      }),
+      WorkflowsModule.forFeature({
+        name: 'health-advanced-worker',
+        activities: [HealthActivitiesHandler],
+        queues: [{ queue }]
+      })
+    ]
+  }).compile()
+  try {
+    const health = workerApp.get(WorkflowsHealth)
+    await workerApp.init()
+    await expect(health.readiness()).resolves.toMatchObject({
+      status: 'up',
+      ready: true,
+      checks: { workers: 'up' }
+    })
+  } finally {
+    await workerApp.close()
+  }
+
+  const contractApp = await Test.createTestingModule({
+    imports: [
+      WorkflowsModule.forRoot({
+        namespace: 'health-advanced-contract-only',
+        storage: sqlite({ filename: ':memory:' }),
+        execution: { workflows: { enabled: false }, activities: { enabled: false } }
+      }),
+      WorkflowsModule.forFeature({
+        name: 'health-advanced-contract-only',
+        activityContracts: [HealthActivities],
+        queues: [{ queue }]
+      })
+    ]
+  }).compile()
+  try {
+    const health = contractApp.get(WorkflowsHealth)
+    await contractApp.init()
+    await expect(health.readiness()).resolves.toMatchObject({
+      status: 'up',
+      ready: true,
+      checks: { workers: 'disabled' }
+    })
+  } finally {
+    await contractApp.close()
   }
 })
 
