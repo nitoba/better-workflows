@@ -9,6 +9,7 @@ import {
   defineQueue,
   getWorkflowToken,
   Workflow,
+  WorkflowContract,
   WorkflowClient,
   WorkflowsModule
 } from '../src'
@@ -77,6 +78,78 @@ class DescriptorlessHandler {
 class DescriptorlessWorkflow {
   async run(input: z.infer<typeof Input>, context: WorkflowContext): Promise<string> {
     return context.activities(DescriptorlessActivities).execute(input, { stepId: 'execute' })
+  }
+}
+
+const CompositionOutput = z.object({
+  mapped: z.array(z.string()),
+  parallel: z.object({ one: z.string(), two: z.string() }),
+  child: z.string(),
+  saga: z.string()
+})
+
+@ActivitiesContract({ queue: Queue })
+abstract class CompositionActivities {
+  @Activity({ name: 'composition.activity', version: 1, input: z.string(), output: z.string() })
+  execute(_input: string, _context: ActivityContext): Promise<string> {
+    throw new Error('contract-only')
+  }
+}
+
+@Activities(CompositionActivities)
+class CompositionActivitiesHandler implements CompositionActivities {
+  async execute(input: string, _context: ActivityContext): Promise<string> {
+    return `activity:${input}`
+  }
+}
+
+@WorkflowContract({ name: 'composition.child', version: 1, input: z.string(), output: z.string() })
+abstract class CompositionChild {
+  abstract run(input: string, context: WorkflowContext): Promise<string>
+}
+
+@Workflow(CompositionChild)
+class CompositionChildHandler implements CompositionChild {
+  async run(input: string, context: WorkflowContext): Promise<string> {
+    return context.activities(CompositionActivities).execute(input, { stepId: 'activity' })
+  }
+}
+
+@WorkflowContract({
+  name: 'composition.parent',
+  version: 1,
+  input: z.string(),
+  output: CompositionOutput
+})
+abstract class CompositionParent {
+  abstract run(input: string, context: WorkflowContext): Promise<z.infer<typeof CompositionOutput>>
+}
+
+@Workflow(CompositionParent)
+class CompositionParentHandler implements CompositionParent {
+  async run(input: string, context: WorkflowContext): Promise<z.infer<typeof CompositionOutput>> {
+    const mapped = await context.map(
+      'map',
+      ['one', 'two'],
+      { key: (item) => item, concurrency: 2 },
+      (item, branch) =>
+        branch.activities(CompositionActivities).execute(item, { stepId: 'activity' })
+    )
+    const parallel = await context.parallel('parallel', {
+      one: (branch) =>
+        branch.activities(CompositionActivities).execute('one', { stepId: 'activity' }),
+      two: (branch) =>
+        branch.activities(CompositionActivities).execute('two', { stepId: 'activity' })
+    })
+    const child = await context.child('child', CompositionChild, input)
+    const saga = await context.saga('saga', (scope) =>
+      scope.step(
+        'activity',
+        (step) => step.activities(CompositionActivities).execute(input, { stepId: 'forward' }),
+        async () => {}
+      )
+    )
+    return { mapped, parallel, child, saga }
   }
 }
 
@@ -241,4 +314,37 @@ test('runtime binding validation catches a handler missing a contract method', a
   }).compile()
   await expect(app.init()).rejects.toMatchObject({ code: 'MISSING_ACTIVITY_HANDLER' })
   await app.close().catch(() => {})
+})
+
+test('advanced workflow composition supports child, map, parallel and saga activities', async () => {
+  const app = await Test.createTestingModule({
+    imports: [
+      WorkflowsModule.forRoot({
+        namespace: 'composition-contract-first',
+        storage: sqlite({ filename: ':memory:' }),
+        queues: [],
+        pollInterval: '10ms'
+      }),
+      WorkflowsModule.forFeature({
+        name: 'composition-contract-first',
+        workflows: [CompositionParentHandler, CompositionChildHandler],
+        activities: [CompositionActivitiesHandler],
+        queues: [{ queue: Queue, concurrency: 4 }]
+      })
+    ]
+  }).compile()
+  try {
+    await app.init()
+    const client = app.get<WorkflowClient<typeof CompositionParent>>(
+      getWorkflowToken(CompositionParent)
+    )
+    expect(await (await client.start('root')).result({ timeout: '8s' })).toEqual({
+      mapped: ['activity:one', 'activity:two'],
+      parallel: { one: 'activity:one', two: 'activity:two' },
+      child: 'activity:root',
+      saga: 'activity:root'
+    })
+  } finally {
+    await app.close()
+  }
 })
