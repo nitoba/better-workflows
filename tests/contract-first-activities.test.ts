@@ -220,3 +220,25 @@ test('explicit method metadata routes a contract with no runtime prototype metho
     await app.close()
   }
 })
+
+test('runtime binding validation catches a handler missing a contract method', async () => {
+  // @ts-expect-error This intentionally bypasses compile-time conformance to test the bootstrap guard.
+  @Activities(DescriptorlessActivities)
+  class MissingHandler {}
+  const app = await Test.createTestingModule({
+    imports: [
+      WorkflowsModule.forRoot({
+        namespace: 'missing-activity-handler',
+        storage: sqlite({ filename: ':memory:' }),
+        execution: { workflows: { enabled: false } }
+      }),
+      WorkflowsModule.forFeature({
+        name: 'missing-activity-handler',
+        activities: [MissingHandler],
+        queues: [{ queue: Queue }]
+      })
+    ]
+  }).compile()
+  await expect(app.init()).rejects.toMatchObject({ code: 'MISSING_ACTIVITY_HANDLER' })
+  await app.close().catch(() => {})
+})
